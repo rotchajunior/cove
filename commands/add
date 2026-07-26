@@ -7,7 +7,7 @@ cove_add() {
 
     if [ -z "$site_name" ]; then
         gum style --foreground red "❌ Error: A site name is required."
-        echo "Usage: cove add <name> [--plain] [--wp-version=<version>]"
+        echo "Usage: cove add <name> [flavor] [--plain]"
         exit 1
     fi
 
@@ -23,22 +23,58 @@ cove_add() {
         exit 1
     fi
 
-    # Check all arguments passed to the function for our flags
+    # Everything after the site name is parsed here. Cove's grammar is that
+    # flags modify *behaviour* (--force, --totals, --no-reload) while positional
+    # arguments name *things* — so what goes inside the site is a positional
+    # "flavor" rather than a flag: `cove add mysite 6.4.3`, `cove add mysite
+    # plain`, `cove add mysite nightly`. One slot answers "what do you want in
+    # it?", which keeps the version and the plain/WordPress choice from being
+    # two unrelated-looking knobs. --plain and --wp-version= stay accepted
+    # forever so existing scripts and the dashboard never break.
+    local flavor=""
+    local plain_flag=false
+    shift
     for arg in "$@"; do
-        if [ "$arg" == "--plain" ]; then
-            site_type="plain"
-        fi
-        if [ "$arg" == "--no-reload" ]; then
-            no_reload_flag=true
-        fi
-        if [[ "$arg" == --wp-version=* ]]; then
-            wp_version="${arg#*=}"
-        fi
+        case "$arg" in
+            --plain)        plain_flag=true ;;
+            --no-reload)    no_reload_flag=true ;;
+            --wp-version=*) flavor="${arg#*=}" ;;
+            -*)             ;;  # unknown flags ignored, as before
+            *)              [ -z "$flavor" ] && flavor="$arg" ;;
+        esac
     done
 
-    if [ -n "$wp_version" ] && ! [[ "$wp_version" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
-        gum style --foreground red "❌ Error: Invalid WordPress version '$wp_version'." "Use a numeric version like 6.4 or 6.4.3."
-        exit 1
+    # Resolve the flavor into a site type + an optional pinned version.
+    case "$flavor" in
+        ""|latest)
+            ;;                                  # newest WordPress — the default
+        plain)
+            site_type="plain" ;;
+        nightly|trunk)
+            wp_version="nightly" ;;
+        [0-9]*)
+            # Handed to wp-cli verbatim, so accept everything wp.org actually
+            # ships: 6.4, 6.4.3, and prerelease builds like 6.9-RC1 or
+            # 6.8-beta2. Pinning a prerelease is a large part of why you'd want
+            # a throwaway local site in the first place.
+            if ! [[ "$flavor" =~ ^[0-9]+(\.[0-9]+){1,2}(-[A-Za-z0-9.]+)?$ ]]; then
+                gum style --foreground red "❌ Error: Invalid WordPress version '$flavor'." "Use a version like 6.4, 6.4.3, or 6.9-RC1."
+                exit 1
+            fi
+            wp_version="$flavor" ;;
+        *)
+            gum style --foreground red "❌ Error: Unknown option '$flavor'." "Expected a WordPress version (6.4.3), 'nightly', 'latest', or 'plain'."
+            exit 1 ;;
+    esac
+
+    if [ "$plain_flag" = true ]; then
+        # --plain alongside a version is a contradiction rather than a harmless
+        # combination: there is no WordPress in a plain site to pin.
+        if [ -n "$wp_version" ]; then
+            gum style --foreground red "❌ Error: Cannot combine a WordPress version with a plain site." "A plain site has no WordPress to version."
+            exit 1
+        fi
+        site_type="plain"
     fi
 
     for protected_name in $PROTECTED_NAMES; do
@@ -74,7 +110,17 @@ cove_add() {
         db_name=$(echo "cove_$site_name" | tr -c '[:alnum:]_' '_')
 
         if [ -n "$wp_version" ]; then
-            echo "📌 Targeting WordPress $wp_version"
+            # Show the pairing rather than just the pinned version. Cove runs a
+            # current PHP, and an older WordPress predates it — deprecation
+            # notices in the site's debug.log are expected rather than a fault,
+            # and seeing both numbers together makes that obvious up front.
+            local php_ver
+            php_ver=$(frankenphp version 2>/dev/null | sed -n 's/.*PHP \([0-9][0-9.]*\).*/\1/p')
+            if [ -n "$php_ver" ]; then
+                echo "📌 Installing WordPress $wp_version on PHP $php_ver"
+            else
+                echo "📌 Installing WordPress $wp_version"
+            fi
         fi
         echo "🗄️ Creating database: $db_name"
         mysql -u "$DB_USER" -p"$DB_PASSWORD" -e "CREATE DATABASE IF NOT EXISTS \`$db_name\`;"
@@ -96,11 +142,11 @@ cove_add() {
         (
             cd "$site_dir/public" || exit 1
 
-            # 1. Download WordPress with a higher memory limit
-            local version_arg=""
-            [ -n "$wp_version" ] && version_arg="--version=$wp_version"
-            if ! $wp_cmd core download --quiet $version_arg; then
-                echo "❌ Error: Failed to download WordPress core. This might be a network issue or a permissions problem."
+            # 1. Download WordPress with a higher memory limit. ${x:+...}
+            # expands to nothing at all when no version is pinned, so the
+            # default path is byte-identical to the unpinned command.
+            if ! $wp_cmd core download --quiet ${wp_version:+--version="$wp_version"}; then
+                echo "❌ Error: Failed to download WordPress core. This might be a network issue, a permissions problem, or a WordPress version that does not exist."
                 exit 1 # Exit the subshell with an error
             fi
 

@@ -67,7 +67,7 @@ Cove provides a simple set of commands to manage your local environment.
 
 | Command | Description |
 | --- | --- |
-| `cove add <name> [--plain] [--wp-version=<version>]` | Creates a new WordPress site (`<name>.localhost`). Use `--plain` for a static site, `--wp-version` to install a specific WordPress version. |
+| `cove add <name> [flavor]` | Creates a new WordPress site (`<name>.localhost`). The optional flavor says what goes inside it: a version (`6.4.3`, `6.9-RC1`), `nightly`, `latest` (the default), or `plain` for a static site with no database. |
 | `cove delete <name> [--force]` | Deletes a site's directory and its associated database. |
 | `cove rename <old-name> <new-name>` | Renames a site, its directory, database, and runs `wp search-replace` so stored URLs (siteurl, home, serialized content) all update to the new domain. |
 | `cove list [--totals]` | Lists all sites managed by Cove. Use `--totals` to show disk usage. |

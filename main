@@ -2086,6 +2086,49 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
 // disk and the UI falls back to '—' when an entry is missing.
 $__cove_sizes_cache = $user_home . '/Cove/cache/site-sizes.json';
 
+// The add-site form offers real WordPress versions rather than a free-text box,
+// so a typo can't turn into a failed install two minutes later. wp.org's
+// stable-check endpoint is the only source that lists every shipped version, so
+// it's fetched once and cached for a day — the dashboard must stay usable
+// offline, so every failure path here falls back to "latest" and never blocks.
+$__cove_wpver_cache = $user_home . '/Cove/cache/wp-versions.json';
+
+function cove_wp_versions($cache_path, $ttl = 86400) {
+    if (is_file($cache_path) && (time() - filemtime($cache_path)) < $ttl) {
+        $cached = @json_decode(@file_get_contents($cache_path), true);
+        if (is_array($cached) && !empty($cached)) return $cached;
+    }
+
+    // Short timeouts: this runs inline on a dashboard request, and a slow or
+    // unreachable wp.org must degrade to a plain "latest" rather than hang.
+    $raw = @file_get_contents('https://api.wordpress.org/core/stable-check/1.0/', false, stream_context_create([
+        'http' => ['timeout' => 4, 'user_agent' => 'Cove'],
+        'ssl'  => ['verify_peer' => true, 'verify_peer_name' => true],
+    ]));
+    $all = $raw ? @json_decode($raw, true) : null;
+    if (!is_array($all) || empty($all)) {
+        // Serve a stale cache in preference to nothing at all.
+        $stale = is_file($cache_path) ? @json_decode(@file_get_contents($cache_path), true) : null;
+        return is_array($stale) ? $stale : [];
+    }
+
+    // stable-check maps every version -> 'latest' | 'outdated' | 'insecure'.
+    // Sort newest-first and keep a usable slice: the whole list is ~700 entries
+    // going back to 0.71, which is noise in a dropdown.
+    $versions = array_keys($all);
+    usort($versions, static fn($a, $b) => version_compare($b, $a));
+    $versions = array_slice($versions, 0, 40);
+
+    $out = [];
+    foreach ($versions as $v) {
+        $out[] = ['version' => $v, 'status' => $all[$v]];
+    }
+
+    @mkdir(dirname($cache_path), 0755, true);
+    @file_put_contents($cache_path, json_encode($out));
+    return $out;
+}
+
 function cove_read_size_cache($path) {
     if (!file_exists($path)) return [];
     $data = @json_decode(@file_get_contents($path), true);
@@ -2143,6 +2186,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
         echo json_encode($sites_info);
         exit;
     }
+    if ($action === 'wp_versions') {
+        echo json_encode(cove_wp_versions($__cove_wpver_cache));
+        exit;
+    }
 }
 
 // Handle POST requests for adding/deleting/reloading
@@ -2172,12 +2219,21 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     switch ($action) {
         case 'add_site':
             if (!empty($site_name) && preg_match('/^[a-zA-Z0-9-]+$/', $site_name)) {
-                $type_flag = ($input['is_plain'] ?? false) ? '--plain' : '';
-                $version_flag = '';
-                if (!empty($input['wp_version']) && preg_match('/^\d+\.\d+(\.\d+)?$/', $input['wp_version'])) {
-                    $version_flag = ' --wp-version=' . escapeshellarg($input['wp_version']);
+                // One positional "flavor" slot, mirroring the CLI: 'plain', a
+                // WordPress version, 'nightly', or nothing at all for latest.
+                // Validated here as well as in cove_add — escapeshellarg stops
+                // shell injection, but there's no reason to hand the CLI a
+                // value the UI already knows is malformed.
+                $flavor = '';
+                if ($input['is_plain'] ?? false) {
+                    $flavor = 'plain';
+                } elseif (!empty($input['wp_version']) && $input['wp_version'] !== 'latest') {
+                    $v = $input['wp_version'];
+                    if ($v === 'nightly' || preg_match('/^\d+(\.\d+){1,2}(-[A-Za-z0-9.]+)?$/', $v)) {
+                        $flavor = $v;
+                    }
                 }
-                $command = sprintf('HOME=%s %s add %s %s %s --no-reload 2>&1', escapeshellarg($user_home), escapeshellarg($cove_path), escapeshellarg($site_name), $type_flag, $version_flag);
+                $command = sprintf('HOME=%s %s add %s %s --no-reload 2>&1', escapeshellarg($user_home), escapeshellarg($cove_path), escapeshellarg($site_name), $flavor !== '' ? escapeshellarg($flavor) : '');
                 // Remember we're adding so the post-exec block below can
                 // measure the new site's size and fold it into the cache.
                 $add_site_target = $site_name;
@@ -2651,7 +2707,8 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
         .add-row input[type="text"]:focus { outline: 0; border-color: var(--accent); }
         .add-row .plain-toggle { display: inline-flex; align-items: center; gap: 0.4rem; color: var(--text-dim); font-size: 0.85rem; cursor: pointer; }
         .add-row .plain-toggle input { accent-color: var(--accent); }
-        .add-row input.wp-version { min-width: 0; width: 170px; flex: none; }
+        .add-row select.wp-version { background: var(--input-bg); border: 1px solid var(--panel-border); color: var(--text); font-family: var(--font-mono); font-size: 0.85rem; padding: 0.5rem 0.7rem; border-radius: var(--radius-md); flex: none; cursor: pointer; }
+        .add-row select.wp-version:focus { outline: 0; border-color: var(--accent); }
 
         /* Site list — one grid on the <ul>, rows inherit its columns via
            subgrid so type/modified/size/actions align vertically across rows
@@ -2924,7 +2981,13 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                         <input type="checkbox" x-model="newSite.isPlain" :disabled="newSite.isLoading">
                         plain (no WordPress)
                     </label>
-                    <input type="text" class="wp-version" x-show="!newSite.isPlain" x-model="newSite.wpVersion" placeholder="WP version (e.g. 6.4.3)" pattern="\d+\.\d+(\.\d+)?" title="Numeric version like 6.4 or 6.4.3" :disabled="newSite.isLoading || newSite.isPlain">
+                    <select class="wp-version" x-show="!newSite.isPlain" x-model="newSite.wpVersion" :disabled="newSite.isLoading || newSite.isPlain" title="WordPress version to install" aria-label="WordPress version" style="display: none;">
+                        <option value="latest">latest</option>
+                        <option value="nightly">nightly</option>
+                        <template x-for="v in wpVersions" :key="v.version">
+                            <option :value="v.version" x-text="v.version + (v.status === 'insecure' ? ' — insecure' : '')"></option>
+                        </template>
+                    </select>
                     <button class="pill primary" type="submit" :disabled="!newSite.name || newSite.isLoading">
                         <span class="btn-spinner" x-show="newSite.isLoading" aria-hidden="true" style="display: none;"></span>
                         <span x-text="newSite.isLoading ? 'creating…' : 'create'"></span>
@@ -3148,7 +3211,12 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 rename: { open: false, site: null, value: '', busy: false },
                 logView: { open: false, site: '', text: '', truncated: false, busy: false, raw: false },
                 _initialised: false,
-                newSite: { name: '', isPlain: false, wpVersion: '', isLoading: false },
+                newSite: { name: '', isPlain: false, wpVersion: 'latest', isLoading: false },
+                // Populated lazily the first time the add row opens — no reason
+                // to hit wp.org on a page load that never creates a site. Stays
+                // empty when offline, leaving 'latest' and 'nightly' available.
+                wpVersions: [],
+                wpVersionsLoaded: false,
                 snackbar: { visible: false, message: '', isError: false, timer: null, action: null, actionLabel: '' },
                 // Deletes are staged for a short undo window before anything is
                 // sent to the backend. One batch at a time; staging more sites
@@ -3325,8 +3393,23 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 toggleAdd() {
                     this.adding = !this.adding;
                     if (this.adding) {
+                        this.loadWpVersions();
                         this.$nextTick(() => { if (this.$refs.newSiteInput) this.$refs.newSiteInput.focus(); });
                     }
+                },
+
+                // Fetched once per page load, and cached server-side for a day.
+                // Deliberately silent on failure: an offline machine should
+                // still be able to create a site, it just won't be offered a
+                // pinned version alongside 'latest' and 'nightly'.
+                async loadWpVersions() {
+                    if (this.wpVersionsLoaded) return;
+                    this.wpVersionsLoaded = true;
+                    try {
+                        const res = await fetch('api.php?action=wp_versions');
+                        const data = await res.json();
+                        if (Array.isArray(data)) this.wpVersions = data;
+                    } catch (e) { /* offline — 'latest' still works */ }
                 },
 
                 formatSize(bytes) {
@@ -3716,9 +3799,12 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                     this.newSite.isLoading = true;
                     const name = this.newSite.name;
                     const isPlain = this.newSite.isPlain;
-                    const wpVersion = this.newSite.isPlain ? '' : this.newSite.wpVersion.trim();
+                    // 'latest' is the server's default, so it's sent as nothing
+                    // at all — keeps the generated command identical to what a
+                    // plain `cove add <name>` produces.
+                    const wpVersion = isPlain ? '' : this.newSite.wpVersion;
 
-                    const add = await this.apiPost('add_site', { site_name: name, is_plain: isPlain, wp_version: wpVersion || undefined });
+                    const add = await this.apiPost('add_site', { site_name: name, is_plain: isPlain, wp_version: (wpVersion && wpVersion !== 'latest') ? wpVersion : undefined });
                     if (add.success) {
                         // Optimistic insert: we already know every field the row
                         // template uses. No auto-refresh — the Caddy reload that
@@ -3740,7 +3826,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                         });
                         this.showSnack('Site created.');
                         this.newSite.name = '';
-                        this.newSite.wpVersion = '';
+                        this.newSite.wpVersion = 'latest';
                         this.adding = false;
                         this.apiPost('reload_server'); // fire and forget — Caddy reloads in the background
 
@@ -4061,16 +4147,26 @@ display_command_help() {
             echo "  --totals       Calculates and displays the size of each site's public directory."
             ;;
         add)
-            echo "Usage: cove add <name> [--plain] [--wp-version=<version>]"
+            echo "Usage: cove add <name> [flavor]"
             echo ""
             echo "Creates a new local site accessible at 'https://<name>.localhost'."
             echo ""
             echo "Arguments:"
             echo "  <name>         The name for the new site. Becomes the subdomain."
+            echo "  [flavor]       What goes inside the site. Defaults to the latest WordPress."
+            echo "                   <version>  A WordPress version: 6.4, 6.4.3, or 6.9-RC1."
+            echo "                   nightly    WordPress trunk, rebuilt daily."
+            echo "                   latest     The newest WordPress release (the default)."
+            echo "                   plain      A static HTML site with no database."
             echo ""
             echo "Flags:"
-            echo "  --plain                Creates a new static HTML site without a database."
-            echo "  --wp-version=<version> Download a specific WordPress version (e.g. 6.4.3)."
+            echo "  --plain        Alias for the 'plain' flavor."
+            echo ""
+            echo "Examples:"
+            echo "  cove add mysite              Latest WordPress."
+            echo "  cove add mysite 6.4.3        WordPress pinned to 6.4.3."
+            echo "  cove add mysite nightly      WordPress trunk."
+            echo "  cove add mysite plain        Static site, no database."
             ;;
         delete)
             echo "Usage: cove delete <name> [--force]"

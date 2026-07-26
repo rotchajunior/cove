@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+### ✨ New Features
+
+* **Choose the WordPress Version When Creating a Site:** `cove add` now takes an optional second argument saying what goes inside the site — `cove add mysite 6.4.3` pins a release, `cove add mysite 6.9-RC1` installs a prerelease, and `cove add mysite nightly` tracks trunk. Reproducing a bug report against the version it was filed on, or checking a plugin against the next release before it ships, no longer means installing the latest and downgrading by hand. The same slot also accepts `plain`, so `cove add mysite plain` is now the natural way to spell what `--plain` has always done, and `latest` is the default you get by passing nothing. `--plain` and `--wp-version=` remain accepted, so nothing that already worked stops working. On the dashboard, the add-site form gained a version dropdown listing the releases wp.org actually shipped (fetched once and cached for a day, flagging the ones marked insecure) rather than a text box you can typo into a failed install two minutes later — and it falls back to `latest` and `nightly` when the machine is offline.
+
 ## [1.12] - 2026-07-26
 
 The dashboard grows up: a `⌘K` command palette, right-click and `⋯` row menus, keyboard navigation, and pinned sites, so an install with hundreds of sites stays navigable. `cove pull` and `cove push` now run on Cove's own backup/restore engine over SSH instead of fetching an external script — which also means they work against hosts missing `zip`, `unzip`, `wget`, or a MySQL client. Every interactive prompt gained a flag equivalent so scripts and AI agents never stall on a question they can't answer, a new `cove health` diagnoses crashes and OPcache pressure, and a run of stability fixes clears the OPcache and Imagick segfaults that had been restarting FrankenPHP under load.

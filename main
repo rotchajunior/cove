@@ -2791,8 +2791,8 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
     <script>
         // Set data-theme synchronously before any CSS paints, so the correct
         // theme's background is used from the very first frame (no FOUC).
-        // Alpine re-reads the same localStorage key in init() — values stay
-        // in sync with no extra flip.
+        // The dashboard script re-reads the same localStorage key in init()
+        // — values stay in sync with no extra flip.
         (function () {
             try {
                 var s = localStorage.getItem('theme');
@@ -2807,7 +2807,6 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,400..600;1,9..144,400..600&family=Geist:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
-    <script src="//unpkg.com/alpinejs" defer></script>
     <style>
         *, *::before, *::after { box-sizing: border-box; }
         html, body { margin: 0; padding: 0; }
@@ -3141,6 +3140,12 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
         .refresh-btn.spinning { animation: spin 1s linear infinite; pointer-events: none; }
         @keyframes spin { to { transform: rotate(360deg); } }
 
+        /* Pop-in fade for banners, menus, modals, palette and snackbar.
+           Toggling display:none → visible replays the animation, so showing
+           an element is all it takes to get the fade. */
+        @keyframes cove-fade { from { opacity: 0; } }
+        .new-site-alert, .filter-chip, .add-row, .modal-backdrop, .ctx-menu, .palette-backdrop, .snackbar { animation: cove-fade 140ms ease; }
+
         /* Modal */
         .modal-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,0.55); display: grid; place-items: center; z-index: 80; padding: 1rem; }
         html[data-theme="light"] .modal-backdrop { background: rgba(20,20,18,0.35); }
@@ -3165,9 +3170,8 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
         .log-pane { max-height: 55vh; overflow: auto; white-space: pre-wrap; word-break: break-word; font-size: 0.76rem !important; line-height: 1.5; }
 
         /* Snackbar */
-        /* Centered via auto margins + fit-content width, NOT transform — Alpine
-           writes transform inline during x-transition, which would wipe out a
-           translateX(-50%) centering and slide the snackbar in from the edge. */
+        /* Centered via auto margins + fit-content width — no transform needed,
+           so the fade animation can't interfere with positioning. */
         .snackbar { position: fixed; bottom: 1.5rem; left: 0; right: 0; margin-inline: auto; width: max-content; max-width: 90vw; display: flex; align-items: center; gap: 0.9rem; background: var(--text); color: var(--bg); padding: 0.7rem 1.15rem; border-radius: 10px; font-size: 0.88rem; z-index: 200; box-shadow: 0 10px 30px rgba(0,0,0,0.25); }
         .snackbar.error { background: var(--danger); color: white; }
         .snackbar-action { background: transparent; border: 0; padding: 0; color: inherit; font: inherit; font-weight: 600; text-decoration: underline; text-underline-offset: 2px; cursor: pointer; }
@@ -3187,7 +3191,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
         }
     </style>
 </head>
-<body x-data="dashboard" x-init="init()">
+<body>
     <div class="wrap">
         <nav class="nav">
             <a class="logo" href="/">
@@ -3211,10 +3215,10 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             </a>
             <div class="nav-services services">
                 <span class="dot" title="Caddy is serving this page — it's running">caddy</span>
-                <button type="button" class="dot link" @click="showDbModal = true" title="Database credentials">mariadb</button>
-                <a class="dot link" :href="mailpitUrl" target="_blank" rel="noopener" title="Open Mailpit">mailpit</a>
+                <button type="button" id="btnDbDot" class="dot link" title="Database credentials">mariadb</button>
+                <a class="dot link" href="https://mail.cove.localhost<?= $__cove_port_suffix ?>" target="_blank" rel="noopener" title="Open Mailpit">mailpit</a>
             </div>
-            <button class="theme-btn" @click="toggleTheme()" :title="theme === 'light' ? 'Switch to dark mode' : 'Switch to light mode'" aria-label="Toggle theme">
+            <button class="theme-btn" id="btnTheme" title="Toggle theme" aria-label="Toggle theme">
                 <svg class="icon-moon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13.5 9.2A5.5 5.5 0 0 1 6.8 2.5a5.75 5.75 0 1 0 6.7 6.7Z"/></svg>
                 <svg class="icon-sun" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="8" cy="8" r="3"/><path d="M8 1.5v1.8M8 12.7v1.8M2.6 2.6l1.3 1.3M12.1 12.1l1.3 1.3M1.5 8h1.8M12.7 8h1.8M2.6 13.4l1.3-1.3M12.1 3.9l1.3-1.3"/></svg>
             </button>
@@ -3232,115 +3236,99 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                         <svg class="pill-icon" width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="4" width="12" height="9" rx="1.5"/><path d="M2.5 5 8 9l5.5-4"/></svg>
                         mail
                     </a>
-                    <button class="pill primary" @click="toggleAdd()" x-text="adding ? 'cancel' : '+ add site'"></button>
+                    <button class="pill primary" id="btnToggleAdd">+ add site</button>
                 </div>
             </header>
 
-            <template x-for="alert in alerts" :key="alert.id">
-                <div class="new-site-alert" x-transition.opacity>
+            <div id="alerts"></div>
+            <template id="tpl-alert">
+                <div class="new-site-alert">
                     <span class="new-site-alert-icon" aria-hidden="true">
                         <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 8.2l3 3 7-7"/></svg>
                     </span>
                     <div class="new-site-alert-text">
-                        <strong x-text="alert.name + '.localhost'"></strong> is ready.
+                        <strong></strong> is ready.
                     </div>
-                    <template x-if="!alert.isPlain">
-                        <button class="pill primary" :disabled="alert.isLoggingIn" @click="loginToNewSite(alert)" x-text="alert.isLoggingIn ? 'opening…' : 'log in to admin'"></button>
-                    </template>
-                    <template x-if="alert.isPlain">
-                        <a class="pill primary" :href="'https://' + alert.name + '.localhost' + PORT_SUFFIX" target="_blank" rel="noopener" @click="dismissAlert(alert.id)">open site</a>
-                    </template>
-                    <button class="new-site-alert-close" @click="dismissAlert(alert.id)" aria-label="Dismiss" title="Dismiss">×</button>
+                    <button class="pill primary alert-login">log in to admin</button>
+                    <a class="pill primary alert-open" target="_blank" rel="noopener">open site</a>
+                    <button class="new-site-alert-close" aria-label="Dismiss" title="Dismiss">×</button>
                 </div>
             </template>
 
             <div class="filter-row">
-                <span class="filter-chip" x-show="typeFilter" x-transition.opacity aria-label="Active type filter" style="display: none;">
-                    <span x-text="typeFilterLabel"></span>
-                    <button type="button" class="filter-chip-x" @click="typeFilter = null; $refs.filterInput.focus()" aria-label="Remove type filter" title="Remove">×</button>
+                <span class="filter-chip" id="typeChip" aria-label="Active type filter" style="display: none;">
+                    <span id="typeChipLabel"></span>
+                    <button type="button" class="filter-chip-x" id="typeChipClear" aria-label="Remove type filter" title="Remove">×</button>
                 </span>
                 <input
                     class="filter-input"
+                    id="filterInput"
                     type="text"
-                    x-model="filter"
-                    x-ref="filterInput"
                     placeholder="filter sites by name or type…"
                     spellcheck="false"
                     autocomplete="off"
                     autocapitalize="off"
                     autocorrect="off"
-                    @keydown.escape.prevent="filter = ''; $event.target.blur()"
                     aria-label="Filter sites"
                 >
                 <button
                     type="button"
                     class="bulk-delete-btn"
-                    :class="{ armed: bulkArmed }"
-                    x-show="(filter || typeFilter) && filteredSites.length > 0 && filteredSites.length < sites.length"
-                    @click="bulkDelete()"
-                    :title="'Delete every site matching the current filter'"
-                    x-text="bulkArmed ? ('sure? delete ' + filteredSites.length) : ('delete ' + filteredSites.length + ' shown')"
+                    id="btnBulkDelete"
+                    title="Delete every site matching the current filter"
                     style="display: none;"></button>
-                <span class="filter-kbd" x-show="!filter && !typeFilter" aria-hidden="true">/</span>
-                <button class="filter-clear" x-show="filter || typeFilter" @click="clearAllFilters(); $refs.filterInput.focus()" aria-label="Clear filter" title="Clear all (Esc)">×</button>
+                <span class="filter-kbd" id="filterKbd" aria-hidden="true">/</span>
+                <button class="filter-clear" id="btnFilterClear" aria-label="Clear filter" title="Clear all (Esc)" style="display: none;">×</button>
             </div>
 
-            <div x-show="adding" x-transition.opacity class="add-row" :class="{ 'is-creating': newSite.isLoading }" style="display: none;">
-                <form @submit.prevent="addSite()">
-                    <input type="text" x-model="newSite.name" @input="newSite.name = newSite.name.toLowerCase().replace(/[^a-z0-9-]/g, '')" placeholder="site-name" required :disabled="newSite.isLoading" x-ref="newSiteInput">
+            <div class="add-row" id="addRow" style="display: none;">
+                <form id="addForm">
+                    <input type="text" id="newSiteName" placeholder="site-name" required>
                     <label class="plain-toggle">
-                        <input type="checkbox" x-model="newSite.isPlain" :disabled="newSite.isLoading">
+                        <input type="checkbox" id="newSitePlain">
                         plain (no WordPress)
                     </label>
-                    <select class="wp-version" x-show="!newSite.isPlain" x-model="newSite.wpVersion" :disabled="newSite.isLoading || newSite.isPlain" title="WordPress version to install" aria-label="WordPress version" style="display: none;">
+                    <select class="wp-version" id="wpVersionSelect" title="WordPress version to install" aria-label="WordPress version">
                         <option value="latest">latest</option>
                         <option value="nightly">nightly</option>
-                        <template x-for="v in wpVersions" :key="v.version">
-                            <option :value="v.version" x-text="v.version + (v.status === 'insecure' ? ' — insecure' : '')"></option>
-                        </template>
                     </select>
-                    <button class="pill primary" type="submit" :disabled="!newSite.name || newSite.isLoading">
-                        <span class="btn-spinner" x-show="newSite.isLoading" aria-hidden="true" style="display: none;"></span>
-                        <span x-text="newSite.isLoading ? 'creating…' : 'create'"></span>
+                    <button class="pill primary" type="submit" id="btnCreate" disabled>
+                        <span class="btn-spinner" id="createSpinner" aria-hidden="true" style="display: none;"></span>
+                        <span id="createLabel">create</span>
                     </button>
                 </form>
             </div>
 
-            <ul class="site-list">
-                <li class="site-head" x-show="!isLoading && filteredSites.length > 0">
-                    <button type="button" class="site-head-btn" :class="{ active: sort === 'name' }" @click="setSort('name')" title="Sort by name">name<span class="sort-arrow" x-text="sortArrow('name')"></span></button>
-                    <button type="button" class="site-head-btn" :class="{ active: sort === 'type' }" @click="setSort('type')" title="Sort by type">type<span class="sort-arrow" x-text="sortArrow('type')"></span></button>
-                    <button type="button" class="site-head-btn site-head-right head-modified" :class="{ active: sort === 'modified' }" @click="setSort('modified')" title="Sort by last modified">modified<span class="sort-arrow" x-text="sortArrow('modified')"></span></button>
-                    <button type="button" class="site-head-btn site-head-right head-size" :class="{ active: sort === 'size' }" @click="setSort('size')" title="Sort by disk size">size<span class="sort-arrow" x-text="sortArrow('size')"></span></button>
+            <ul class="site-list" id="siteList">
+                <li class="site-head" id="siteHead" style="display: none;">
+                    <button type="button" class="site-head-btn" data-sort="name" title="Sort by name">name<span class="sort-arrow"></span></button>
+                    <button type="button" class="site-head-btn" data-sort="type" title="Sort by type">type<span class="sort-arrow"></span></button>
+                    <button type="button" class="site-head-btn site-head-right head-modified" data-sort="modified" title="Sort by last modified">modified<span class="sort-arrow"></span></button>
+                    <button type="button" class="site-head-btn site-head-right head-size" data-sort="size" title="Sort by disk size">size<span class="sort-arrow"></span></button>
                     <span aria-hidden="true"></span>
                 </li>
-                <template x-for="site in filteredSites" :key="site.name">
-                    <li class="site-row" :class="{ 'is-selected': selectedName === site.name, 'has-menu': ctxMenu.open && ctxMenu.site && ctxMenu.site.name === site.name, 'is-pinned': isPinned(site.name) }" @click="openSite(site)" @contextmenu.prevent="openRowMenu(site, $event)">
-                        <a class="site-domain" :href="site.domain" target="_blank" rel="noopener" @click.stop x-html="highlightedDomain(site.domain, filter)"></a>
+                <template id="tpl-site-row">
+                    <li class="site-row">
+                        <a class="site-domain" target="_blank" rel="noopener"></a>
                         <span class="site-type-cell">
-                            <span class="site-type" :class="site.type === 'WordPress' ? 'wp' : 'static'" @click.stop="typeFilter = site.type" :title="'Filter to ' + (site.type === 'WordPress' ? 'WordPress' : 'static') + ' sites'" x-text="site.type === 'WordPress' ? 'WP' : 'STATIC'"></span>
-                            <span class="site-wp-version" x-show="site.wp_version" :class="site.wp_status" :title="site.wp_status === 'insecure' ? 'WordPress ' + site.wp_version + ' — wp.org marks this release insecure. Update with: cove core update ' + site.name : 'WordPress ' + site.wp_version" x-text="site.wp_version" style="display: none;"></span>
+                            <span class="site-type"></span>
+                            <span class="site-wp-version"></span>
                         </span>
-                        <span class="site-modified" x-text="formatRelative(site.modified_at)" :title="site.modified_at ? new Date(site.modified_at * 1000).toLocaleString() : ''"></span>
-                        <span class="site-size" x-text="formatSize(site.size_bytes)"></span>
+                        <span class="site-modified"></span>
+                        <span class="site-size"></span>
                         <div class="site-actions">
-                            <template x-if="site.type === 'WordPress'">
-                                <button class="site-action-btn" :class="{ loading: site.isLoggingIn }" @click.stop="getLoginLink(site.name)" :disabled="site.isLoggingIn" :title="'One-time admin login for ' + site.name">
-                                    <span class="btn-label">login</span>
-                                    <span class="btn-spinner" aria-hidden="true"></span>
-                                </button>
-                            </template>
+                            <button class="site-action-btn site-login-btn">
+                                <span class="btn-label">login</span>
+                                <span class="btn-spinner" aria-hidden="true"></span>
+                            </button>
                             <!-- Always rendered, unlike the hover-only links: this is the
                                  only way the row's actions are reachable on touch. -->
-                            <button class="row-menu-btn" :class="{ active: ctxMenu.open && ctxMenu.site && ctxMenu.site.name === site.name }" @click.stop="openRowMenu(site, $event)" :aria-label="'Actions for ' + site.name" title="Actions">⋯</button>
+                            <button class="row-menu-btn" title="Actions">⋯</button>
                         </div>
                     </li>
                 </template>
-                <template x-if="isLoading">
-                    <li class="loading">Loading sites…</li>
-                </template>
-                <template x-if="!isLoading && sites.length === 0">
-                    <li class="empty">
+                <li class="loading" id="siteLoading">Loading sites…</li>
+                <li class="empty" id="emptyNone" style="display: none;">
                         <svg class="empty-art" viewBox="0 0 104 68" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                             <path class="art-fill" d="M52 12 L68 38 H52 Z"/>
                             <path class="art-line" d="M52 10 v30"/>
@@ -3350,12 +3338,10 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                             <path class="art-wave" d="M8 56 Q 15 52, 22 56 T 36 56 T 50 56 T 64 56 T 78 56 T 92 56"/>
                             <path class="art-wave" d="M20 62 Q 27 58, 34 62 T 48 62 T 62 62 T 76 62" opacity="0.35"/>
                         </svg>
-                        <div>No sites in the cove yet.</div>
-                        <div class="empty-hint">Click <em>+ add site</em>, or run <code>cove add myblog</code>.</div>
-                    </li>
-                </template>
-                <template x-if="!isLoading && sites.length > 0 && filteredSites.length === 0">
-                    <li class="empty">
+                    <div>No sites in the cove yet.</div>
+                    <div class="empty-hint">Click <em>+ add site</em>, or run <code>cove add myblog</code>.</div>
+                </li>
+                <li class="empty" id="emptyFilter" style="display: none;">
                         <svg class="empty-art" viewBox="0 0 104 68" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                             <path class="art-line" d="M52 44 v-14 q0 -6 6 -6 h4"/>
                             <path class="art-line" d="M62 18 h8 q3 0 3 3 v3 h-11 q-3 0 -3 -3 v-3 Z"/>
@@ -3365,23 +3351,22 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                             <path class="art-wave" d="M8 56 Q 15 52, 22 56 T 36 56 T 50 56 T 64 56 T 78 56 T 92 56"/>
                             <path class="art-wave" d="M20 62 Q 27 58, 34 62 T 48 62 T 62 62 T 76 62" opacity="0.35"/>
                         </svg>
-                        <div>Nothing surfaced for <code x-text="filter || typeFilterLabel"></code>.</div>
-                        <div class="empty-hint">Press Esc to clear.</div>
-                    </li>
-                </template>
+                    <div>Nothing surfaced for <code id="emptyFilterQuery"></code>.</div>
+                    <div class="empty-hint">Press Esc to clear.</div>
+                </li>
             </ul>
 
             <footer class="card-foot">
                 <div class="totals">
-                    <span x-text="siteCountLabel"></span>
-                    <span x-show="totalBytes > 0" x-text="'· ' + formatSize(totalBytes)"></span>
-                    <button type="button" class="refresh-btn" :class="{ spinning: isRefreshingSizes }" @click="refreshSizes()" :disabled="isRefreshingSizes" :title="isRefreshingSizes ? 'Refreshing…' : 'Refresh disk sizes'">↻</button>
+                    <span id="siteCount"></span>
+                    <span id="totalSize" style="display: none;"></span>
+                    <button type="button" class="refresh-btn" id="btnRefreshSizes" title="Refresh disk sizes">↻</button>
                 </div>
             </footer>
         </section>
     </div>
 
-    <div x-show="showDbModal" x-transition.opacity class="modal-backdrop" @click.self="showDbModal = false" @keydown.escape.window="showDbModal = false" style="display: none;">
+    <div class="modal-backdrop" id="dbModal" style="display: none;">
         <div class="modal">
             <h3>Database credentials</h3>
             <p class="modal-sub">Cove uses these to create new WordPress databases.</p>
@@ -3397,103 +3382,85 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             </div>
             <div class="modal-foot">
                 <span>stored in <?= htmlspecialchars(str_replace(getenv('HOME'), '~', $config_file)) ?></span>
-                <button class="pill" @click="showDbModal = false">close</button>
+                <button class="pill" id="btnDbClose">close</button>
             </div>
         </div>
     </div>
 
     <!-- Rename -->
-    <div x-show="rename.open" x-transition.opacity class="modal-backdrop" @click.self="rename.open = false" @keydown.escape.window="rename.open = false" style="display: none;">
+    <div class="modal-backdrop" id="renameModal" style="display: none;">
         <div class="modal">
             <h3>Rename site</h3>
             <p class="modal-sub">Renames the directory, the database, and the local URL. Any bookmark to the old address stops working.</p>
-            <form @submit.prevent="submitRename()">
-                <input class="modal-input" type="text" x-model="rename.value" x-ref="renameInput" spellcheck="false" autocomplete="off"
-                    placeholder="new-name" :disabled="rename.busy" @keydown.escape.prevent="rename.open = false">
-                <div class="modal-hint"><span x-text="rename.value ? rename.value + '.localhost' : '\u00a0'"></span></div>
+            <form id="renameForm">
+                <input class="modal-input" type="text" id="renameInput" spellcheck="false" autocomplete="off" placeholder="new-name">
+                <div class="modal-hint"><span id="renameHint">&nbsp;</span></div>
                 <div class="modal-actions">
-                    <button type="button" class="pill" @click="rename.open = false" :disabled="rename.busy">cancel</button>
-                    <button type="submit" class="pill primary" :disabled="rename.busy || !rename.value" x-text="rename.busy ? 'renaming…' : 'rename'"></button>
+                    <button type="button" class="pill" id="btnRenameCancel">cancel</button>
+                    <button type="submit" class="pill primary" id="btnRenameSubmit">rename</button>
                 </div>
             </form>
         </div>
     </div>
 
     <!-- Site log -->
-    <div x-show="logView.open" x-transition.opacity class="modal-backdrop" @click.self="logView.open = false" @keydown.escape.window="logView.open = false" style="display: none;">
+    <div class="modal-backdrop" id="logModal" style="display: none;">
         <div class="modal modal-wide">
-            <h3>Log <span class="modal-title-dim" x-text="logView.site"></span></h3>
-            <p class="modal-sub" x-show="logView.truncated">Showing the most recent 64KB.</p>
-            <pre class="log-pane" x-ref="logPane" x-text="logDisplay"></pre>
+            <h3>Log <span class="modal-title-dim" id="logTitle"></span></h3>
+            <p class="modal-sub" id="logTruncated" style="display: none;">Showing the most recent 64KB.</p>
+            <pre class="log-pane" id="logPane"></pre>
             <div class="modal-actions">
-                <button type="button" class="pill" @click="logView.raw = !logView.raw" x-text="logView.raw ? 'formatted' : 'raw'"></button>
-                <button type="button" class="pill" @click="viewLog({ name: logView.site }, true)" :disabled="logView.busy">refresh</button>
-                <button type="button" class="pill primary" @click="logView.open = false">close</button>
+                <button type="button" class="pill" id="btnLogRaw">raw</button>
+                <button type="button" class="pill" id="btnLogRefresh">refresh</button>
+                <button type="button" class="pill primary" id="btnLogClose">close</button>
             </div>
         </div>
     </div>
 
     <!-- Context menu: one component driven by both right-click on a row and the
          row's ⋯ button, so the two affordances can never drift apart. -->
-    <div x-show="ctxMenu.open" class="ctx-menu" :style="{ left: ctxMenu.x + 'px', top: ctxMenu.y + 'px' }" @click.outside="closeRowMenu()" x-transition.opacity.duration.100ms style="display: none;">
-        <template x-if="ctxMenu.site">
-            <div>
-                <div class="ctx-title" x-text="ctxMenu.site.domain.replace('https://','')"></div>
-                <button class="ctx-item" @click="openSite(ctxMenu.site); closeRowMenu()"><span>Open site</span><span class="ctx-key">↵</span></button>
-                <template x-if="ctxMenu.site.type === 'WordPress'">
-                    <button class="ctx-item" @click="getLoginLink(ctxMenu.site.name); closeRowMenu()"><span>Log in to admin</span><span class="ctx-key">⌘↵</span></button>
-                </template>
-                <div class="ctx-sep"></div>
-                <button class="ctx-item" @click="promptRename(ctxMenu.site); closeRowMenu()"><span>Rename…</span></button>
-                <button class="ctx-item" @click="revealSite(ctxMenu.site.name); closeRowMenu()"><span x-text="revealLabel"></span></button>
-                <template x-if="ctxMenu.site.type === 'WordPress'">
-                    <button class="ctx-item" @click="openSiteDb(ctxMenu.site); closeRowMenu()"><span>Open database</span></button>
-                </template>
-                <button class="ctx-item" @click="viewLog(ctxMenu.site); closeRowMenu()"><span>View log</span></button>
-                <div class="ctx-sep"></div>
-                <button class="ctx-item" @click="copyPath(ctxMenu.site.full_path); closeRowMenu()"><span>Copy path</span></button>
-                <button class="ctx-item" @click="togglePin(ctxMenu.site.name); closeRowMenu()"><span x-text="isPinned(ctxMenu.site.name) ? 'Unpin from top' : 'Pin to top'"></span></button>
-                <div class="ctx-sep"></div>
-                <button class="ctx-item danger" @click="deleteSite(ctxMenu.site.name); closeRowMenu()"><span>Delete site</span><span class="ctx-key">⌘⌫</span></button>
-            </div>
-        </template>
+    <div class="ctx-menu" id="ctxMenu" style="display: none;">
+        <div>
+            <div class="ctx-title" id="ctxTitle"></div>
+            <button class="ctx-item" id="ctxOpen"><span>Open site</span><span class="ctx-key">↵</span></button>
+            <button class="ctx-item" id="ctxLogin"><span>Log in to admin</span><span class="ctx-key">⌘↵</span></button>
+            <div class="ctx-sep"></div>
+            <button class="ctx-item" id="ctxRename"><span>Rename…</span></button>
+            <button class="ctx-item" id="ctxReveal"><span>Open folder</span></button>
+            <button class="ctx-item" id="ctxDb"><span>Open database</span></button>
+            <button class="ctx-item" id="ctxLog"><span>View log</span></button>
+            <div class="ctx-sep"></div>
+            <button class="ctx-item" id="ctxCopy"><span>Copy path</span></button>
+            <button class="ctx-item" id="ctxPin"><span>Pin to top</span></button>
+            <div class="ctx-sep"></div>
+            <button class="ctx-item danger" id="ctxDelete"><span>Delete site</span><span class="ctx-key">⌘⌫</span></button>
+        </div>
     </div>
 
     <!-- Command palette. Primary navigation once the list is longer than a
          screen, which on a real install it always is. -->
-    <div x-show="palette.open" class="palette-backdrop" @click.self="closePalette()" x-transition.opacity.duration.120ms style="display: none;">
+    <div class="palette-backdrop" id="paletteBackdrop" style="display: none;">
         <div class="palette">
-            <input class="palette-input" type="text" x-model="palette.query" x-ref="paletteInput"
+            <input class="palette-input" id="paletteInput" type="text"
                 placeholder="Search sites, or type a command…" spellcheck="false" autocomplete="off"
-                @keydown.arrow-down.prevent="paletteMove(1)"
-                @keydown.arrow-up.prevent="paletteMove(-1)"
-                @keydown.enter.prevent="paletteRun($event)"
-                @keydown.escape.prevent="closePalette()"
                 aria-label="Command palette">
-            <ul class="palette-list" x-ref="paletteList">
-                <template x-for="(item, i) in paletteResults" :key="item.key">
-                    <li class="palette-item" :class="{ active: i === palette.index }" @click="paletteRunItem(item)" @mouseenter="palette.index = i">
-                        <span class="pi-kind" x-text="item.kind"></span>
-                        <span class="pi-name" x-text="item.label"></span>
-                        <span class="pi-meta" x-text="item.meta"></span>
-                    </li>
-                </template>
-                <template x-if="paletteResults.length === 0">
-                    <li class="palette-empty">No matches.</li>
-                </template>
-            </ul>
+            <ul class="palette-list" id="paletteList"></ul>
+            <template id="tpl-palette-item">
+                <li class="palette-item">
+                    <span class="pi-kind"></span>
+                    <span class="pi-name"></span>
+                    <span class="pi-meta"></span>
+                </li>
+            </template>
             <div class="palette-hint">
                 <span>↑↓ navigate</span><span>↵ open</span><span>⌘↵ log in</span><span>esc close</span>
             </div>
         </div>
     </div>
 
-    <div x-show="snackbar.visible" x-transition.opacity.duration.200ms class="snackbar" :class="{ error: snackbar.isError }" style="display: none;">
-        <span x-text="snackbar.message"></span>
-        <!-- !! matters: x-show/@click expressions that RESULT in a function get
-             auto-invoked by Alpine, so a bare `snackbar.action` here would run
-             the undo handler on every render. -->
-        <button type="button" class="snackbar-action" x-show="!!snackbar.action" @click="if (snackbar.action) snackbar.action()" x-text="snackbar.actionLabel" style="display: none;"></button>
+    <div class="snackbar" id="snackbar" style="display: none;">
+        <span id="snackMsg"></span>
+        <button type="button" class="snackbar-action" id="snackAction" style="display: none;"></button>
     </div>
 
     <script>
@@ -3502,830 +3469,1300 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
         // Adminer needs the username to deep-link straight into a site's schema.
         const DB_USER = '<?= htmlspecialchars($config_data['DB_USER'] ?? '', ENT_QUOTES) ?>';
 
-        document.addEventListener('alpine:init', () => {
-            Alpine.data('dashboard', () => ({
-                // Respect the OS theme preference on first visit, dark otherwise.
-                theme: localStorage.getItem('theme') || (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark'),
-                sites: [],
-                isLoading: true,
-                adding: false,
-                showDbModal: false,
-                isRefreshingSizes: false,
-                filter: '',
-                typeFilter: null, // null | 'WordPress' | 'Plain' — set via the row type pills, cleared via the chip × or overall filter clear
-                // Default to most-recently-modified rather than alphabetical: on an
-                // install with hundreds of sites, "what was I just working on" is a
-                // far better landing state than "what starts with A".
-                sort: ['name', 'type', 'size', 'modified'].includes(localStorage.getItem('sort')) ? localStorage.getItem('sort') : 'modified',
-                sortDir: ['asc', 'desc'].includes(localStorage.getItem('sortDir')) ? localStorage.getItem('sortDir') : 'desc',
-                pinned: (() => { try { return JSON.parse(localStorage.getItem('pinned')) || []; } catch (e) { return []; } })(),
-                selectedName: null,
-                ctxMenu: { open: false, site: null, x: 0, y: 0 },
-                palette: { open: false, query: '', index: 0 },
-                rename: { open: false, site: null, value: '', busy: false },
-                logView: { open: false, site: '', text: '', truncated: false, busy: false, raw: false },
-                _initialised: false,
-                newSite: { name: '', isPlain: false, wpVersion: 'latest', isLoading: false },
-                // Populated lazily the first time the add row opens — no reason
-                // to hit wp.org on a page load that never creates a site. Stays
-                // empty when offline, leaving 'latest' and 'nightly' available.
-                wpVersions: [],
-                wpVersionsLoaded: false,
-                snackbar: { visible: false, message: '', isError: false, timer: null, action: null, actionLabel: '' },
-                // Deletes are staged for a short undo window before anything is
-                // sent to the backend. One batch at a time; staging more sites
-                // merges into it and restarts the window.
-                pendingDelete: null, // { sites: [...], timer }
-                bulkArmed: false,
-                bulkArmTimer: null,
-                // Persistent dismissible banners for newly-created sites — the
-                // snackbar only lives ~3.5s, not long enough to reach for the
-                // admin login after spinning up a fresh install.
-                alerts: [],
-                deleteQueue: [],
-                isProcessingQueue: false,
+        // No framework: state lives on `app`, and every method that mutates
+        // state ends by calling render(). Renderers are idempotent and only
+        // write DOM they own — crucially they never write input values, so
+        // typing never fights the renderer; inputs push into state via their
+        // own listeners and open()-style methods set values explicitly.
+        const $id = (id) => document.getElementById(id);
+        const show = (el, on) => { if (el) el.style.display = on ? '' : 'none'; };
 
-                get adminerUrl() { return 'https://db.cove.localhost' + PORT_SUFFIX; },
-                get mailpitUrl() { return 'https://mail.cove.localhost' + PORT_SUFFIX; },
-                get totalBytes() { return this.sites.reduce((t, s) => t + (s.size_bytes || 0), 0); },
-                get filteredSites() {
-                    // Two independent filters ANDed together: typeFilter (chip,
-                    // exact match on site.type) and filter (free text, substring
-                    // match on name OR type). Keeping them separate means the
-                    // user can type anything in the input without worrying about
-                    // stepping on the type constraint.
-                    let base = [...this.sites];
-                    if (this.typeFilter) {
-                        base = base.filter(s => s.type === this.typeFilter);
-                    }
-                    const q = this.filter.trim().toLowerCase();
-                    if (q) {
-                        base = base.filter(s =>
-                            s.name.toLowerCase().includes(q) ||
-                            (s.type || '').toLowerCase().includes(q));
-                    }
-                    const dir = this.sortDir === 'asc' ? 1 : -1;
-                    if (this.sort === 'size') {
-                        base.sort((a, b) => dir * ((a.size_bytes || 0) - (b.size_bytes || 0)));
-                    } else if (this.sort === 'modified') {
-                        base.sort((a, b) => dir * ((a.modified_at || 0) - (b.modified_at || 0)));
-                    } else if (this.sort === 'type') {
-                        // Version segments compare numerically so 6.10 outranks 6.9.
-                        // Plain sites have no wp_version and stay grouped together.
-                        const vcmp = (a, b) => {
-                            const pa = (a.wp_version || '').split('.'), pb = (b.wp_version || '').split('.');
-                            for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
-                                const d = (parseInt(pa[i], 10) || 0) - (parseInt(pb[i], 10) || 0);
-                                if (d) return d;
-                            }
-                            return 0;
-                        };
-                        base.sort((a, b) => dir * (a.type.localeCompare(b.type) || vcmp(a, b)) || a.name.localeCompare(b.name));
-                    } else {
-                        base.sort((a, b) => dir * a.name.localeCompare(b.name));
-                    }
-                    // Pinned sites float above the chosen sort rather than replacing
-                    // it: out of hundreds of sites only a handful are ever active.
-                    if (this.pinned.length) {
-                        base.sort((a, b) => (this.pinned.includes(b.name) ? 1 : 0) - (this.pinned.includes(a.name) ? 1 : 0));
-                    }
-                    return base;
-                },
+        const app = {
+            // Respect the OS theme preference on first visit, dark otherwise.
+            theme: localStorage.getItem('theme') || (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark'),
+            sites: [],
+            isLoading: true,
+            adding: false,
+            showDbModal: false,
+            isRefreshingSizes: false,
+            filter: '',
+            typeFilter: null, // null | 'WordPress' | 'Plain' — set via the row type pills, cleared via the chip × or overall filter clear
+            // Default to most-recently-modified rather than alphabetical: on an
+            // install with hundreds of sites, "what was I just working on" is a
+            // far better landing state than "what starts with A".
+            sort: ['name', 'type', 'size', 'modified'].includes(localStorage.getItem('sort')) ? localStorage.getItem('sort') : 'modified',
+            sortDir: ['asc', 'desc'].includes(localStorage.getItem('sortDir')) ? localStorage.getItem('sortDir') : 'desc',
+            pinned: (() => { try { return JSON.parse(localStorage.getItem('pinned')) || []; } catch (e) { return []; } })(),
+            selectedName: null,
+            ctxMenu: { open: false, site: null, x: 0, y: 0, openedAt: 0 },
+            palette: { open: false, query: '', index: 0 },
+            rename: { open: false, site: null, value: '', busy: false },
+            logView: { open: false, site: '', text: '', truncated: false, busy: false, raw: false },
+            newSite: { name: '', isPlain: false, wpVersion: 'latest', isLoading: false },
+            // Populated lazily the first time the add row opens — no reason
+            // to hit wp.org on a page load that never creates a site. Stays
+            // empty when offline, leaving 'latest' and 'nightly' available.
+            wpVersions: [],
+            wpVersionsLoaded: false,
+            snackbar: { visible: false, message: '', isError: false, timer: null, action: null, actionLabel: '' },
+            // Deletes are staged for a short undo window before anything is
+            // sent to the backend. One batch at a time; staging more sites
+            // merges into it and restarts the window.
+            pendingDelete: null, // { sites: [...], timer }
+            bulkArmed: false,
+            bulkArmTimer: null,
+            // Persistent dismissible banners for newly-created sites — the
+            // snackbar only lives ~3.5s, not long enough to reach for the
+            // admin login after spinning up a fresh install.
+            alerts: [],
+            deleteQueue: [],
+            isProcessingQueue: false,
+            _paletteItems: [],
 
-                get typeFilterLabel() {
-                    return this.typeFilter === 'WordPress' ? 'type: wp' : 'type: static';
-                },
-
-                clearAllFilters() {
-                    this.filter = '';
-                    this.typeFilter = null;
-                },
-                get siteCountLabel() {
-                    const total = this.sites.length;
-                    const visible = this.filteredSites.length;
-                    const suffix = ' site' + (total === 1 ? '' : 's');
-                    return visible === total ? total + suffix : visible + ' of ' + total + suffix;
-                },
-
-                init() {
-                    if (this._initialised) return;
-                    this._initialised = true;
-
-                    this.applyTheme();
-                    this.$watch('theme', () => { this.applyTheme(); localStorage.setItem('theme', this.theme); });
-
-                    // An armed bulk-delete is scoped to the current result set —
-                    // disarm if the filter changes underneath it.
-                    this.$watch('filter', () => { this.bulkArmed = false; });
-                    this.$watch('typeFilter', () => { this.bulkArmed = false; });
-
-                    // If the tab closes during an undo window, flush the staged
-                    // deletes with keepalive requests so they aren't lost. No
-                    // reload_server here: the next reload from any source
-                    // regenerates from disk and prunes via tombstones.
-                    window.addEventListener('pagehide', () => {
-                        if (!this.pendingDelete) return;
-                        for (const s of this.pendingDelete.sites) {
-                            fetch('api.php', {
-                                method: 'POST',
-                                headers: { 'Content-Type': 'application/json' },
-                                body: JSON.stringify({ action: 'delete_site', site_name: s.name }),
-                                keepalive: true
-                            }).catch(() => {});
+            get adminerUrl() { return 'https://db.cove.localhost' + PORT_SUFFIX; },
+            get mailpitUrl() { return 'https://mail.cove.localhost' + PORT_SUFFIX; },
+            get totalBytes() { return this.sites.reduce((t, s) => t + (s.size_bytes || 0), 0); },
+            get filteredSites() {
+                // Two independent filters ANDed together: typeFilter (chip,
+                // exact match on site.type) and filter (free text, substring
+                // match on name OR type). Keeping them separate means the
+                // user can type anything in the input without worrying about
+                // stepping on the type constraint.
+                let base = [...this.sites];
+                if (this.typeFilter) {
+                    base = base.filter(s => s.type === this.typeFilter);
+                }
+                const q = this.filter.trim().toLowerCase();
+                if (q) {
+                    base = base.filter(s =>
+                        s.name.toLowerCase().includes(q) ||
+                        (s.type || '').toLowerCase().includes(q));
+                }
+                const dir = this.sortDir === 'asc' ? 1 : -1;
+                if (this.sort === 'size') {
+                    base.sort((a, b) => dir * ((a.size_bytes || 0) - (b.size_bytes || 0)));
+                } else if (this.sort === 'modified') {
+                    base.sort((a, b) => dir * ((a.modified_at || 0) - (b.modified_at || 0)));
+                } else if (this.sort === 'type') {
+                    // Version segments compare numerically so 6.10 outranks 6.9.
+                    // Plain sites have no wp_version and stay grouped together.
+                    const vcmp = (a, b) => {
+                        const pa = (a.wp_version || '').split('.'), pb = (b.wp_version || '').split('.');
+                        for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+                            const d = (parseInt(pa[i], 10) || 0) - (parseInt(pb[i], 10) || 0);
+                            if (d) return d;
                         }
-                        this.pendingDelete = null;
-                    });
-
-                    // `/` focuses the filter (GitHub-style). Ignored when typing
-                    // in a form field or holding a modifier key.
-                    window.addEventListener('keydown', (e) => {
-                        const el = document.activeElement;
-                        const tag = el && el.tagName;
-                        const typing = tag === 'INPUT' || tag === 'TEXTAREA' || (el && el.isContentEditable);
-
-                        // Cmd/Ctrl+K opens the palette from anywhere, including
-                        // from inside the filter box — it's the one shortcut that
-                        // should never be swallowed by a focused field.
-                        if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
-                            e.preventDefault();
-                            this.palette.open ? this.closePalette() : this.openPalette();
-                            return;
-                        }
-                        if (this.palette.open) return; // palette owns its own keys
-
-                        // Arrows work while filtering (type to narrow, arrow to pick).
-                        // j/k only outside a text field, or they'd eat typed letters.
-                        const isDown = e.key === 'ArrowDown' || (!typing && e.key === 'j');
-                        const isUp   = e.key === 'ArrowUp'   || (!typing && e.key === 'k');
-                        if ((isDown || isUp) && !e.metaKey && !e.ctrlKey && !e.altKey) {
-                            e.preventDefault();
-                            this.moveSelection(isDown ? 1 : -1);
-                            return;
-                        }
-
-                        if (e.key === 'Enter' && this.selectedName && !this.adding) {
-                            const site = this.selectedSite();
-                            if (!site) return;
-                            e.preventDefault();
-                            if ((e.metaKey || e.ctrlKey) && site.type === 'WordPress') {
-                                this.getLoginLink(site.name);
-                            } else {
-                                this.openSite(site);
-                            }
-                            return;
-                        }
-
-                        if ((e.metaKey || e.ctrlKey) && (e.key === 'Backspace' || e.key === 'Delete') && this.selectedName) {
-                            e.preventDefault();
-                            this.deleteSite(this.selectedName);
-                            return;
-                        }
-
-                        if (e.key === 'Escape') {
-                            if (this.ctxMenu.open) { this.closeRowMenu(); return; }
-                            if (this.selectedName && !typing) { this.selectedName = null; return; }
-                        }
-
-                        if (e.key === '/' && !e.ctrlKey && !e.metaKey && !e.altKey) {
-                            if (typing) return;
-                            e.preventDefault();
-                            this.$refs.filterInput && this.$refs.filterInput.focus();
-                        }
-                    });
-
-                    // A scroll or resize would leave the menu floating away from
-                    // the row it belongs to, so dismiss rather than reposition.
-                    window.addEventListener('scroll', () => { if (this.ctxMenu.open) this.closeRowMenu(); }, { passive: true });
-                    window.addEventListener('resize', () => { if (this.ctxMenu.open) this.closeRowMenu(); });
-
-                    this.getSites().then(() => {
-                        // If the size cache is empty (fresh install or just deleted),
-                        // kick off a background refresh so sizes populate without
-                        // making the user hunt for the ↻ button.
-                        if (this.sites.length > 0 && this.sites.every(s => s.size_bytes === null)) {
-                            this.refreshSizes();
-                        }
-                    });
-                },
-
-                applyTheme() {
-                    document.documentElement.dataset.theme = this.theme;
-                },
-
-                toggleTheme() {
-                    this.theme = this.theme === 'light' ? 'dark' : 'light';
-                },
-
-                toggleAdd() {
-                    this.adding = !this.adding;
-                    if (this.adding) {
-                        this.loadWpVersions();
-                        this.$nextTick(() => { if (this.$refs.newSiteInput) this.$refs.newSiteInput.focus(); });
-                    }
-                },
-
-                // Fetched once per page load, and cached server-side for a day.
-                // Deliberately silent on failure: an offline machine should
-                // still be able to create a site, it just won't be offered a
-                // pinned version alongside 'latest' and 'nightly'.
-                async loadWpVersions() {
-                    if (this.wpVersionsLoaded) return;
-                    this.wpVersionsLoaded = true;
-                    try {
-                        const res = await fetch('api.php?action=wp_versions');
-                        const data = await res.json();
-                        if (Array.isArray(data)) this.wpVersions = data;
-                    } catch (e) { /* offline — 'latest' still works */ }
-                },
-
-                formatSize(bytes) {
-                    if (bytes === null || bytes === undefined) return '—';
-                    if (bytes === 0) return '0 B';
-                    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
-                    const i = Math.min(units.length - 1, Math.floor(Math.log(bytes) / Math.log(1024)));
-                    const v = bytes / Math.pow(1024, i);
-                    return (v >= 10 || i === 0 ? Math.round(v) : v.toFixed(1)) + ' ' + units[i];
-                },
-
-                formatRelative(ts) {
-                    if (!ts) return '—';
-                    const s = Math.max(0, Date.now() / 1000 - ts);
-                    if (s < 60) return 'now';
-                    if (s < 3600) return Math.floor(s / 60) + 'm';
-                    if (s < 86400) return Math.floor(s / 3600) + 'h';
-                    if (s < 86400 * 30) return Math.floor(s / 86400) + 'd';
-                    if (s < 86400 * 365) return Math.floor(s / 86400 / 30) + 'mo';
-                    return Math.floor(s / 86400 / 365) + 'y';
-                },
-
-                escapeHtml(s) {
-                    return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-                },
-
-                // Wrap every case-insensitive occurrence of `query` in <mark> while
-                // escaping every other substring. Safe for x-html use because the
-                // inner text comes from the trusted domain, not from query (query
-                // only controls WHERE to split).
-                highlightMatch(text, query) {
-                    const q = (query || '').trim();
-                    if (!q) return this.escapeHtml(text);
-                    const lower = text.toLowerCase();
-                    const lowerQ = q.toLowerCase();
-                    let out = '';
-                    let i = 0;
-                    while (i < text.length) {
-                        const idx = lower.indexOf(lowerQ, i);
-                        if (idx === -1) { out += this.escapeHtml(text.slice(i)); break; }
-                        out += this.escapeHtml(text.slice(i, idx));
-                        out += '<mark>' + this.escapeHtml(text.slice(idx, idx + q.length)) + '</mark>';
-                        i = idx + q.length;
-                    }
-                    return out;
-                },
-
-                // Wrap the site name in <span class="host-accent"> so it reads
-                // teal while the .localhost suffix stays dim — matches the
-                // landing-page dashboard mock. Split at the first dot; if
-                // there's none, the whole string is treated as the name.
-                highlightedDomain(domain, query) {
-                    const stripped = String(domain).replace(/^https?:\/\//, '');
-                    const dotIdx = stripped.indexOf('.');
-                    if (dotIdx === -1) return '<span class="host-accent">' + this.highlightMatch(stripped, query) + '</span>';
-                    const name = stripped.slice(0, dotIdx);
-                    const suffix = stripped.slice(dotIdx);
-                    return '<span class="host-accent">' + this.highlightMatch(name, query) + '</span>' + this.highlightMatch(suffix, query);
-                },
-
-                // --- Command palette -------------------------------------------
-                // Results mix matching sites with global commands. Sites are ranked
-                // by match position so a prefix hit beats a mid-string one.
-                get paletteResults() {
-                    const q = this.palette.query.trim().toLowerCase();
-                    const out = [];
-                    const commands = [
-                        { key: 'cmd:add',     kind: 'cmd', label: 'Add site',            meta: '',  run: () => { this.closePalette(); this.toggleAdd(); } },
-                        { key: 'cmd:reload',  kind: 'cmd', label: 'Reload server',       meta: '',  run: () => { this.closePalette(); this.reloadServer(); } },
-                        { key: 'cmd:sizes',   kind: 'cmd', label: 'Refresh disk sizes',  meta: '',  run: () => { this.closePalette(); this.refreshSizes(); } },
-                        { key: 'cmd:db',      kind: 'cmd', label: 'Open database',       meta: '',  run: () => { this.closePalette(); window.open('https://db.cove.localhost' + PORT_SUFFIX, '_blank', 'noopener'); } },
-                        { key: 'cmd:mail',    kind: 'cmd', label: 'Open Mailpit',        meta: '',  run: () => { this.closePalette(); window.open(this.mailpitUrl, '_blank', 'noopener'); } },
-                        { key: 'cmd:creds',   kind: 'cmd', label: 'Database credentials',meta: '',  run: () => { this.closePalette(); this.showDbModal = true; } },
-                        { key: 'cmd:theme',   kind: 'cmd', label: 'Toggle theme',        meta: '',  run: () => { this.closePalette(); this.toggleTheme(); } },
-                    ];
-                    let sites = this.sites;
-                    if (q) {
-                        sites = sites
-                            .map(s => ({ s, i: s.name.toLowerCase().indexOf(q) }))
-                            .filter(x => x.i !== -1)
-                            .sort((a, b) => a.i - b.i || a.s.name.localeCompare(b.s.name))
-                            .map(x => x.s);
-                    } else {
-                        // No query: show pinned first, then whatever the list is
-                        // sorted by, capped so the palette stays a menu not a dump.
-                        sites = this.filteredSites;
-                    }
-                    for (const site of sites.slice(0, 40)) {
-                        out.push({
-                            key: 'site:' + site.name,
-                            kind: site.type === 'WordPress' ? 'wp' : 'static',
-                            label: site.name + '.localhost',
-                            meta: this.formatSize(site.size_bytes),
-                            site,
-                            run: () => { this.closePalette(); this.openSite(site); }
-                        });
-                    }
-                    for (const c of commands) {
-                        if (!q || c.label.toLowerCase().includes(q)) out.push(c);
-                    }
-                    return out;
-                },
-
-                async reloadServer() {
-                    this.showSnack('Reloading server…');
-                    const res = await this.apiPostRetry('reload_server', {}, 3, 10000);
-                    if (res.success) this.showSnack('Server reloaded.');
-                },
-
-                // --- Row actions -----------------------------------------------
-                // macOS says "Finder"; everywhere else the file manager has no
-                // one name, so stay generic rather than lie about it.
-                get revealLabel() {
-                    return navigator.platform && navigator.platform.startsWith('Mac')
-                        ? 'Reveal in Finder' : 'Open folder';
-                },
-
-                promptRename(site) {
-                    this.rename = { open: true, site, value: site.name, busy: false };
-                    this.$nextTick(() => {
-                        const el = this.$refs.renameInput;
-                        if (el) { el.focus(); el.select(); }
-                    });
-                },
-
-                async submitRename() {
-                    const site = this.rename.site;
-                    const next = (this.rename.value || '').trim();
-                    if (!site || !next || next === site.name) { this.rename.open = false; return; }
-                    if (!/^[a-zA-Z0-9-]+$/.test(next)) {
-                        this.showSnack('Use letters, numbers and hyphens only.', true);
-                        return;
-                    }
-                    this.rename.busy = true;
-                    // Renaming rewrites the Caddyfile, so the response can land
-                    // mid-reload exactly like a delete does — same retry policy.
-                    const res = await this.apiPostRetry('rename_site', { site_name: site.name, new_name: next });
-                    this.rename.busy = false;
-                    if (!res.success) return;   // apiPost surfaced the reason
-                    this.rename.open = false;
-                    // Carry over UI state that is keyed by name, or a pinned site
-                    // would silently unpin itself on rename.
-                    if (this.isPinned(site.name)) {
-                        this.pinned = this.pinned.map(n => (n === site.name ? next : n));
-                        localStorage.setItem('pinned', JSON.stringify(this.pinned));
-                    }
-                    if (this.selectedName === site.name) this.selectedName = next;
-                    this.showSnack(res.message || 'Renamed.');
-                    await this.getSites();
-                },
-
-                async revealSite(name) {
-                    const res = await this.apiPost('reveal_site', { site_name: name });
-                    if (res.success) this.showSnack(res.message || 'Opened in the file manager.');
-                },
-
-                openSiteDb(site) {
-                    // Adminer takes the schema in the query string, so this lands
-                    // on the site's own tables instead of the server root.
-                    const url = this.adminerUrl + '/?username=' + encodeURIComponent(DB_USER) +
-                                '&db=' + encodeURIComponent(site.db_name || ('cove_' + site.name).replace(/[^a-zA-Z0-9_]/g, '_'));
-                    window.open(url, '_blank', 'noopener');
-                },
-
-                // Caddy writes one JSON object per line, which is unreadable as a
-                // wall of text. Fold each request down to the fields you'd
-                // actually scan for — time, status, method, path, duration —
-                // and leave anything that isn't a request line untouched.
-                get logDisplay() {
-                    if (this.logView.busy) return 'Loading…';
-                    const raw = this.logView.text || '';
-                    if (!raw) return 'No log entries yet.';
-                    if (this.logView.raw) return raw;
-                    const out = [];
-                    for (const line of raw.split('\n')) {
-                        const t = line.trim();
-                        if (!t) continue;
-                        if (t[0] !== '{') { out.push(t); continue; }
-                        let o;
-                        try { o = JSON.parse(t); } catch (e) { out.push(t); continue; }
-                        const req = o.request || {};
-                        if (!req.method) { out.push(o.msg ? (o.level || '') + ' ' + o.msg : t); continue; }
-                        const time = o.ts ? new Date(o.ts * 1000).toLocaleTimeString() : '';
-                        const status = o.status !== undefined ? String(o.status) : '';
-                        const dur = typeof o.duration === 'number' ? (o.duration * 1000).toFixed(0) + 'ms' : '';
-                        out.push([
-                            time,
-                            status.padEnd(3),
-                            (req.method || '').padEnd(6),
-                            req.uri || '',
-                            dur
-                        ].filter(Boolean).join('  '));
-                    }
-                    return out.join('\n') || 'No log entries yet.';
-                },
-
-                async viewLog(site, refresh = false) {
-                    this.logView = { open: true, site: site.name, text: refresh ? this.logView.text : '', truncated: false, busy: true };
-                    const res = await this.apiPost('site_log', { site_name: site.name });
-                    this.logView.busy = false;
-                    if (!res.success) { this.logView.open = false; return; }
-                    this.logView.text = res.log || '';
-                    this.logView.truncated = !!res.truncated;
-                    // Logs are read tail-first; jump to the newest lines.
-                    this.$nextTick(() => {
-                        const el = this.$refs.logPane;
-                        if (el) el.scrollTop = el.scrollHeight;
-                    });
-                },
-
-                openPalette() {
-                    this.palette.open = true;
-                    this.palette.query = '';
-                    this.palette.index = 0;
-                    this.closeRowMenu();
-                    this.$nextTick(() => this.$refs.paletteInput && this.$refs.paletteInput.focus());
-                },
-
-                closePalette() { this.palette.open = false; },
-
-                paletteMove(delta) {
-                    const n = this.paletteResults.length;
-                    if (!n) return;
-                    this.palette.index = (this.palette.index + delta + n) % n;
-                    this.$nextTick(() => {
-                        const list = this.$refs.paletteList;
-                        if (!list) return;
-                        const el = list.children[this.palette.index];
-                        if (el && el.scrollIntoView) el.scrollIntoView({ block: 'nearest' });
-                    });
-                },
-
-                paletteRun(event) {
-                    const item = this.paletteResults[this.palette.index];
-                    if (!item) return;
-                    // Cmd/Ctrl+Enter logs into a WordPress site instead of opening it.
-                    if (event && (event.metaKey || event.ctrlKey) && item.site && item.site.type === 'WordPress') {
-                        this.closePalette();
-                        this.getLoginLink(item.site.name);
-                        return;
-                    }
-                    item.run();
-                },
-
-                paletteRunItem(item) { item.run(); },
-
-                // --- Row context menu ------------------------------------------
-                openRowMenu(site, event) {
-                    // Clamp into the viewport so a right-click near the right or
-                    // bottom edge doesn't push the menu off-screen.
-                    const w = 200, h = 230;
-                    const x = Math.min(event.clientX, window.innerWidth - w - 8);
-                    const y = Math.min(event.clientY, window.innerHeight - h - 8);
-                    this.ctxMenu = { open: true, site, x: Math.max(8, x), y: Math.max(8, y) };
-                },
-
-                closeRowMenu() { this.ctxMenu.open = false; },
-
-                // --- Pinning ---------------------------------------------------
-                isPinned(name) { return this.pinned.includes(name); },
-
-                togglePin(name) {
-                    if (this.isPinned(name)) {
-                        this.pinned = this.pinned.filter(n => n !== name);
-                    } else {
-                        this.pinned = [...this.pinned, name];
-                    }
-                    localStorage.setItem('pinned', JSON.stringify(this.pinned));
-                },
-
-                // --- Keyboard list navigation ----------------------------------
-                moveSelection(delta) {
-                    const list = this.filteredSites;
-                    if (!list.length) return;
-                    const cur = list.findIndex(s => s.name === this.selectedName);
-                    let next = cur === -1 ? (delta > 0 ? 0 : list.length - 1) : cur + delta;
-                    next = Math.max(0, Math.min(list.length - 1, next));
-                    this.selectedName = list[next].name;
-                    this.$nextTick(() => {
-                        const rows = document.querySelectorAll('.site-row');
-                        const el = rows[next];
-                        if (el && el.scrollIntoView) el.scrollIntoView({ block: 'nearest' });
-                    });
-                },
-
-                selectedSite() {
-                    return this.filteredSites.find(s => s.name === this.selectedName) || null;
-                },
-
-                setSort(key) {
-                    // Click the active header to flip direction; a new key
-                    // starts at its natural default (a→z for name, biggest /
-                    // most recent first for size and modified).
-                    if (this.sort === key) {
-                        this.sortDir = this.sortDir === 'asc' ? 'desc' : 'asc';
-                    } else {
-                        this.sort = key;
-                        this.sortDir = key === 'name' ? 'asc' : 'desc';
-                    }
-                    localStorage.setItem('sort', this.sort);
-                    localStorage.setItem('sortDir', this.sortDir);
-                },
-
-                sortArrow(key) {
-                    if (this.sort !== key) return '';
-                    return this.sortDir === 'asc' ? '↑' : '↓';
-                },
-
-                openSite(site) {
-                    // Don't navigate when the click was part of a drag-to-select,
-                    // so users can still grab the domain/size text to copy.
-                    if (window.getSelection && window.getSelection().toString()) return;
-                    window.open(site.domain, '_blank', 'noopener');
-                },
-
-                showSnack(msg, isError = false, opts = {}) {
-                    if (this.snackbar.timer) clearTimeout(this.snackbar.timer);
-                    this.snackbar = {
-                        visible: true, message: msg, isError, timer: null,
-                        action: opts.action || null,
-                        actionLabel: opts.actionLabel || ''
+                        return 0;
                     };
-                    this.snackbar.timer = setTimeout(() => { this.snackbar.visible = false; }, opts.duration || 3500);
-                },
+                    base.sort((a, b) => dir * (a.type.localeCompare(b.type) || vcmp(a, b)) || a.name.localeCompare(b.name));
+                } else {
+                    base.sort((a, b) => dir * a.name.localeCompare(b.name));
+                }
+                // Pinned sites float above the chosen sort rather than replacing
+                // it: out of hundreds of sites only a handful are ever active.
+                if (this.pinned.length) {
+                    base.sort((a, b) => (this.pinned.includes(b.name) ? 1 : 0) - (this.pinned.includes(a.name) ? 1 : 0));
+                }
+                return base;
+            },
 
-                async apiPost(action, payload = {}, opts = {}) {
-                    const { timeoutMs = 0, quiet = false } = opts;
-                    const ctrl = timeoutMs ? new AbortController() : null;
-                    const timer = ctrl ? setTimeout(() => ctrl.abort(), timeoutMs) : null;
-                    try {
-                        const res = await fetch('api.php', {
+            get typeFilterLabel() {
+                return this.typeFilter === 'WordPress' ? 'type: wp' : 'type: static';
+            },
+
+            setTypeFilter(v) {
+                this.typeFilter = v;
+                // An armed bulk-delete is scoped to the current result set —
+                // disarm when the filter changes underneath it.
+                this.bulkArmed = false;
+                this.render();
+            },
+
+            clearAllFilters() {
+                this.filter = '';
+                $id('filterInput').value = '';
+                this.typeFilter = null;
+                this.bulkArmed = false;
+                this.render();
+            },
+
+            get siteCountLabel() {
+                const total = this.sites.length;
+                const visible = this.filteredSites.length;
+                const suffix = ' site' + (total === 1 ? '' : 's');
+                return visible === total ? total + suffix : visible + ' of ' + total + suffix;
+            },
+
+            init() {
+                this.applyTheme();
+                this.bindStaticEvents();
+                this.render();
+
+                // If the tab closes during an undo window, flush the staged
+                // deletes with keepalive requests so they aren't lost. No
+                // reload_server here: the next reload from any source
+                // regenerates from disk and prunes via tombstones.
+                window.addEventListener('pagehide', () => {
+                    if (!this.pendingDelete) return;
+                    for (const s of this.pendingDelete.sites) {
+                        fetch('api.php', {
                             method: 'POST',
                             headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({ action, ...payload }),
-                            ...(ctrl ? { signal: ctrl.signal } : {})
-                        }).then(r => r.json());
-                        if (!res.success && !quiet) this.showSnack(res.message || 'An error occurred.', true);
-                        return res;
-                    } catch (e) {
-                        // transport marks network-level failures (connection
-                        // dropped, timeout) as distinct from server-reported
-                        // errors — only these are worth retrying.
-                        if (!quiet) this.showSnack('Network error.', true);
-                        return { success: false, transport: true };
-                    } finally {
-                        if (timer) clearTimeout(timer);
+                            body: JSON.stringify({ action: 'delete_site', site_name: s.name }),
+                            keepalive: true
+                        }).catch(() => {});
                     }
-                },
+                    this.pendingDelete = null;
+                });
 
-                async apiPostRetry(action, payload = {}, attempts = 3, timeoutMs = 30000) {
-                    // The Caddy/FrankenPHP reload the dashboard triggers after
-                    // add/delete can momentarily drop or hang requests to the
-                    // dashboard itself. Retry transport failures a few times so
-                    // an action that lands mid-reload isn't silently lost.
-                    let res;
-                    for (let i = 1; i <= attempts; i++) {
-                        res = await this.apiPost(action, payload, { timeoutMs, quiet: i < attempts });
-                        if (res.success || !res.transport) return res;
-                        if (i < attempts) await new Promise(r => setTimeout(r, 3000));
-                    }
-                    return res;
-                },
+                // `/` focuses the filter (GitHub-style). Ignored when typing
+                // in a form field or holding a modifier key.
+                window.addEventListener('keydown', (e) => {
+                    const el = document.activeElement;
+                    const tag = el && el.tagName;
+                    const typing = tag === 'INPUT' || tag === 'TEXTAREA' || (el && el.isContentEditable);
 
-                async getSites() {
-                    this.isLoading = true;
-                    try {
-                        const r = await fetch('api.php?action=list_sites');
-                        const data = await r.json();
-                        // Sites staged for deletion are still on disk (nothing
-                        // is sent to the backend until the undo window closes),
-                        // so a refresh landing mid-window would re-add the rows
-                        // the user just deleted — and undo would then push a
-                        // second copy, duplicating the :key and breaking x-for.
-                        const staged = new Set(this.pendingDelete ? this.pendingDelete.sites.map(s => s.name) : []);
-                        this.sites = data
-                            .map(s => ({ ...s, isLoggingIn: false }))
-                            .filter(s => !staged.has(s.name));
-                    } catch (e) {
-                        this.showSnack('Could not fetch sites.', true);
-                    } finally {
-                        this.isLoading = false;
-                    }
-                },
-
-                async addSite() {
-                    if (!this.newSite.name) return;
-                    this.newSite.isLoading = true;
-                    const name = this.newSite.name;
-                    const isPlain = this.newSite.isPlain;
-                    // 'latest' is the server's default, so it's sent as nothing
-                    // at all — keeps the generated command identical to what a
-                    // plain `cove add <name>` produces.
-                    const wpVersion = isPlain ? '' : this.newSite.wpVersion;
-
-                    const add = await this.apiPost('add_site', { site_name: name, is_plain: isPlain, wp_version: (wpVersion && wpVersion !== 'latest') ? wpVersion : undefined });
-                    if (add.success) {
-                        // Optimistic insert: we already know every field the row
-                        // template uses. No auto-refresh — the Caddy reload that
-                        // follows can take tens of seconds on fleets with lots of
-                        // sites and would either hang the fetch or drop the UI
-                        // into an ERR_CONNECTION_REFUSED during the config swap.
-                        this.sites.push({
-                            name,
-                            domain: 'https://' + name + '.localhost' + PORT_SUFFIX,
-                            type: isPlain ? 'Plain' : 'WordPress',
-                            display_path: '~/Cove/Sites/' + name + '.localhost',
-                            full_path: SITES_DIR + '/' + name + '.localhost',
-                            // Server calculates size in add_site and returns it
-                            // alongside success. Fall back to null so the row
-                            // shows "—" until the next refresh if anything failed.
-                            size_bytes: (typeof add.size_bytes === 'number') ? add.size_bytes : null,
-                            modified_at: Math.floor(Date.now() / 1000),
-                            isLoggingIn: false,
-                        });
-                        this.showSnack('Site created.');
-                        this.newSite.name = '';
-                        this.newSite.wpVersion = 'latest';
-                        this.adding = false;
-                        this.apiPost('reload_server'); // fire and forget — Caddy reloads in the background
-
-                        // Surface a persistent alert so the user can jump
-                        // straight into the new site without hunting for the
-                        // row. WP sites get a one-time admin login; plain
-                        // sites get a simple "open site" link.
-                        this.alerts.push({
-                            id: Date.now() + Math.random(),
-                            name,
-                            isPlain,
-                            isLoggingIn: false,
-                        });
-                    }
-                    this.newSite.isLoading = false;
-                },
-
-                async loginToNewSite(alert) {
-                    alert.isLoggingIn = true;
-                    const res = await this.apiPost('get_login_link', { site_name: alert.name });
-                    if (res.success && res.url) {
-                        window.open(res.url, '_blank');
-                        // Acted on — banner's job is done. The new tab has the
-                        // one-time URL; dashboard can drop the prompt.
-                        this.dismissAlert(alert.id);
-                    }
-                    alert.isLoggingIn = false;
-                },
-
-                dismissAlert(id) {
-                    this.alerts = this.alerts.filter(a => a.id !== id);
-                },
-
-                deleteSite(name) {
-                    const site = this.sites.find(s => s.name === name);
-                    if (!site) return;
-                    this.stageDeletes([site]);
-                },
-
-                bulkDelete() {
-                    // Two-step inline confirm: first click arms the button for a
-                    // few seconds, second click stages every filtered site. The
-                    // undo snackbar is the safety net after that.
-                    if (!this.bulkArmed) {
-                        this.bulkArmed = true;
-                        this.bulkArmTimer = setTimeout(() => { this.bulkArmed = false; }, 3500);
+                    // Cmd/Ctrl+K opens the palette from anywhere, including
+                    // from inside the filter box — it's the one shortcut that
+                    // should never be swallowed by a focused field.
+                    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
+                        e.preventDefault();
+                        this.palette.open ? this.closePalette() : this.openPalette();
                         return;
                     }
-                    clearTimeout(this.bulkArmTimer);
-                    this.bulkArmed = false;
-                    this.stageDeletes([...this.filteredSites]);
-                },
-
-                stageDeletes(sitesToDelete) {
-                    // Pull the rows from the list immediately (the UI feels
-                    // instant) but hold the backend work for an undo window.
-                    // Nothing is deleted server-side until the window passes.
-                    if (this.pendingDelete) clearTimeout(this.pendingDelete.timer);
-                    const staged = this.pendingDelete ? this.pendingDelete.sites : [];
-                    for (const site of sitesToDelete) {
-                        const idx = this.sites.findIndex(s => s.name === site.name);
-                        if (idx !== -1) { this.sites.splice(idx, 1); staged.push(site); }
+                    if (this.palette.open) {
+                        // Palette owns its own keys via its input's listeners;
+                        // catch Esc here too in case the input lost focus.
+                        if (e.key === 'Escape') this.closePalette();
+                        return;
                     }
-                    if (!staged.length) { this.pendingDelete = null; return; }
-                    this.pendingDelete = {
-                        sites: staged,
-                        timer: setTimeout(() => this.commitPendingDeletes(), 5000)
-                    };
-                    const label = staged.length === 1
-                        ? 'Deleted ' + staged[0].name + '.'
-                        : 'Deleted ' + staged.length + ' sites.';
-                    this.showSnack(label, false, {
-                        actionLabel: 'undo',
-                        action: () => this.undoPendingDeletes(),
-                        duration: 5000
-                    });
-                },
 
-                commitPendingDeletes() {
-                    if (!this.pendingDelete) return;
-                    const names = this.pendingDelete.sites.map(s => s.name);
-                    this.pendingDelete = null;
-                    // processDeleteQueue drains the queue single-file so
-                    // concurrent deletes don't race on shared state (Caddyfile
-                    // regeneration, /etc/hosts edits).
-                    this.deleteQueue.push(...names);
-                    this.processDeleteQueue();
-                },
+                    // Arrows work while filtering (type to narrow, arrow to pick).
+                    // j/k only outside a text field, or they'd eat typed letters.
+                    const isDown = e.key === 'ArrowDown' || (!typing && e.key === 'j');
+                    const isUp   = e.key === 'ArrowUp'   || (!typing && e.key === 'k');
+                    if ((isDown || isUp) && !e.metaKey && !e.ctrlKey && !e.altKey) {
+                        e.preventDefault();
+                        this.moveSelection(isDown ? 1 : -1);
+                        return;
+                    }
 
-                undoPendingDeletes() {
-                    if (!this.pendingDelete) return;
-                    clearTimeout(this.pendingDelete.timer);
-                    // filteredSites re-sorts on render, so push order is fine.
-                    this.sites.push(...this.pendingDelete.sites);
-                    this.pendingDelete = null;
-                    if (this.snackbar.timer) clearTimeout(this.snackbar.timer);
-                    this.snackbar.visible = false;
-                },
-
-                async processDeleteQueue() {
-                    // Single-flight runner: whichever call picks up the lock drains the
-                    // full queue. Concurrent deleteSite() calls just enqueue and return.
-                    if (this.isProcessingQueue) return;
-                    this.isProcessingQueue = true;
-
-                    let anyFailed = false;
-                    try {
-                        // Outer loop catches deletes queued while we were awaiting the
-                        // reload below — otherwise they'd sit forever because the next
-                        // deleteSite() call short-circuits on isProcessingQueue.
-                        while (this.deleteQueue.length > 0) {
-                            while (this.deleteQueue.length > 0) {
-                                const target = this.deleteQueue.shift();
-                                const del = await this.apiPostRetry('delete_site', { site_name: target });
-                                if (del.success) {
-                                    // Don't stomp a newer batch's undo snackbar
-                                    // with a routine confirmation.
-                                    if (!this.pendingDelete) this.showSnack('Site deleted.');
-                                } else {
-                                    anyFailed = true; // apiPost already surfaced the error
-                                }
-                            }
-                            // Kick a reload at the end of the batch. Race-safety
-                            // lives server-side: cove_reload() uses a mkdir lock
-                            // with a pending marker to coalesce concurrent calls,
-                            // since reload_server itself backgrounds the shell
-                            // command (shell_exec '...&') and returns instantly.
-                            // Two unsynchronized frankenphp reload calls otherwise
-                            // deadlock Caddy's admin server (10s shutdown timeout).
-                            await this.apiPostRetry('reload_server', {}, 3, 10000);
+                    if (e.key === 'Enter' && this.selectedName && !this.adding) {
+                        const site = this.selectedSite();
+                        if (!site) return;
+                        e.preventDefault();
+                        if ((e.metaKey || e.ctrlKey) && site.type === 'WordPress') {
+                            this.getLoginLink(site.name);
+                        } else {
+                            this.openSite(site);
                         }
-                    } finally {
-                        this.isProcessingQueue = false;
+                        return;
                     }
 
-                    // If anything failed mid-queue the optimistic UI is now out of sync
-                    // with the backend (e.g. a survivor is missing from our list).
-                    // Cheapest correct fix: re-fetch the authoritative list.
-                    if (anyFailed) await this.getSites();
-                },
+                    if ((e.metaKey || e.ctrlKey) && (e.key === 'Backspace' || e.key === 'Delete') && this.selectedName) {
+                        e.preventDefault();
+                        this.deleteSite(this.selectedName);
+                        return;
+                    }
 
-                async getLoginLink(name) {
-                    const site = this.sites.find(s => s.name === name);
+                    if (e.key === 'Escape') {
+                        if (this.ctxMenu.open) { this.closeRowMenu(); return; }
+                        if (this.rename.open) { this.closeRename(); return; }
+                        if (this.logView.open) { this.closeLog(); return; }
+                        if (this.showDbModal) { this.setDbModal(false); return; }
+                        if (this.selectedName && !typing) { this.selectedName = null; this.render(); return; }
+                    }
+
+                    if (e.key === '/' && !e.ctrlKey && !e.metaKey && !e.altKey) {
+                        if (typing) return;
+                        e.preventDefault();
+                        $id('filterInput').focus();
+                    }
+                });
+
+                // A scroll or resize would leave the menu floating away from
+                // the row it belongs to, so dismiss rather than reposition.
+                window.addEventListener('scroll', () => { if (this.ctxMenu.open) this.closeRowMenu(); }, { passive: true });
+                window.addEventListener('resize', () => { if (this.ctxMenu.open) this.closeRowMenu(); });
+
+                // Click anywhere outside the context menu dismisses it. The
+                // click that opened the menu also bubbles here, so skip it.
+                document.addEventListener('click', (e) => {
+                    if (!this.ctxMenu.open || e.timeStamp === this.ctxMenu.openedAt) return;
+                    if (!$id('ctxMenu').contains(e.target)) this.closeRowMenu();
+                });
+
+                this.getSites().then(() => {
+                    // If the size cache is empty (fresh install or just deleted),
+                    // kick off a background refresh so sizes populate without
+                    // making the user hunt for the ↻ button.
+                    if (this.sites.length > 0 && this.sites.every(s => s.size_bytes === null)) {
+                        this.refreshSizes();
+                    }
+                });
+            },
+
+            // One-time listeners on elements that are never re-created. Row,
+            // alert, palette and menu clicks are delegated from their fixed
+            // containers, so rebuilding children never orphans a handler.
+            bindStaticEvents() {
+                $id('btnTheme').addEventListener('click', () => this.toggleTheme());
+                $id('btnDbDot').addEventListener('click', () => this.setDbModal(true));
+                $id('btnToggleAdd').addEventListener('click', () => this.toggleAdd());
+                $id('btnRefreshSizes').addEventListener('click', () => this.refreshSizes());
+                $id('btnDbClose').addEventListener('click', () => this.setDbModal(false));
+                $id('dbModal').addEventListener('click', (e) => { if (e.target === $id('dbModal')) this.setDbModal(false); });
+
+                // Filter row
+                const filterInput = $id('filterInput');
+                filterInput.addEventListener('input', () => {
+                    this.filter = filterInput.value;
+                    this.bulkArmed = false;
+                    this.render();
+                });
+                filterInput.addEventListener('keydown', (e) => {
+                    if (e.key === 'Escape') {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        this.filter = '';
+                        filterInput.value = '';
+                        this.bulkArmed = false;
+                        filterInput.blur();
+                        this.render();
+                    }
+                });
+                $id('typeChipClear').addEventListener('click', () => { this.setTypeFilter(null); filterInput.focus(); });
+                $id('btnFilterClear').addEventListener('click', () => { this.clearAllFilters(); filterInput.focus(); });
+                $id('btnBulkDelete').addEventListener('click', () => this.bulkDelete());
+
+                // Add-site form
+                const nameInput = $id('newSiteName');
+                nameInput.addEventListener('input', () => {
+                    const clean = nameInput.value.toLowerCase().replace(/[^a-z0-9-]/g, '');
+                    if (clean !== nameInput.value) nameInput.value = clean;
+                    this.newSite.name = clean;
+                    this.render();
+                });
+                $id('newSitePlain').addEventListener('change', (e) => {
+                    this.newSite.isPlain = e.target.checked;
+                    this.render();
+                });
+                $id('wpVersionSelect').addEventListener('change', (e) => { this.newSite.wpVersion = e.target.value; });
+                $id('addForm').addEventListener('submit', (e) => { e.preventDefault(); this.addSite(); });
+
+                // Sort headers
+                document.querySelectorAll('.site-head-btn[data-sort]').forEach(btn => {
+                    btn.addEventListener('click', () => this.setSort(btn.dataset.sort));
+                });
+
+                // Site rows: one delegated listener instead of per-row handlers.
+                const list = $id('siteList');
+                list.addEventListener('click', (e) => {
+                    const row = e.target.closest('.site-row');
+                    if (!row) return;
+                    const site = this.sites.find(s => s.name === row.dataset.name);
                     if (!site) return;
-                    site.isLoggingIn = true;
-                    const res = await this.apiPost('get_login_link', { site_name: name });
-                    if (res.success && res.url) {
-                        window.open(res.url, '_blank');
-                        this.showSnack('Login link opened in a new tab.');
-                    }
-                    site.isLoggingIn = false;
-                },
+                    if (e.target.closest('.site-domain')) return; // plain link — let it navigate
+                    if (e.target.closest('.site-type')) { this.setTypeFilter(site.type); return; }
+                    if (e.target.closest('.site-login-btn')) { this.getLoginLink(site.name); return; }
+                    if (e.target.closest('.row-menu-btn')) { this.openRowMenu(site, e); return; }
+                    this.openSite(site);
+                });
+                list.addEventListener('contextmenu', (e) => {
+                    const row = e.target.closest('.site-row');
+                    if (!row) return;
+                    const site = this.sites.find(s => s.name === row.dataset.name);
+                    if (!site) return;
+                    e.preventDefault();
+                    this.openRowMenu(site, e);
+                });
 
-                async copyPath(path) {
-                    try {
-                        await navigator.clipboard.writeText(path);
-                        this.showSnack('Path copied to clipboard.');
-                    } catch (e) {
-                        this.showSnack('Could not copy path.', true);
-                    }
-                },
+                // New-site alerts (delegated)
+                $id('alerts').addEventListener('click', (e) => {
+                    const box = e.target.closest('.new-site-alert');
+                    if (!box) return;
+                    const alert = this.alerts.find(a => String(a.id) === box.dataset.id);
+                    if (!alert) return;
+                    if (e.target.closest('.alert-login')) { this.loginToNewSite(alert); return; }
+                    if (e.target.closest('.alert-open')) { this.dismissAlert(alert.id); return; } // link navigates itself
+                    if (e.target.closest('.new-site-alert-close')) this.dismissAlert(alert.id);
+                });
 
-                async refreshSizes() {
-                    this.isRefreshingSizes = true;
-                    const res = await this.apiPost('refresh_sizes');
-                    if (res.success) {
-                        await this.getSites();
-                        this.showSnack('Disk sizes updated.');
+                // Context menu items act on whichever site the menu was opened for.
+                const withCtxSite = (fn) => () => {
+                    const site = this.ctxMenu.site;
+                    this.closeRowMenu();
+                    if (site) fn(site);
+                };
+                $id('ctxOpen').addEventListener('click', withCtxSite(s => this.openSite(s)));
+                $id('ctxLogin').addEventListener('click', withCtxSite(s => this.getLoginLink(s.name)));
+                $id('ctxRename').addEventListener('click', withCtxSite(s => this.promptRename(s)));
+                $id('ctxReveal').addEventListener('click', withCtxSite(s => this.revealSite(s.name)));
+                $id('ctxDb').addEventListener('click', withCtxSite(s => this.openSiteDb(s)));
+                $id('ctxLog').addEventListener('click', withCtxSite(s => this.viewLog(s)));
+                $id('ctxCopy').addEventListener('click', withCtxSite(s => this.copyPath(s.full_path)));
+                $id('ctxPin').addEventListener('click', withCtxSite(s => this.togglePin(s.name)));
+                $id('ctxDelete').addEventListener('click', withCtxSite(s => this.deleteSite(s.name)));
+
+                // Command palette
+                const paletteInput = $id('paletteInput');
+                paletteInput.addEventListener('input', () => {
+                    this.palette.query = paletteInput.value;
+                    this.palette.index = 0;
+                    this.renderPalette();
+                });
+                paletteInput.addEventListener('keydown', (e) => {
+                    if (e.key === 'ArrowDown') { e.preventDefault(); this.paletteMove(1); }
+                    else if (e.key === 'ArrowUp') { e.preventDefault(); this.paletteMove(-1); }
+                    else if (e.key === 'Enter') { e.preventDefault(); this.paletteRun(e); }
+                    else if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); this.closePalette(); }
+                });
+                $id('paletteBackdrop').addEventListener('click', (e) => { if (e.target === $id('paletteBackdrop')) this.closePalette(); });
+                const paletteList = $id('paletteList');
+                paletteList.addEventListener('click', (e) => {
+                    const li = e.target.closest('.palette-item');
+                    if (li) this.paletteRunItem(this._paletteItems[Number(li.dataset.index)]);
+                });
+                paletteList.addEventListener('mouseover', (e) => {
+                    const li = e.target.closest('.palette-item');
+                    if (!li || Number(li.dataset.index) === this.palette.index) return;
+                    this.palette.index = Number(li.dataset.index);
+                    // Just move the highlight — a full re-render mid-hover would
+                    // reset scroll position in the list.
+                    paletteList.querySelectorAll('.palette-item').forEach(n =>
+                        n.classList.toggle('active', Number(n.dataset.index) === this.palette.index));
+                });
+
+                // Rename modal
+                const renameInput = $id('renameInput');
+                renameInput.addEventListener('input', () => {
+                    this.rename.value = renameInput.value;
+                    this.renderRename();
+                });
+                renameInput.addEventListener('keydown', (e) => {
+                    if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); this.closeRename(); }
+                });
+                $id('renameForm').addEventListener('submit', (e) => { e.preventDefault(); this.submitRename(); });
+                $id('btnRenameCancel').addEventListener('click', () => this.closeRename());
+                $id('renameModal').addEventListener('click', (e) => { if (e.target === $id('renameModal')) this.closeRename(); });
+
+                // Log modal
+                $id('btnLogRaw').addEventListener('click', () => { this.logView.raw = !this.logView.raw; this.renderLog(); });
+                $id('btnLogRefresh').addEventListener('click', () => this.viewLog({ name: this.logView.site }, true));
+                $id('btnLogClose').addEventListener('click', () => this.closeLog());
+                $id('logModal').addEventListener('click', (e) => { if (e.target === $id('logModal')) this.closeLog(); });
+
+                // Snackbar action (undo etc.)
+                $id('snackAction').addEventListener('click', () => { if (this.snackbar.action) this.snackbar.action(); });
+            },
+
+            // --- Rendering -------------------------------------------------
+            // Everything below reads state and writes DOM. Cheap enough to run
+            // wholesale after any state change: a few hundred rows rebuild in
+            // low single-digit milliseconds.
+            render() {
+                this.renderChrome();
+                this.renderAlerts();
+                this.renderList();
+                this.renderFooter();
+                this.renderCtxMenu();
+                this.renderModals();
+                if (this.palette.open) this.renderPalette();
+            },
+
+            renderChrome() {
+                $id('btnToggleAdd').textContent = this.adding ? 'cancel' : '+ add site';
+
+                // Filter row
+                const chip = $id('typeChip');
+                show(chip, !!this.typeFilter);
+                if (this.typeFilter) $id('typeChipLabel').textContent = this.typeFilterLabel;
+                const bulk = $id('btnBulkDelete');
+                const visible = this.filteredSites.length;
+                show(bulk, (this.filter || this.typeFilter) && visible > 0 && visible < this.sites.length);
+                bulk.classList.toggle('armed', this.bulkArmed);
+                bulk.textContent = this.bulkArmed ? ('sure? delete ' + visible) : ('delete ' + visible + ' shown');
+                show($id('filterKbd'), !this.filter && !this.typeFilter);
+                show($id('btnFilterClear'), this.filter || this.typeFilter);
+
+                // Add row
+                const addRow = $id('addRow');
+                show(addRow, this.adding);
+                addRow.classList.toggle('is-creating', this.newSite.isLoading);
+                $id('newSiteName').disabled = this.newSite.isLoading;
+                $id('newSitePlain').disabled = this.newSite.isLoading;
+                const sel = $id('wpVersionSelect');
+                show(sel, !this.newSite.isPlain);
+                sel.disabled = this.newSite.isLoading || this.newSite.isPlain;
+                $id('btnCreate').disabled = !this.newSite.name || this.newSite.isLoading;
+                show($id('createSpinner'), this.newSite.isLoading);
+                $id('createLabel').textContent = this.newSite.isLoading ? 'creating…' : 'create';
+
+                // Theme button tooltip tracks the mode it would switch to.
+                $id('btnTheme').title = this.theme === 'light' ? 'Switch to dark mode' : 'Switch to light mode';
+            },
+
+            renderAlerts() {
+                const wrap = $id('alerts');
+                wrap.querySelectorAll('.new-site-alert').forEach(n => n.remove());
+                const tpl = $id('tpl-alert');
+                for (const alert of this.alerts) {
+                    const node = tpl.content.firstElementChild.cloneNode(true);
+                    node.dataset.id = String(alert.id);
+                    node.querySelector('strong').textContent = alert.name + '.localhost';
+                    const login = node.querySelector('.alert-login');
+                    const open = node.querySelector('.alert-open');
+                    if (alert.isPlain) {
+                        login.remove();
+                        open.href = 'https://' + alert.name + '.localhost' + PORT_SUFFIX;
+                    } else {
+                        open.remove();
+                        login.disabled = alert.isLoggingIn;
+                        login.textContent = alert.isLoggingIn ? 'opening…' : 'log in to admin';
                     }
-                    this.isRefreshingSizes = false;
+                    wrap.appendChild(node);
                 }
-            }));
-        });
+            },
+
+            renderList() {
+                const list = $id('siteList');
+                const rows = this.filteredSites;
+                list.querySelectorAll('.site-row').forEach(n => n.remove());
+
+                show($id('siteHead'), !this.isLoading && rows.length > 0);
+                document.querySelectorAll('.site-head-btn[data-sort]').forEach(btn => {
+                    btn.classList.toggle('active', this.sort === btn.dataset.sort);
+                    btn.querySelector('.sort-arrow').textContent =
+                        this.sort === btn.dataset.sort ? (this.sortDir === 'asc' ? '↑' : '↓') : '';
+                });
+
+                show($id('siteLoading'), this.isLoading);
+                show($id('emptyNone'), !this.isLoading && this.sites.length === 0);
+                const emptyFilter = !this.isLoading && this.sites.length > 0 && rows.length === 0;
+                show($id('emptyFilter'), emptyFilter);
+                if (emptyFilter) $id('emptyFilterQuery').textContent = this.filter || this.typeFilterLabel;
+
+                const tpl = $id('tpl-site-row');
+                const anchor = $id('siteLoading'); // rows insert before the loading li to keep list order
+                for (const site of rows) {
+                    const row = tpl.content.firstElementChild.cloneNode(true);
+                    row.dataset.name = site.name;
+                    row.classList.toggle('is-selected', this.selectedName === site.name);
+                    row.classList.toggle('has-menu', this.ctxMenu.open && this.ctxMenu.site && this.ctxMenu.site.name === site.name);
+                    row.classList.toggle('is-pinned', this.isPinned(site.name));
+
+                    const domain = row.querySelector('.site-domain');
+                    domain.href = site.domain;
+                    domain.innerHTML = this.highlightedDomain(site.domain, this.filter);
+
+                    const isWp = site.type === 'WordPress';
+                    const type = row.querySelector('.site-type');
+                    type.classList.add(isWp ? 'wp' : 'static');
+                    type.textContent = isWp ? 'WP' : 'STATIC';
+                    type.title = 'Filter to ' + (isWp ? 'WordPress' : 'static') + ' sites';
+
+                    const ver = row.querySelector('.site-wp-version');
+                    if (site.wp_version) {
+                        ver.textContent = site.wp_version;
+                        if (site.wp_status) ver.classList.add(site.wp_status);
+                        ver.title = site.wp_status === 'insecure'
+                            ? 'WordPress ' + site.wp_version + ' — wp.org marks this release insecure. Update with: cove core update ' + site.name
+                            : 'WordPress ' + site.wp_version;
+                    } else {
+                        ver.remove();
+                    }
+
+                    const mod = row.querySelector('.site-modified');
+                    mod.textContent = this.formatRelative(site.modified_at);
+                    mod.title = site.modified_at ? new Date(site.modified_at * 1000).toLocaleString() : '';
+                    row.querySelector('.site-size').textContent = this.formatSize(site.size_bytes);
+
+                    const login = row.querySelector('.site-login-btn');
+                    if (isWp) {
+                        login.classList.toggle('loading', !!site.isLoggingIn);
+                        login.disabled = !!site.isLoggingIn;
+                        login.title = 'One-time admin login for ' + site.name;
+                    } else {
+                        login.remove();
+                    }
+                    row.querySelector('.row-menu-btn').classList.toggle('active',
+                        this.ctxMenu.open && this.ctxMenu.site && this.ctxMenu.site.name === site.name);
+                    row.querySelector('.row-menu-btn').setAttribute('aria-label', 'Actions for ' + site.name);
+
+                    list.insertBefore(row, anchor);
+                }
+            },
+
+            renderFooter() {
+                $id('siteCount').textContent = this.siteCountLabel;
+                const totalEl = $id('totalSize');
+                show(totalEl, this.totalBytes > 0);
+                totalEl.textContent = '· ' + this.formatSize(this.totalBytes);
+                $id('btnRefreshSizes').classList.toggle('spinning', this.isRefreshingSizes);
+                $id('btnRefreshSizes').disabled = this.isRefreshingSizes;
+                $id('btnRefreshSizes').title = this.isRefreshingSizes ? 'Refreshing…' : 'Refresh disk sizes';
+            },
+
+            renderCtxMenu() {
+                const menu = $id('ctxMenu');
+                show(menu, this.ctxMenu.open);
+                const site = this.ctxMenu.site;
+                if (!this.ctxMenu.open || !site) return;
+                menu.style.left = this.ctxMenu.x + 'px';
+                menu.style.top = this.ctxMenu.y + 'px';
+                $id('ctxTitle').textContent = site.domain.replace('https://', '');
+                const isWp = site.type === 'WordPress';
+                show($id('ctxLogin'), isWp);
+                show($id('ctxDb'), isWp);
+                $id('ctxReveal').querySelector('span').textContent = this.revealLabel;
+                $id('ctxPin').querySelector('span').textContent = this.isPinned(site.name) ? 'Unpin from top' : 'Pin to top';
+            },
+
+            renderModals() {
+                show($id('dbModal'), this.showDbModal);
+                show($id('renameModal'), this.rename.open);
+                this.renderRename();
+                show($id('logModal'), this.logView.open);
+                this.renderLog();
+            },
+
+            renderRename() {
+                if (!this.rename.open) return;
+                $id('renameInput').disabled = this.rename.busy;
+                $id('renameHint').textContent = this.rename.value ? this.rename.value + '.localhost' : ' ';
+                $id('btnRenameCancel').disabled = this.rename.busy;
+                const submit = $id('btnRenameSubmit');
+                submit.disabled = this.rename.busy || !this.rename.value;
+                submit.textContent = this.rename.busy ? 'renaming…' : 'rename';
+            },
+
+            renderLog() {
+                if (!this.logView.open) return;
+                $id('logTitle').textContent = this.logView.site;
+                show($id('logTruncated'), this.logView.truncated);
+                $id('logPane').textContent = this.logDisplay;
+                $id('btnLogRaw').textContent = this.logView.raw ? 'formatted' : 'raw';
+                $id('btnLogRefresh').disabled = this.logView.busy;
+            },
+
+            renderPalette() {
+                const backdrop = $id('paletteBackdrop');
+                show(backdrop, this.palette.open);
+                if (!this.palette.open) return;
+                const items = this.paletteResults;
+                this._paletteItems = items;
+                const list = $id('paletteList');
+                list.innerHTML = '';
+                const tpl = $id('tpl-palette-item');
+                items.forEach((item, i) => {
+                    const li = tpl.content.firstElementChild.cloneNode(true);
+                    li.dataset.index = String(i);
+                    li.classList.toggle('active', i === this.palette.index);
+                    li.querySelector('.pi-kind').textContent = item.kind;
+                    li.querySelector('.pi-name').textContent = item.label;
+                    li.querySelector('.pi-meta').textContent = item.meta;
+                    list.appendChild(li);
+                });
+                if (!items.length) {
+                    const empty = document.createElement('li');
+                    empty.className = 'palette-empty';
+                    empty.textContent = 'No matches.';
+                    list.appendChild(empty);
+                }
+            },
+
+            renderSnackbar() {
+                const bar = $id('snackbar');
+                show(bar, this.snackbar.visible);
+                bar.classList.toggle('error', this.snackbar.isError);
+                $id('snackMsg').textContent = this.snackbar.message;
+                const action = $id('snackAction');
+                show(action, !!this.snackbar.action);
+                action.textContent = this.snackbar.actionLabel;
+            },
+
+            // --- Behavior --------------------------------------------------
+            applyTheme() {
+                document.documentElement.dataset.theme = this.theme;
+            },
+
+            toggleTheme() {
+                this.theme = this.theme === 'light' ? 'dark' : 'light';
+                this.applyTheme();
+                localStorage.setItem('theme', this.theme);
+                this.renderChrome();
+            },
+
+            toggleAdd() {
+                this.adding = !this.adding;
+                this.render();
+                if (this.adding) {
+                    this.loadWpVersions();
+                    $id('newSiteName').focus();
+                }
+            },
+
+            // Fetched once per page load, and cached server-side for a day.
+            // Deliberately silent on failure: an offline machine should
+            // still be able to create a site, it just won't be offered a
+            // pinned version alongside 'latest' and 'nightly'.
+            async loadWpVersions() {
+                if (this.wpVersionsLoaded) return;
+                this.wpVersionsLoaded = true;
+                try {
+                    const res = await fetch('api.php?action=wp_versions');
+                    const data = await res.json();
+                    if (Array.isArray(data)) {
+                        this.wpVersions = data;
+                        // 'latest' and 'nightly' are hard-coded first options;
+                        // real versions append after them.
+                        const sel = $id('wpVersionSelect');
+                        for (const v of data) {
+                            const opt = document.createElement('option');
+                            opt.value = v.version;
+                            opt.textContent = v.version + (v.status === 'insecure' ? ' — insecure' : '');
+                            sel.appendChild(opt);
+                        }
+                    }
+                } catch (e) { /* offline — 'latest' still works */ }
+            },
+
+            formatSize(bytes) {
+                if (bytes === null || bytes === undefined) return '—';
+                if (bytes === 0) return '0 B';
+                const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+                const i = Math.min(units.length - 1, Math.floor(Math.log(bytes) / Math.log(1024)));
+                const v = bytes / Math.pow(1024, i);
+                return (v >= 10 || i === 0 ? Math.round(v) : v.toFixed(1)) + ' ' + units[i];
+            },
+
+            formatRelative(ts) {
+                if (!ts) return '—';
+                const s = Math.max(0, Date.now() / 1000 - ts);
+                if (s < 60) return 'now';
+                if (s < 3600) return Math.floor(s / 60) + 'm';
+                if (s < 86400) return Math.floor(s / 3600) + 'h';
+                if (s < 86400 * 30) return Math.floor(s / 86400) + 'd';
+                if (s < 86400 * 365) return Math.floor(s / 86400 / 30) + 'mo';
+                return Math.floor(s / 86400 / 365) + 'y';
+            },
+
+            escapeHtml(s) {
+                return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+            },
+
+            // Wrap every case-insensitive occurrence of `query` in <mark> while
+            // escaping every other substring. Safe for innerHTML use because the
+            // inner text comes from the trusted domain, not from query (query
+            // only controls WHERE to split).
+            highlightMatch(text, query) {
+                const q = (query || '').trim();
+                if (!q) return this.escapeHtml(text);
+                const lower = text.toLowerCase();
+                const lowerQ = q.toLowerCase();
+                let out = '';
+                let i = 0;
+                while (i < text.length) {
+                    const idx = lower.indexOf(lowerQ, i);
+                    if (idx === -1) { out += this.escapeHtml(text.slice(i)); break; }
+                    out += this.escapeHtml(text.slice(i, idx));
+                    out += '<mark>' + this.escapeHtml(text.slice(idx, idx + q.length)) + '</mark>';
+                    i = idx + q.length;
+                }
+                return out;
+            },
+
+            // Wrap the site name in <span class="host-accent"> so it reads
+            // teal while the .localhost suffix stays dim — matches the
+            // landing-page dashboard mock. Split at the first dot; if
+            // there's none, the whole string is treated as the name.
+            highlightedDomain(domain, query) {
+                const stripped = String(domain).replace(/^https?:\/\//, '');
+                const dotIdx = stripped.indexOf('.');
+                if (dotIdx === -1) return '<span class="host-accent">' + this.highlightMatch(stripped, query) + '</span>';
+                const name = stripped.slice(0, dotIdx);
+                const suffix = stripped.slice(dotIdx);
+                return '<span class="host-accent">' + this.highlightMatch(name, query) + '</span>' + this.highlightMatch(suffix, query);
+            },
+
+            // --- Command palette -------------------------------------------
+            // Results mix matching sites with global commands. Sites are ranked
+            // by match position so a prefix hit beats a mid-string one.
+            get paletteResults() {
+                const q = this.palette.query.trim().toLowerCase();
+                const out = [];
+                const commands = [
+                    { key: 'cmd:add',     kind: 'cmd', label: 'Add site',            meta: '',  run: () => { this.closePalette(); this.toggleAdd(); } },
+                    { key: 'cmd:reload',  kind: 'cmd', label: 'Reload server',       meta: '',  run: () => { this.closePalette(); this.reloadServer(); } },
+                    { key: 'cmd:sizes',   kind: 'cmd', label: 'Refresh disk sizes',  meta: '',  run: () => { this.closePalette(); this.refreshSizes(); } },
+                    { key: 'cmd:db',      kind: 'cmd', label: 'Open database',       meta: '',  run: () => { this.closePalette(); window.open('https://db.cove.localhost' + PORT_SUFFIX, '_blank', 'noopener'); } },
+                    { key: 'cmd:mail',    kind: 'cmd', label: 'Open Mailpit',        meta: '',  run: () => { this.closePalette(); window.open(this.mailpitUrl, '_blank', 'noopener'); } },
+                    { key: 'cmd:creds',   kind: 'cmd', label: 'Database credentials',meta: '',  run: () => { this.closePalette(); this.setDbModal(true); } },
+                    { key: 'cmd:theme',   kind: 'cmd', label: 'Toggle theme',        meta: '',  run: () => { this.closePalette(); this.toggleTheme(); } },
+                ];
+                let sites = this.sites;
+                if (q) {
+                    sites = sites
+                        .map(s => ({ s, i: s.name.toLowerCase().indexOf(q) }))
+                        .filter(x => x.i !== -1)
+                        .sort((a, b) => a.i - b.i || a.s.name.localeCompare(b.s.name))
+                        .map(x => x.s);
+                } else {
+                    // No query: show pinned first, then whatever the list is
+                    // sorted by, capped so the palette stays a menu not a dump.
+                    sites = this.filteredSites;
+                }
+                for (const site of sites.slice(0, 40)) {
+                    out.push({
+                        key: 'site:' + site.name,
+                        kind: site.type === 'WordPress' ? 'wp' : 'static',
+                        label: site.name + '.localhost',
+                        meta: this.formatSize(site.size_bytes),
+                        site,
+                        run: () => { this.closePalette(); this.openSite(site); }
+                    });
+                }
+                for (const c of commands) {
+                    if (!q || c.label.toLowerCase().includes(q)) out.push(c);
+                }
+                return out;
+            },
+
+            async reloadServer() {
+                this.showSnack('Reloading server…');
+                const res = await this.apiPostRetry('reload_server', {}, 3, 10000);
+                if (res.success) this.showSnack('Server reloaded.');
+            },
+
+            // --- Row actions -----------------------------------------------
+            // macOS says "Finder"; everywhere else the file manager has no
+            // one name, so stay generic rather than lie about it.
+            get revealLabel() {
+                return navigator.platform && navigator.platform.startsWith('Mac')
+                    ? 'Reveal in Finder' : 'Open folder';
+            },
+
+            setDbModal(on) {
+                this.showDbModal = on;
+                show($id('dbModal'), on);
+            },
+
+            promptRename(site) {
+                this.rename = { open: true, site, value: site.name, busy: false };
+                show($id('renameModal'), true);
+                this.renderRename();
+                const el = $id('renameInput');
+                el.value = site.name;
+                el.focus();
+                el.select();
+            },
+
+            closeRename() {
+                this.rename.open = false;
+                show($id('renameModal'), false);
+            },
+
+            async submitRename() {
+                const site = this.rename.site;
+                const next = (this.rename.value || '').trim();
+                if (!site || !next || next === site.name) { this.closeRename(); return; }
+                if (!/^[a-zA-Z0-9-]+$/.test(next)) {
+                    this.showSnack('Use letters, numbers and hyphens only.', true);
+                    return;
+                }
+                this.rename.busy = true;
+                this.renderRename();
+                // Renaming rewrites the Caddyfile, so the response can land
+                // mid-reload exactly like a delete does — same retry policy.
+                const res = await this.apiPostRetry('rename_site', { site_name: site.name, new_name: next });
+                this.rename.busy = false;
+                this.renderRename();
+                if (!res.success) return;   // apiPost surfaced the reason
+                this.closeRename();
+                // Carry over UI state that is keyed by name, or a pinned site
+                // would silently unpin itself on rename.
+                if (this.isPinned(site.name)) {
+                    this.pinned = this.pinned.map(n => (n === site.name ? next : n));
+                    localStorage.setItem('pinned', JSON.stringify(this.pinned));
+                }
+                if (this.selectedName === site.name) this.selectedName = next;
+                this.showSnack(res.message || 'Renamed.');
+                await this.getSites();
+            },
+
+            async revealSite(name) {
+                const res = await this.apiPost('reveal_site', { site_name: name });
+                if (res.success) this.showSnack(res.message || 'Opened in the file manager.');
+            },
+
+            openSiteDb(site) {
+                // Adminer takes the schema in the query string, so this lands
+                // on the site's own tables instead of the server root.
+                const url = this.adminerUrl + '/?username=' + encodeURIComponent(DB_USER) +
+                            '&db=' + encodeURIComponent(site.db_name || ('cove_' + site.name).replace(/[^a-zA-Z0-9_]/g, '_'));
+                window.open(url, '_blank', 'noopener');
+            },
+
+            // Caddy writes one JSON object per line, which is unreadable as a
+            // wall of text. Fold each request down to the fields you'd
+            // actually scan for — time, status, method, path, duration —
+            // and leave anything that isn't a request line untouched.
+            get logDisplay() {
+                if (this.logView.busy) return 'Loading…';
+                const raw = this.logView.text || '';
+                if (!raw) return 'No log entries yet.';
+                if (this.logView.raw) return raw;
+                const out = [];
+                for (const line of raw.split('\n')) {
+                    const t = line.trim();
+                    if (!t) continue;
+                    if (t[0] !== '{') { out.push(t); continue; }
+                    let o;
+                    try { o = JSON.parse(t); } catch (e) { out.push(t); continue; }
+                    const req = o.request || {};
+                    if (!req.method) { out.push(o.msg ? (o.level || '') + ' ' + o.msg : t); continue; }
+                    const time = o.ts ? new Date(o.ts * 1000).toLocaleTimeString() : '';
+                    const status = o.status !== undefined ? String(o.status) : '';
+                    const dur = typeof o.duration === 'number' ? (o.duration * 1000).toFixed(0) + 'ms' : '';
+                    out.push([
+                        time,
+                        status.padEnd(3),
+                        (req.method || '').padEnd(6),
+                        req.uri || '',
+                        dur
+                    ].filter(Boolean).join('  '));
+                }
+                return out.join('\n') || 'No log entries yet.';
+            },
+
+            async viewLog(site, refresh = false) {
+                this.logView = { open: true, site: site.name, text: refresh ? this.logView.text : '', truncated: false, busy: true, raw: this.logView.raw };
+                show($id('logModal'), true);
+                this.renderLog();
+                const res = await this.apiPost('site_log', { site_name: site.name });
+                this.logView.busy = false;
+                if (!res.success) { this.closeLog(); return; }
+                this.logView.text = res.log || '';
+                this.logView.truncated = !!res.truncated;
+                this.renderLog();
+                // Logs are read tail-first; jump to the newest lines.
+                const el = $id('logPane');
+                el.scrollTop = el.scrollHeight;
+            },
+
+            closeLog() {
+                this.logView.open = false;
+                show($id('logModal'), false);
+            },
+
+            openPalette() {
+                this.palette.open = true;
+                this.palette.query = '';
+                this.palette.index = 0;
+                this.closeRowMenu();
+                $id('paletteInput').value = '';
+                this.renderPalette();
+                $id('paletteInput').focus();
+            },
+
+            closePalette() {
+                this.palette.open = false;
+                show($id('paletteBackdrop'), false);
+            },
+
+            paletteMove(delta) {
+                const n = this._paletteItems.length;
+                if (!n) return;
+                this.palette.index = (this.palette.index + delta + n) % n;
+                const list = $id('paletteList');
+                list.querySelectorAll('.palette-item').forEach(el =>
+                    el.classList.toggle('active', Number(el.dataset.index) === this.palette.index));
+                const el = list.children[this.palette.index];
+                if (el && el.scrollIntoView) el.scrollIntoView({ block: 'nearest' });
+            },
+
+            paletteRun(event) {
+                const item = this._paletteItems[this.palette.index];
+                if (!item) return;
+                // Cmd/Ctrl+Enter logs into a WordPress site instead of opening it.
+                if (event && (event.metaKey || event.ctrlKey) && item.site && item.site.type === 'WordPress') {
+                    this.closePalette();
+                    this.getLoginLink(item.site.name);
+                    return;
+                }
+                item.run();
+            },
+
+            paletteRunItem(item) { if (item) item.run(); },
+
+            // --- Row context menu ------------------------------------------
+            openRowMenu(site, event) {
+                // Show first, then clamp using the menu's real size — the item
+                // set varies by site type, so a guessed height either wastes
+                // margin or lets the bottom items land off-screen.
+                this.ctxMenu = { open: true, site, x: event.clientX, y: event.clientY, openedAt: event.timeStamp };
+                this.renderCtxMenu();
+                const rect = $id('ctxMenu').getBoundingClientRect();
+                this.ctxMenu.x = Math.max(8, Math.min(event.clientX, window.innerWidth - rect.width - 8));
+                this.ctxMenu.y = Math.max(8, Math.min(event.clientY, window.innerHeight - rect.height - 8));
+                this.renderCtxMenu();
+                this.renderList(); // row highlight
+            },
+
+            closeRowMenu() {
+                if (!this.ctxMenu.open) return;
+                this.ctxMenu.open = false;
+                show($id('ctxMenu'), false);
+                this.renderList();
+            },
+
+            // --- Pinning ---------------------------------------------------
+            isPinned(name) { return this.pinned.includes(name); },
+
+            togglePin(name) {
+                if (this.isPinned(name)) {
+                    this.pinned = this.pinned.filter(n => n !== name);
+                } else {
+                    this.pinned = [...this.pinned, name];
+                }
+                localStorage.setItem('pinned', JSON.stringify(this.pinned));
+                this.render();
+            },
+
+            // --- Keyboard list navigation ----------------------------------
+            moveSelection(delta) {
+                const list = this.filteredSites;
+                if (!list.length) return;
+                const cur = list.findIndex(s => s.name === this.selectedName);
+                let next = cur === -1 ? (delta > 0 ? 0 : list.length - 1) : cur + delta;
+                next = Math.max(0, Math.min(list.length - 1, next));
+                this.selectedName = list[next].name;
+                this.renderList();
+                const el = document.querySelectorAll('.site-row')[next];
+                if (el && el.scrollIntoView) el.scrollIntoView({ block: 'nearest' });
+            },
+
+            selectedSite() {
+                return this.filteredSites.find(s => s.name === this.selectedName) || null;
+            },
+
+            setSort(key) {
+                // Click the active header to flip direction; a new key
+                // starts at its natural default (a→z for name, biggest /
+                // most recent first for size and modified).
+                if (this.sort === key) {
+                    this.sortDir = this.sortDir === 'asc' ? 'desc' : 'asc';
+                } else {
+                    this.sort = key;
+                    this.sortDir = key === 'name' ? 'asc' : 'desc';
+                }
+                localStorage.setItem('sort', this.sort);
+                localStorage.setItem('sortDir', this.sortDir);
+                this.render();
+            },
+
+            openSite(site) {
+                // Don't navigate when the click was part of a drag-to-select,
+                // so users can still grab the domain/size text to copy.
+                if (window.getSelection && window.getSelection().toString()) return;
+                window.open(site.domain, '_blank', 'noopener');
+            },
+
+            showSnack(msg, isError = false, opts = {}) {
+                if (this.snackbar.timer) clearTimeout(this.snackbar.timer);
+                this.snackbar = {
+                    visible: true, message: msg, isError, timer: null,
+                    action: opts.action || null,
+                    actionLabel: opts.actionLabel || ''
+                };
+                this.snackbar.timer = setTimeout(() => { this.snackbar.visible = false; this.renderSnackbar(); }, opts.duration || 3500);
+                this.renderSnackbar();
+            },
+
+            async apiPost(action, payload = {}, opts = {}) {
+                const { timeoutMs = 0, quiet = false } = opts;
+                const ctrl = timeoutMs ? new AbortController() : null;
+                const timer = ctrl ? setTimeout(() => ctrl.abort(), timeoutMs) : null;
+                try {
+                    const res = await fetch('api.php', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ action, ...payload }),
+                        ...(ctrl ? { signal: ctrl.signal } : {})
+                    }).then(r => r.json());
+                    if (!res.success && !quiet) this.showSnack(res.message || 'An error occurred.', true);
+                    return res;
+                } catch (e) {
+                    // transport marks network-level failures (connection
+                    // dropped, timeout) as distinct from server-reported
+                    // errors — only these are worth retrying.
+                    if (!quiet) this.showSnack('Network error.', true);
+                    return { success: false, transport: true };
+                } finally {
+                    if (timer) clearTimeout(timer);
+                }
+            },
+
+            async apiPostRetry(action, payload = {}, attempts = 3, timeoutMs = 30000) {
+                // The Caddy/FrankenPHP reload the dashboard triggers after
+                // add/delete can momentarily drop or hang requests to the
+                // dashboard itself. Retry transport failures a few times so
+                // an action that lands mid-reload isn't silently lost.
+                let res;
+                for (let i = 1; i <= attempts; i++) {
+                    res = await this.apiPost(action, payload, { timeoutMs, quiet: i < attempts });
+                    if (res.success || !res.transport) return res;
+                    if (i < attempts) await new Promise(r => setTimeout(r, 3000));
+                }
+                return res;
+            },
+
+            async getSites() {
+                this.isLoading = true;
+                this.render();
+                try {
+                    const r = await fetch('api.php?action=list_sites');
+                    const data = await r.json();
+                    // Sites staged for deletion are still on disk (nothing
+                    // is sent to the backend until the undo window closes),
+                    // so a refresh landing mid-window would re-add the rows
+                    // the user just deleted — and undo would then push a
+                    // second copy of the same row.
+                    const staged = new Set(this.pendingDelete ? this.pendingDelete.sites.map(s => s.name) : []);
+                    this.sites = data
+                        .map(s => ({ ...s, isLoggingIn: false }))
+                        .filter(s => !staged.has(s.name));
+                } catch (e) {
+                    this.showSnack('Could not fetch sites.', true);
+                } finally {
+                    this.isLoading = false;
+                    this.render();
+                }
+            },
+
+            async addSite() {
+                if (!this.newSite.name) return;
+                this.newSite.isLoading = true;
+                this.render();
+                const name = this.newSite.name;
+                const isPlain = this.newSite.isPlain;
+                // 'latest' is the server's default, so it's sent as nothing
+                // at all — keeps the generated command identical to what a
+                // plain `cove add <name>` produces.
+                const wpVersion = isPlain ? '' : this.newSite.wpVersion;
+
+                const add = await this.apiPost('add_site', { site_name: name, is_plain: isPlain, wp_version: (wpVersion && wpVersion !== 'latest') ? wpVersion : undefined });
+                if (add.success) {
+                    // Optimistic insert: we already know every field the row
+                    // template uses. No auto-refresh — the Caddy reload that
+                    // follows can take tens of seconds on fleets with lots of
+                    // sites and would either hang the fetch or drop the UI
+                    // into an ERR_CONNECTION_REFUSED during the config swap.
+                    this.sites.push({
+                        name,
+                        domain: 'https://' + name + '.localhost' + PORT_SUFFIX,
+                        type: isPlain ? 'Plain' : 'WordPress',
+                        display_path: '~/Cove/Sites/' + name + '.localhost',
+                        full_path: SITES_DIR + '/' + name + '.localhost',
+                        // Server calculates size in add_site and returns it
+                        // alongside success. Fall back to null so the row
+                        // shows "—" until the next refresh if anything failed.
+                        size_bytes: (typeof add.size_bytes === 'number') ? add.size_bytes : null,
+                        modified_at: Math.floor(Date.now() / 1000),
+                        isLoggingIn: false,
+                    });
+                    this.showSnack('Site created.');
+                    this.newSite.name = '';
+                    $id('newSiteName').value = '';
+                    this.newSite.wpVersion = 'latest';
+                    $id('wpVersionSelect').value = 'latest';
+                    this.adding = false;
+                    this.apiPost('reload_server'); // fire and forget — Caddy reloads in the background
+
+                    // Surface a persistent alert so the user can jump
+                    // straight into the new site without hunting for the
+                    // row. WP sites get a one-time admin login; plain
+                    // sites get a simple "open site" link.
+                    this.alerts.push({
+                        id: Date.now() + Math.random(),
+                        name,
+                        isPlain,
+                        isLoggingIn: false,
+                    });
+                }
+                this.newSite.isLoading = false;
+                this.render();
+            },
+
+            async loginToNewSite(alert) {
+                alert.isLoggingIn = true;
+                this.renderAlerts();
+                const res = await this.apiPost('get_login_link', { site_name: alert.name });
+                if (res.success && res.url) {
+                    window.open(res.url, '_blank');
+                    // Acted on — banner's job is done. The new tab has the
+                    // one-time URL; dashboard can drop the prompt.
+                    this.dismissAlert(alert.id);
+                }
+                alert.isLoggingIn = false;
+                this.renderAlerts();
+            },
+
+            dismissAlert(id) {
+                this.alerts = this.alerts.filter(a => a.id !== id);
+                this.renderAlerts();
+            },
+
+            deleteSite(name) {
+                const site = this.sites.find(s => s.name === name);
+                if (!site) return;
+                this.stageDeletes([site]);
+            },
+
+            bulkDelete() {
+                // Two-step inline confirm: first click arms the button for a
+                // few seconds, second click stages every filtered site. The
+                // undo snackbar is the safety net after that.
+                if (!this.bulkArmed) {
+                    this.bulkArmed = true;
+                    this.bulkArmTimer = setTimeout(() => { this.bulkArmed = false; this.renderChrome(); }, 3500);
+                    this.renderChrome();
+                    return;
+                }
+                clearTimeout(this.bulkArmTimer);
+                this.bulkArmed = false;
+                this.stageDeletes([...this.filteredSites]);
+            },
+
+            stageDeletes(sitesToDelete) {
+                // Pull the rows from the list immediately (the UI feels
+                // instant) but hold the backend work for an undo window.
+                // Nothing is deleted server-side until the window passes.
+                if (this.pendingDelete) clearTimeout(this.pendingDelete.timer);
+                const staged = this.pendingDelete ? this.pendingDelete.sites : [];
+                for (const site of sitesToDelete) {
+                    const idx = this.sites.findIndex(s => s.name === site.name);
+                    if (idx !== -1) { this.sites.splice(idx, 1); staged.push(site); }
+                }
+                if (!staged.length) { this.pendingDelete = null; this.render(); return; }
+                this.pendingDelete = {
+                    sites: staged,
+                    timer: setTimeout(() => this.commitPendingDeletes(), 5000)
+                };
+                this.render();
+                const label = staged.length === 1
+                    ? 'Deleted ' + staged[0].name + '.'
+                    : 'Deleted ' + staged.length + ' sites.';
+                this.showSnack(label, false, {
+                    actionLabel: 'undo',
+                    action: () => this.undoPendingDeletes(),
+                    duration: 5000
+                });
+            },
+
+            commitPendingDeletes() {
+                if (!this.pendingDelete) return;
+                const names = this.pendingDelete.sites.map(s => s.name);
+                this.pendingDelete = null;
+                // processDeleteQueue drains the queue single-file so
+                // concurrent deletes don't race on shared state (Caddyfile
+                // regeneration, /etc/hosts edits).
+                this.deleteQueue.push(...names);
+                this.processDeleteQueue();
+            },
+
+            undoPendingDeletes() {
+                if (!this.pendingDelete) return;
+                clearTimeout(this.pendingDelete.timer);
+                // renderList re-sorts, so push order is fine.
+                this.sites.push(...this.pendingDelete.sites);
+                this.pendingDelete = null;
+                if (this.snackbar.timer) clearTimeout(this.snackbar.timer);
+                this.snackbar.visible = false;
+                this.render();
+                this.renderSnackbar();
+            },
+
+            async processDeleteQueue() {
+                // Single-flight runner: whichever call picks up the lock drains the
+                // full queue. Concurrent deleteSite() calls just enqueue and return.
+                if (this.isProcessingQueue) return;
+                this.isProcessingQueue = true;
+
+                let anyFailed = false;
+                try {
+                    // Outer loop catches deletes queued while we were awaiting the
+                    // reload below — otherwise they'd sit forever because the next
+                    // deleteSite() call short-circuits on isProcessingQueue.
+                    while (this.deleteQueue.length > 0) {
+                        while (this.deleteQueue.length > 0) {
+                            const target = this.deleteQueue.shift();
+                            const del = await this.apiPostRetry('delete_site', { site_name: target });
+                            if (del.success) {
+                                // Don't stomp a newer batch's undo snackbar
+                                // with a routine confirmation.
+                                if (!this.pendingDelete) this.showSnack('Site deleted.');
+                            } else {
+                                anyFailed = true; // apiPost already surfaced the error
+                            }
+                        }
+                        // Kick a reload at the end of the batch. Race-safety
+                        // lives server-side: cove_reload() uses a mkdir lock
+                        // with a pending marker to coalesce concurrent calls,
+                        // since reload_server itself backgrounds the shell
+                        // command (shell_exec '...&') and returns instantly.
+                        // Two unsynchronized frankenphp reload calls otherwise
+                        // deadlock Caddy's admin server (10s shutdown timeout).
+                        await this.apiPostRetry('reload_server', {}, 3, 10000);
+                    }
+                } finally {
+                    this.isProcessingQueue = false;
+                }
+
+                // If anything failed mid-queue the optimistic UI is now out of sync
+                // with the backend (e.g. a survivor is missing from our list).
+                // Cheapest correct fix: re-fetch the authoritative list.
+                if (anyFailed) await this.getSites();
+            },
+
+            async getLoginLink(name) {
+                const site = this.sites.find(s => s.name === name);
+                if (!site) return;
+                site.isLoggingIn = true;
+                this.renderList();
+                const res = await this.apiPost('get_login_link', { site_name: name });
+                if (res.success && res.url) {
+                    window.open(res.url, '_blank');
+                    this.showSnack('Login link opened in a new tab.');
+                }
+                site.isLoggingIn = false;
+                this.renderList();
+            },
+
+            async copyPath(path) {
+                try {
+                    await navigator.clipboard.writeText(path);
+                    this.showSnack('Path copied to clipboard.');
+                } catch (e) {
+                    this.showSnack('Could not copy path.', true);
+                }
+            },
+
+            async refreshSizes() {
+                this.isRefreshingSizes = true;
+                this.renderFooter();
+                const res = await this.apiPost('refresh_sizes');
+                if (res.success) {
+                    await this.getSites();
+                    this.showSnack('Disk sizes updated.');
+                }
+                this.isRefreshingSizes = false;
+                this.renderFooter();
+            }
+        };
+
+        // The script sits at the end of <body>, so the DOM is already parsed.
+        app.init();
     </script>
 </body>
 </html>

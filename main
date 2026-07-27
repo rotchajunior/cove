@@ -2493,6 +2493,28 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
         echo json_encode(cove_wp_versions($__cove_wpver_cache));
         exit;
     }
+    if ($action === 'php_info') {
+        // Which PHP versions the dashboard can offer for per-site pins. The
+        // dashboard itself runs under FrankenPHP, so PHP_VERSION here IS
+        // Cove's default PHP — only OLDER versions run on native php-fpm.
+        // Installed = the Homebrew formula's php-fpm binary exists, mirroring
+        // php_fpm_prefix_for in the CLI.
+        $default_mm = preg_replace('/^(\d+\.\d+).*$/', '$1', PHP_VERSION);
+        $brew_opt = is_dir('/opt/homebrew/opt') ? '/opt/homebrew/opt' : (is_dir('/usr/local/opt') ? '/usr/local/opt' : null);
+        $supported = (PHP_OS_FAMILY === 'Darwin') && $brew_opt !== null;
+        $versions = [];
+        foreach (['8.4', '8.3', '8.2', '8.1', '8.0', '7.4'] as $v) {
+            if (version_compare($v, $default_mm, '>=')) continue;
+            $installed = $supported && is_executable($brew_opt . '/php@' . $v . '/sbin/php-fpm');
+            // 8.0 and 7.4 left Homebrew core, so they can't be offered as
+            // one-click installs — but when a tap already provides them
+            // (shivammathur/php), pinning works, so show what's there.
+            if (!$installed && version_compare($v, '8.1', '<')) continue;
+            $versions[] = ['version' => $v, 'installed' => $installed];
+        }
+        echo json_encode(['supported' => $supported, 'default' => $default_mm, 'versions' => $versions]);
+        exit;
+    }
 }
 
 // Handle POST requests for adding/deleting/reloading
@@ -2668,6 +2690,44 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }
             echo json_encode($response);
             exit; // Exit immediately
+        case 'set_php':
+            // Pin a site to an older PHP (native php-fpm) or back to the
+            // default. Charset gates mirror add/delete; the version must be a
+            // major.minor or the literal 'default'.
+            $php_version = $input['php_version'] ?? '';
+            if (empty($site_name) || !preg_match('/^[a-zA-Z0-9-]+$/', $site_name)) {
+                $response['message'] = 'Invalid site name provided.';
+                break;
+            }
+            if (!preg_match('/^(default|\d+\.\d+)$/', $php_version)) {
+                $response['message'] = 'Invalid PHP version.';
+                break;
+            }
+            $pin_file = $sitedir . '/' . $site_name . '.localhost/php_version';
+            $current_pin = is_file($pin_file) ? trim((string) @file_get_contents($pin_file)) : null;
+            // Idempotent retry, same reasoning as rename: pinning reloads the
+            // Caddy serving this dashboard, so a dropped response gets retried
+            // by the UI after the work already happened.
+            if (($php_version === 'default' && $current_pin === null) || $php_version === $current_pin) {
+                echo json_encode(['success' => true, 'message' => 'Already set.']);
+                exit;
+            }
+            $brew_opt = is_dir('/opt/homebrew/opt') ? '/opt/homebrew/opt' : '/usr/local/opt';
+            $needs_install = $php_version !== 'default' && !is_executable($brew_opt . '/php@' . $php_version . '/sbin/php-fpm');
+            if ($needs_install) {
+                // brew install takes minutes — run the whole pin in the
+                // background (cove php auto-confirms installs when it has no
+                // TTY) and let the UI poll list_sites for the pin to appear.
+                $install_log = $user_home . '/Cove/cache/php-install-' . $php_version . '.log';
+                shell_exec(sprintf('HOME=%s %s php %s %s > %s 2>&1 &',
+                    escapeshellarg($user_home), escapeshellarg($cove_path),
+                    escapeshellarg($site_name), escapeshellarg($php_version), escapeshellarg($install_log)));
+                echo json_encode(['success' => true, 'installing' => true]);
+                exit;
+            }
+            $command = sprintf('HOME=%s %s php %s %s 2>&1', escapeshellarg($user_home), escapeshellarg($cove_path), escapeshellarg($site_name), escapeshellarg($php_version));
+            $php_set_target = $php_version;
+            break;
         case 'reload_server':
             // This command is run in the background to prevent deadlocking the server.
             // Output is redirected to /dev/null and the '&' backgrounds the process.
@@ -2709,6 +2769,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $response['message'] = 'Renamed to ' . $rename_site_target . '.localhost.';
                 $response['new_name'] = $rename_site_target;
             }
+            if (isset($php_set_target)) {
+                $response['message'] = $php_set_target === 'default'
+                    ? 'Back on Cove\'s default PHP.'
+                    : 'Now running PHP ' . $php_set_target . '.';
+            }
             // For add_site: measure the new site's footprint inline and fold
             // it into the size cache so the UI shows "4.0 KB" (or whatever)
             // immediately instead of "—" until the next refresh_sizes pass.
@@ -2741,6 +2806,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 // gone is a success, not an error.
                 echo json_encode(['success' => true, 'message' => 'Site already deleted.']);
                 exit;
+            }
+            if (isset($php_set_target)) {
+                $msg = 'Could not change the PHP version.';
             }
             if (isset($rename_site_target)) {
                 $msg = 'Could not rename site.';
@@ -3041,6 +3109,9 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
         .site-wp-version.insecure::after { content: "●"; margin-left: 0.25rem; color: var(--pill-warn-fg, #d08c30); font-size: 0.6em; vertical-align: middle; }
         .site-type.wp { background: var(--pill-wp-bg); color: var(--pill-wp-fg); }
         .site-type.static { background: var(--pill-static-bg); color: var(--pill-static-fg); }
+        /* Pinned-PHP chip: only rendered when a site is pinned off the default,
+           so the common case stays visually quiet. */
+        .site-php-version { font-family: var(--font-mono); font-size: 0.66rem; color: var(--text-faint); white-space: nowrap; border: 1px solid var(--panel-border); border-radius: var(--radius-pill); padding: 0.05rem 0.45rem; }
         .site-modified { font-family: var(--font-mono); font-size: 0.8rem; color: var(--text-faint); min-width: 44px; text-align: right; }
         .site-size { font-family: var(--font-mono); font-size: 0.82rem; color: var(--text-dim); min-width: 64px; text-align: right; }
         .site-actions { display: flex; gap: 0.15rem; opacity: 0; transition: opacity 100ms; }
@@ -3157,6 +3228,17 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
         .db-cred-label { color: var(--text-dim); font-weight: 500; }
         .db-cred-value { color: var(--text); word-break: break-all; background: transparent; padding: 0; }
         .modal .modal-foot { margin-top: 1rem; display: flex; justify-content: space-between; align-items: center; color: var(--text-faint); font-family: var(--font-mono); font-size: 0.75rem; }
+
+        /* PHP version picker rows. Installed versions are one click; missing
+           ones are greyed but still actionable — clicking installs the brew
+           formula first, then pins. */
+        .php-options { display: flex; flex-direction: column; gap: 0.35rem; }
+        .php-option { display: flex; align-items: center; justify-content: space-between; gap: 1rem; width: 100%; background: var(--input-bg); border: 1px solid var(--panel-border); border-radius: var(--radius-md); padding: 0.55rem 0.9rem; color: var(--text); cursor: pointer; font-family: var(--font-mono); font-size: 0.85rem; text-align: left; transition: border-color 120ms, background 120ms; }
+        .php-option:hover { border-color: var(--accent); }
+        .php-option.current { border-color: var(--accent); background: var(--pill-wp-bg); cursor: default; }
+        .php-option.uninstalled .php-option-name { color: var(--text-faint); }
+        .php-option .php-option-meta { font-size: 0.72rem; color: var(--text-faint); }
+        .php-option:disabled { opacity: 0.65; cursor: default; }
 
         /* Wider variant for log output, which is unreadable at 540px. */
         .modal-wide { max-width: min(900px, 92vw); width: 900px; }
@@ -3317,6 +3399,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                         <span class="site-type-cell">
                             <span class="site-type"></span>
                             <span class="site-wp-version"></span>
+                            <span class="site-php-version"></span>
                         </span>
                         <span class="site-modified"></span>
                         <span class="site-size"></span>
@@ -3404,6 +3487,25 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
         </div>
     </div>
 
+    <!-- PHP version picker -->
+    <div class="modal-backdrop" id="phpModal" style="display: none;">
+        <div class="modal">
+            <h3>PHP version <span class="modal-title-dim" id="phpModalSite"></span></h3>
+            <p class="modal-sub">Pinned sites run on a native Homebrew php-fpm behind FrankenPHP — TLS, logs and the URL stay the same.</p>
+            <div class="php-options" id="phpOptions"></div>
+            <template id="tpl-php-option">
+                <button type="button" class="php-option">
+                    <span class="php-option-name"></span>
+                    <span class="php-option-meta"></span>
+                </button>
+            </template>
+            <div class="modal-foot">
+                <span id="phpModalHint"></span>
+                <button class="pill" id="btnPhpClose">close</button>
+            </div>
+        </div>
+    </div>
+
     <!-- Site log -->
     <div class="modal-backdrop" id="logModal" style="display: none;">
         <div class="modal modal-wide">
@@ -3430,6 +3532,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             <button class="ctx-item" id="ctxRename"><span>Rename…</span></button>
             <button class="ctx-item" id="ctxReveal"><span>Open folder</span></button>
             <button class="ctx-item" id="ctxDb"><span>Open database</span></button>
+            <button class="ctx-item" id="ctxPhp"><span>PHP version…</span><span class="ctx-key" id="ctxPhpMeta"></span></button>
             <button class="ctx-item" id="ctxLog"><span>View log</span></button>
             <div class="ctx-sep"></div>
             <button class="ctx-item" id="ctxCopy"><span>Copy path</span></button>
@@ -3500,6 +3603,11 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             palette: { open: false, query: '', index: 0 },
             rename: { open: false, site: null, value: '', busy: false },
             logView: { open: false, site: '', text: '', truncated: false, busy: false, raw: false },
+            phpModal: { open: false, site: null, busy: false },
+            // { supported, default, versions: [{version, installed}] } — fetched
+            // lazily; null until loaded, refreshed after any pin change.
+            phpInfo: null,
+            phpInstallPoll: null,
             newSite: { name: '', isPlain: false, wpVersion: 'latest', isLoading: false },
             // Populated lazily the first time the add row opens — no reason
             // to hit wp.org on a page load that never creates a site. Stays
@@ -3669,6 +3777,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
 
                     if (e.key === 'Escape') {
                         if (this.ctxMenu.open) { this.closeRowMenu(); return; }
+                        if (this.phpModal.open) { this.closePhpModal(); return; }
                         if (this.rename.open) { this.closeRename(); return; }
                         if (this.logView.open) { this.closeLog(); return; }
                         if (this.showDbModal) { this.setDbModal(false); return; }
@@ -3693,6 +3802,10 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                     if (!this.ctxMenu.open || e.timeStamp === this.ctxMenu.openedAt) return;
                     if (!$id('ctxMenu').contains(e.target)) this.closeRowMenu();
                 });
+
+                // Non-blocking: the context menu's "php X.Y" meta and the
+                // platform-support check want this early, but nothing waits on it.
+                this.loadPhpInfo();
 
                 this.getSites().then(() => {
                     // If the size cache is empty (fresh install or just deleted),
@@ -3806,7 +3919,16 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 $id('ctxRename').addEventListener('click', withCtxSite(s => this.promptRename(s)));
                 $id('ctxReveal').addEventListener('click', withCtxSite(s => this.revealSite(s.name)));
                 $id('ctxDb').addEventListener('click', withCtxSite(s => this.openSiteDb(s)));
+                $id('ctxPhp').addEventListener('click', withCtxSite(s => this.openPhpModal(s)));
                 $id('ctxLog').addEventListener('click', withCtxSite(s => this.viewLog(s)));
+
+                // PHP version picker
+                $id('btnPhpClose').addEventListener('click', () => this.closePhpModal());
+                $id('phpModal').addEventListener('click', (e) => { if (e.target === $id('phpModal')) this.closePhpModal(); });
+                $id('phpOptions').addEventListener('click', (e) => {
+                    const btn = e.target.closest('.php-option');
+                    if (btn && !btn.disabled) this.choosePhp(btn.dataset.version);
+                });
                 $id('ctxCopy').addEventListener('click', withCtxSite(s => this.copyPath(s.full_path)));
                 $id('ctxPin').addEventListener('click', withCtxSite(s => this.togglePin(s.name)));
                 $id('ctxDelete').addEventListener('click', withCtxSite(s => this.deleteSite(s.name)));
@@ -3980,6 +4102,14 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                         ver.remove();
                     }
 
+                    const php = row.querySelector('.site-php-version');
+                    if (site.php_version) {
+                        php.textContent = 'php ' + site.php_version;
+                        php.title = 'Pinned to PHP ' + site.php_version + ' (native php-fpm). Change via the row menu.';
+                    } else {
+                        php.remove();
+                    }
+
                     const mod = row.querySelector('.site-modified');
                     mod.textContent = this.formatRelative(site.modified_at);
                     mod.title = site.modified_at ? new Date(site.modified_at * 1000).toLocaleString() : '';
@@ -4020,6 +4150,61 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 show($id('ctxDb'), isWp);
                 $id('ctxReveal').querySelector('span').textContent = this.revealLabel;
                 $id('ctxPin').querySelector('span').textContent = this.isPinned(site.name) ? 'Unpin from top' : 'Pin to top';
+                // Effective PHP as the item's meta; hide the item entirely on
+                // platforms where per-site pins aren't supported.
+                show($id('ctxPhp'), !this.phpInfo || this.phpInfo.supported !== false);
+                const effPhp = site.php_version || (this.phpInfo && this.phpInfo.default) || '';
+                $id('ctxPhpMeta').textContent = effPhp ? 'php ' + effPhp : '';
+            },
+
+            renderPhpModal() {
+                show($id('phpModal'), this.phpModal.open);
+                if (!this.phpModal.open) return;
+                const site = this.phpModal.site;
+                $id('phpModalSite').textContent = site.name + '.localhost';
+                const wrap = $id('phpOptions');
+                wrap.textContent = '';
+                const info = this.phpInfo;
+                if (!info) {
+                    const loading = document.createElement('div');
+                    loading.className = 'modal-hint';
+                    loading.textContent = 'Loading…';
+                    wrap.appendChild(loading);
+                    return;
+                }
+                // The pin may have changed since the menu opened — read the
+                // live site entry rather than the captured one.
+                const live = this.sites.find(s => s.name === site.name) || site;
+                const pin = live.php_version || null;
+                const tpl = $id('tpl-php-option');
+                const options = [{
+                    version: 'default',
+                    label: 'default — PHP ' + info.default,
+                    meta: pin ? 'FrankenPHP' : 'current · FrankenPHP',
+                    installed: true,
+                    current: !pin,
+                }];
+                for (const v of info.versions) {
+                    options.push({
+                        version: v.version,
+                        label: 'PHP ' + v.version,
+                        meta: pin === v.version ? 'current · php-fpm'
+                            : (v.installed ? 'installed' : 'not installed — click to install'),
+                        installed: v.installed,
+                        current: pin === v.version,
+                    });
+                }
+                for (const o of options) {
+                    const btn = tpl.content.firstElementChild.cloneNode(true);
+                    btn.dataset.version = o.version;
+                    btn.classList.toggle('current', o.current);
+                    btn.classList.toggle('uninstalled', !o.installed);
+                    btn.disabled = this.phpModal.busy || o.current;
+                    btn.querySelector('.php-option-name').textContent = o.label;
+                    btn.querySelector('.php-option-meta').textContent = o.meta;
+                    wrap.appendChild(btn);
+                }
+                $id('phpModalHint').textContent = this.phpModal.busy ? 'Applying…' : '';
             },
 
             renderModals() {
@@ -4028,6 +4213,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 this.renderRename();
                 show($id('logModal'), this.logView.open);
                 this.renderLog();
+                this.renderPhpModal();
             },
 
             renderRename() {
@@ -4305,6 +4491,76 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 const url = this.adminerUrl + '/?username=' + encodeURIComponent(DB_USER) +
                             '&db=' + encodeURIComponent(site.db_name || ('cove_' + site.name).replace(/[^a-zA-Z0-9_]/g, '_'));
                 window.open(url, '_blank', 'noopener');
+            },
+
+            // --- Per-site PHP version ---------------------------------------
+            loadPhpInfo(force = false) {
+                if (this.phpInfo && !force) return Promise.resolve(this.phpInfo);
+                return fetch('api.php?action=php_info')
+                    .then(r => r.json())
+                    .then(d => { this.phpInfo = d; return d; })
+                    .catch(() => null); // offline/mid-reload — the modal shows Loading… until retried
+            },
+
+            openPhpModal(site) {
+                this.phpModal = { open: true, site, busy: false };
+                this.renderPhpModal();
+                // Refresh every open: an install may have finished since the
+                // last fetch, flipping a greyed row to clickable.
+                this.loadPhpInfo(true).then(() => this.renderPhpModal());
+            },
+
+            closePhpModal() {
+                this.phpModal.open = false;
+                show($id('phpModal'), false);
+            },
+
+            async choosePhp(version) {
+                const site = this.phpModal.site;
+                if (!site || this.phpModal.busy || !version) return;
+                this.phpModal.busy = true;
+                this.renderPhpModal();
+                // Pinning regenerates the Caddyfile and reloads the server
+                // under this dashboard — same retry policy as rename.
+                const res = await this.apiPostRetry('set_php', { site_name: site.name, php_version: version });
+                this.phpModal.busy = false;
+                if (!res.success) { this.renderPhpModal(); return; }
+                this.closePhpModal();
+                if (res.installing) {
+                    this.showSnack('Installing PHP ' + version + ' via Homebrew — this can take a few minutes…', false, { duration: 300000 });
+                    this.startPhpInstallPoll(site.name, version);
+                    return;
+                }
+                this.showSnack(res.message || 'PHP version updated.');
+                this.loadPhpInfo(true);
+                await this.getSites();
+            },
+
+            startPhpInstallPoll(name, version) {
+                // The install+pin runs detached server-side; the pin file
+                // appearing in list_sites is the completion signal. Polled
+                // with a raw fetch, not getSites(), so the visible list does
+                // not flash "Loading…" every five seconds.
+                if (this.phpInstallPoll) clearInterval(this.phpInstallPoll);
+                const started = Date.now();
+                this.phpInstallPoll = setInterval(async () => {
+                    try {
+                        const r = await fetch('api.php?action=list_sites');
+                        const data = await r.json();
+                        const site = data.find(s => s.name === name);
+                        if (site && site.php_version === version) {
+                            clearInterval(this.phpInstallPoll);
+                            this.phpInstallPoll = null;
+                            this.loadPhpInfo(true);
+                            await this.getSites();
+                            this.showSnack(name + '.localhost is now running PHP ' + version + '.');
+                        } else if (Date.now() - started > 15 * 60 * 1000) {
+                            clearInterval(this.phpInstallPoll);
+                            this.phpInstallPoll = null;
+                            this.showSnack('PHP ' + version + ' is still installing — check ~/Cove/cache/php-install-' + version + '.log.', true, { duration: 8000 });
+                        }
+                    } catch (e) { /* mid-reload — keep polling */ }
+                }, 5000);
             },
 
             // Caddy writes one JSON object per line, which is unreadable as a

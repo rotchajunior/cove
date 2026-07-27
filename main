@@ -3309,7 +3309,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             <ul class="site-list">
                 <li class="site-head" x-show="!isLoading && filteredSites.length > 0">
                     <button type="button" class="site-head-btn" :class="{ active: sort === 'name' }" @click="setSort('name')" title="Sort by name">name<span class="sort-arrow" x-text="sortArrow('name')"></span></button>
-                    <span class="site-head-label">type</span>
+                    <button type="button" class="site-head-btn" :class="{ active: sort === 'type' }" @click="setSort('type')" title="Sort by type">type<span class="sort-arrow" x-text="sortArrow('type')"></span></button>
                     <button type="button" class="site-head-btn site-head-right head-modified" :class="{ active: sort === 'modified' }" @click="setSort('modified')" title="Sort by last modified">modified<span class="sort-arrow" x-text="sortArrow('modified')"></span></button>
                     <button type="button" class="site-head-btn site-head-right head-size" :class="{ active: sort === 'size' }" @click="setSort('size')" title="Sort by disk size">size<span class="sort-arrow" x-text="sortArrow('size')"></span></button>
                     <span aria-hidden="true"></span>
@@ -3516,7 +3516,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 // Default to most-recently-modified rather than alphabetical: on an
                 // install with hundreds of sites, "what was I just working on" is a
                 // far better landing state than "what starts with A".
-                sort: ['name', 'size', 'modified'].includes(localStorage.getItem('sort')) ? localStorage.getItem('sort') : 'modified',
+                sort: ['name', 'type', 'size', 'modified'].includes(localStorage.getItem('sort')) ? localStorage.getItem('sort') : 'modified',
                 sortDir: ['asc', 'desc'].includes(localStorage.getItem('sortDir')) ? localStorage.getItem('sortDir') : 'desc',
                 pinned: (() => { try { return JSON.parse(localStorage.getItem('pinned')) || []; } catch (e) { return []; } })(),
                 selectedName: null,
@@ -3569,6 +3569,18 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                         base.sort((a, b) => dir * ((a.size_bytes || 0) - (b.size_bytes || 0)));
                     } else if (this.sort === 'modified') {
                         base.sort((a, b) => dir * ((a.modified_at || 0) - (b.modified_at || 0)));
+                    } else if (this.sort === 'type') {
+                        // Version segments compare numerically so 6.10 outranks 6.9.
+                        // Plain sites have no wp_version and stay grouped together.
+                        const vcmp = (a, b) => {
+                            const pa = (a.wp_version || '').split('.'), pb = (b.wp_version || '').split('.');
+                            for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+                                const d = (parseInt(pa[i], 10) || 0) - (parseInt(pb[i], 10) || 0);
+                                if (d) return d;
+                            }
+                            return 0;
+                        };
+                        base.sort((a, b) => dir * (a.type.localeCompare(b.type) || vcmp(a, b)) || a.name.localeCompare(b.name));
                     } else {
                         base.sort((a, b) => dir * a.name.localeCompare(b.name));
                     }

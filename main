@@ -1969,7 +1969,12 @@ emit_site_php_handler() {
     local ver
     ver=$(site_php_version "$site_path")
     if [ -n "$ver" ] && [ -n "$(php_fpm_prefix_for "$ver")" ]; then
+        # php_server is shorthand for php_fastcgi + file_server. When swapping
+        # in a pinned socket, file_server must come along explicitly or every
+        # static asset (JS/CSS/images) falls through to no handler and Caddy
+        # answers with an empty 200 — which presents as a broken wp-admin.
         echo "    php_fastcgi unix/$(php_fpm_sock_for "$ver")" >> "$CADDYFILE_PATH"
+        echo "    file_server" >> "$CADDYFILE_PATH"
     else
         echo "    php_server" >> "$CADDYFILE_PATH"
     fi

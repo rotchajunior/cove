@@ -2714,20 +2714,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }
             $brew_opt = is_dir('/opt/homebrew/opt') ? '/opt/homebrew/opt' : '/usr/local/opt';
             $needs_install = $php_version !== 'default' && !is_executable($brew_opt . '/php@' . $php_version . '/sbin/php-fpm');
-            if ($needs_install) {
-                // brew install takes minutes — run the whole pin in the
-                // background (cove php auto-confirms installs when it has no
-                // TTY) and let the UI poll list_sites for the pin to appear.
-                $install_log = $user_home . '/Cove/cache/php-install-' . $php_version . '.log';
-                shell_exec(sprintf('HOME=%s %s php %s %s > %s 2>&1 &',
-                    escapeshellarg($user_home), escapeshellarg($cove_path),
-                    escapeshellarg($site_name), escapeshellarg($php_version), escapeshellarg($install_log)));
-                echo json_encode(['success' => true, 'installing' => true]);
-                exit;
-            }
-            $command = sprintf('HOME=%s %s php %s %s 2>&1', escapeshellarg($user_home), escapeshellarg($cove_path), escapeshellarg($site_name), escapeshellarg($php_version));
-            $php_set_target = $php_version;
-            break;
+            // Always applied in the background — even an installed-version pin
+            // regenerates the Caddyfile and reloads the Caddy serving this
+            // dashboard, so a synchronous exec just hangs the response until
+            // the client gives up. Return immediately; the UI polls list_sites
+            // for the pin state. cove php auto-confirms brew installs when it
+            // has no TTY, so the missing-formula case rides the same path.
+            $apply_log = $user_home . '/Cove/cache/php-apply-' . $site_name . '.log';
+            shell_exec(sprintf('HOME=%s %s php %s %s > %s 2>&1 &',
+                escapeshellarg($user_home), escapeshellarg($cove_path),
+                escapeshellarg($site_name), escapeshellarg($php_version), escapeshellarg($apply_log)));
+            echo json_encode(['success' => true, 'applying' => true, 'installing' => $needs_install]);
+            exit;
         case 'reload_server':
             // This command is run in the background to prevent deadlocking the server.
             // Output is redirected to /dev/null and the '&' backgrounds the process.
@@ -2769,11 +2767,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $response['message'] = 'Renamed to ' . $rename_site_target . '.localhost.';
                 $response['new_name'] = $rename_site_target;
             }
-            if (isset($php_set_target)) {
-                $response['message'] = $php_set_target === 'default'
-                    ? 'Back on Cove\'s default PHP.'
-                    : 'Now running PHP ' . $php_set_target . '.';
-            }
             // For add_site: measure the new site's footprint inline and fold
             // it into the size cache so the UI shows "4.0 KB" (or whatever)
             // immediately instead of "—" until the next refresh_sizes pass.
@@ -2806,9 +2799,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 // gone is a success, not an error.
                 echo json_encode(['success' => true, 'message' => 'Site already deleted.']);
                 exit;
-            }
-            if (isset($php_set_target)) {
-                $msg = 'Could not change the PHP version.';
             }
             if (isset($rename_site_target)) {
                 $msg = 'Could not rename site.';
@@ -3110,8 +3100,11 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
         .site-type.wp { background: var(--pill-wp-bg); color: var(--pill-wp-fg); }
         .site-type.static { background: var(--pill-static-bg); color: var(--pill-static-fg); }
         /* Pinned-PHP chip: only rendered when a site is pinned off the default,
-           so the common case stays visually quiet. */
+           so the common case stays visually quiet. While a version change is
+           applying (or installing), the chip pulses with the target version. */
         .site-php-version { font-family: var(--font-mono); font-size: 0.66rem; color: var(--text-faint); white-space: nowrap; border: 1px solid var(--panel-border); border-radius: var(--radius-pill); padding: 0.05rem 0.45rem; }
+        .site-php-version.applying { border-color: var(--accent); color: var(--text-dim); animation: php-pulse 1.2s ease-in-out infinite; }
+        @keyframes php-pulse { 50% { opacity: 0.45; } }
         .site-modified { font-family: var(--font-mono); font-size: 0.8rem; color: var(--text-faint); min-width: 44px; text-align: right; }
         .site-size { font-family: var(--font-mono); font-size: 0.82rem; color: var(--text-dim); min-width: 64px; text-align: right; }
         .site-actions { display: flex; gap: 0.15rem; opacity: 0; transition: opacity 100ms; }
@@ -3603,11 +3596,15 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             palette: { open: false, query: '', index: 0 },
             rename: { open: false, site: null, value: '', busy: false },
             logView: { open: false, site: '', text: '', truncated: false, busy: false, raw: false },
-            phpModal: { open: false, site: null, busy: false },
+            phpModal: { open: false, site: null },
             // { supported, default, versions: [{version, installed}] } — fetched
             // lazily; null until loaded, refreshed after any pin change.
             phpInfo: null,
             phpInstallPoll: null,
+            // name → target version while a change is in flight. Kept separate
+            // from the site objects because getSites() rebuilds those from the
+            // server and would drop a flag stored on them mid-install.
+            phpApplying: {},
             newSite: { name: '', isPlain: false, wpVersion: 'latest', isLoading: false },
             // Populated lazily the first time the add row opens — no reason
             // to hit wp.org on a page load that never creates a site. Stays
@@ -4103,7 +4100,12 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                     }
 
                     const php = row.querySelector('.site-php-version');
-                    if (site.php_version) {
+                    const applying = this.phpApplying[site.name];
+                    if (applying) {
+                        php.classList.add('applying');
+                        php.textContent = applying === 'default' ? 'php default…' : 'php ' + applying + '…';
+                        php.title = 'Switching PHP version…';
+                    } else if (site.php_version) {
                         php.textContent = 'php ' + site.php_version;
                         php.title = 'Pinned to PHP ' + site.php_version + ' (native php-fpm). Change via the row menu.';
                     } else {
@@ -4194,17 +4196,23 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                         current: pin === v.version,
                     });
                 }
+                const applying = this.phpApplying[site.name];
                 for (const o of options) {
                     const btn = tpl.content.firstElementChild.cloneNode(true);
                     btn.dataset.version = o.version;
                     btn.classList.toggle('current', o.current);
                     btn.classList.toggle('uninstalled', !o.installed);
-                    btn.disabled = this.phpModal.busy || o.current;
+                    btn.disabled = !!applying || o.current;
                     btn.querySelector('.php-option-name').textContent = o.label;
                     btn.querySelector('.php-option-meta').textContent = o.meta;
                     wrap.appendChild(btn);
                 }
-                $id('phpModalHint').textContent = this.phpModal.busy ? 'Applying…' : '';
+                // Only populated when the modal is reopened while a change is
+                // still in flight — the normal path closes the modal instantly
+                // and shows progress on the row chip instead.
+                $id('phpModalHint').textContent = applying
+                    ? 'Switching to ' + (applying === 'default' ? 'the default PHP' : 'PHP ' + applying) + '…'
+                    : '';
             },
 
             renderModals() {
@@ -4503,7 +4511,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             },
 
             openPhpModal(site) {
-                this.phpModal = { open: true, site, busy: false };
+                this.phpModal = { open: true, site };
                 this.renderPhpModal();
                 // Refresh every open: an install may have finished since the
                 // last fetch, flipping a greyed row to clickable.
@@ -4517,50 +4525,66 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
 
             async choosePhp(version) {
                 const site = this.phpModal.site;
-                if (!site || this.phpModal.busy || !version) return;
-                this.phpModal.busy = true;
-                this.renderPhpModal();
-                // Pinning regenerates the Caddyfile and reloads the server
-                // under this dashboard — same retry policy as rename.
-                const res = await this.apiPostRetry('set_php', { site_name: site.name, php_version: version });
-                this.phpModal.busy = false;
-                if (!res.success) { this.renderPhpModal(); return; }
+                if (!site || !version || this.phpApplying[site.name]) return;
+                // Close immediately and show progress on the row itself — the
+                // pulsing chip is the status, not a modal spinner.
                 this.closePhpModal();
-                if (res.installing) {
-                    this.showSnack('Installing PHP ' + version + ' via Homebrew — this can take a few minutes…', false, { duration: 300000 });
-                    this.startPhpInstallPoll(site.name, version);
+                this.phpApplying[site.name] = version;
+                this.renderList();
+                // The server backgrounds the whole change (it reloads the very
+                // Caddy serving this dashboard), so this returns immediately
+                // and the poll below watches for the pin state to flip.
+                const res = await this.apiPostRetry('set_php', { site_name: site.name, php_version: version });
+                if (!res.success) {
+                    delete this.phpApplying[site.name];
+                    this.renderList();
+                    return; // apiPost surfaced the reason
+                }
+                if (!res.applying) {
+                    // Idempotent no-op: the site was already on the requested
+                    // version (e.g. a retried request that had already landed).
+                    delete this.phpApplying[site.name];
+                    this.renderList();
                     return;
                 }
-                this.showSnack(res.message || 'PHP version updated.');
-                this.loadPhpInfo(true);
-                await this.getSites();
+                if (res.installing) {
+                    this.showSnack('Installing PHP ' + version + ' via Homebrew — this can take a few minutes…', false, { duration: 300000 });
+                }
+                this.startPhpPoll(site.name, version, res.installing ? 15 * 60 * 1000 : 90 * 1000);
             },
 
-            startPhpInstallPoll(name, version) {
-                // The install+pin runs detached server-side; the pin file
-                // appearing in list_sites is the completion signal. Polled
-                // with a raw fetch, not getSites(), so the visible list does
-                // not flash "Loading…" every five seconds.
+            startPhpPoll(name, version, timeoutMs) {
+                // The change runs detached server-side; the pin state flipping
+                // in list_sites is the completion signal. Polled with a raw
+                // fetch, not getSites(), so the visible list does not flash
+                // "Loading…" every few seconds — and a fetch that dies against
+                // the mid-reload server just polls again.
                 if (this.phpInstallPoll) clearInterval(this.phpInstallPoll);
                 const started = Date.now();
+                const wantPin = version === 'default' ? null : version;
                 this.phpInstallPoll = setInterval(async () => {
                     try {
                         const r = await fetch('api.php?action=list_sites');
                         const data = await r.json();
                         const site = data.find(s => s.name === name);
-                        if (site && site.php_version === version) {
+                        if (site && (site.php_version || null) === wantPin) {
                             clearInterval(this.phpInstallPoll);
                             this.phpInstallPoll = null;
+                            delete this.phpApplying[name];
                             this.loadPhpInfo(true);
                             await this.getSites();
-                            this.showSnack(name + '.localhost is now running PHP ' + version + '.');
-                        } else if (Date.now() - started > 15 * 60 * 1000) {
+                            this.showSnack(wantPin
+                                ? name + '.localhost is now running PHP ' + version + '.'
+                                : name + '.localhost is back on Cove\'s default PHP.');
+                        } else if (Date.now() - started > timeoutMs) {
                             clearInterval(this.phpInstallPoll);
                             this.phpInstallPoll = null;
-                            this.showSnack('PHP ' + version + ' is still installing — check ~/Cove/cache/php-install-' + version + '.log.', true, { duration: 8000 });
+                            delete this.phpApplying[name];
+                            this.renderList();
+                            this.showSnack('PHP change hasn\'t finished — check ~/Cove/cache/php-apply-' + name + '.log.', true, { duration: 8000 });
                         }
                     } catch (e) { /* mid-reload — keep polling */ }
-                }, 5000);
+                }, 3000);
             },
 
             // Caddy writes one JSON object per line, which is unreadable as a

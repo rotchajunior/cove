@@ -181,6 +181,10 @@ GUI_DIR="$APP_DIR/gui"
 ADMINER_DIR="$APP_DIR/adminer"
 CUSTOM_CADDY_DIR="$APP_DIR/directives"
 
+# Per-site PHP version switching (native php-fpm behind FrankenPHP).
+RUN_DIR="$COVE_DIR/run"          # unix sockets: php-<ver>.sock
+PHP_FPM_DIR="$COVE_DIR/php-fpm"  # generated php-fpm configs: <ver>/php-fpm.conf
+
 PROTECTED_NAMES="cove"
 COVE_VERSION="1.13"
 # Bundled Whoops release. Pinned here so cove install and cove upgrade deploy
@@ -268,6 +272,50 @@ cove_ini_get() {
             | sed -E 's/[[:space:]]+$//')
     fi
     echo "${val:-$fallback}"
+}
+
+# --- Per-site PHP version helpers ---
+# A site pinned to an older PHP carries a single-line `php_version` file in its
+# site dir (peer of mappings/lan_config). FrankenPHP stays the front door for
+# every site; pinned sites are handed to a native Homebrew php-fpm over a unix
+# socket via php_fastcgi. See sync_php_fpm_services / emit_site_php_handler.
+
+# Normalize "php@8.2" / "8.2.29" / "8.2" → "8.2". Echoes nothing on garbage.
+normalize_php_version() {
+    local ver="${1#php@}"
+    if [[ "$ver" =~ ^([578]\.[0-9]+)(\.[0-9]+)?$ ]]; then
+        echo "${BASH_REMATCH[1]}"
+    fi
+}
+
+# Echo the pinned version for a site dir, or nothing when unpinned.
+site_php_version() {
+    cat "$1/php_version" 2>/dev/null
+}
+
+# Homebrew prefix for php@<ver> (e.g. /opt/homebrew/opt/php@8.2), but only
+# when its php-fpm binary actually exists. Empty on nanobrew/Linux or when the
+# formula isn't installed — callers treat empty as "no native PHP available"
+# and fall back to FrankenPHP.
+php_fpm_prefix_for() {
+    local ver="$1"
+    if [ "$OS" != "macos" ] || [ "$MAC_BREW" != "brew" ]; then
+        return 0
+    fi
+    local prefix
+    prefix=$(brew --prefix "php@$ver" 2>/dev/null)
+    if [ -n "$prefix" ] && [ -x "$prefix/sbin/php-fpm" ]; then
+        echo "$prefix"
+    fi
+}
+
+php_fpm_sock_for() {
+    echo "$RUN_DIR/php-$1.sock"
+}
+
+# The PHP version FrankenPHP bundles (e.g. "8.5.2"), parsed from its banner.
+frankenphp_php_version() {
+    frankenphp version 2>/dev/null | sed -n 's/.*PHP \([0-9][0-9.]*\).*/\1/p'
 }
 
 # Returns the process name(s) listening on $1 for display purposes, or empty
@@ -400,8 +448,6 @@ update_wp_site_urls_for_port_change() {
     [ -d "$SITES_DIR" ] || return 0
 
     local wp_cmd
-    wp_cmd=$(get_wp_cmd)
-
     local total_sites=0 updated_sites=0 failed_hosts=0
     local site_path site_name hostname mapping old_url new_url
     local -a hostnames
@@ -411,6 +457,7 @@ update_wp_site_urls_for_port_change() {
         [ -f "$site_path/public/wp-config.php" ] || continue
         total_sites=$((total_sites + 1))
         site_name=$(basename "$site_path")
+        wp_cmd=$(get_wp_cmd "$site_path")
 
         hostnames=("$site_name")
         if [ -f "$site_path/mappings" ]; then
@@ -983,15 +1030,33 @@ check_dependencies() {
 #
 # --allow-root is needed in WSL/Docker where the script runs as root.
 get_wp_cmd() {
+    # Optional $1: a site dir. A site pinned to an older PHP (php_version
+    # file) runs wp-cli under that same native php binary — version-gated
+    # plugins and core requirement checks must see the PHP the site actually
+    # serves with. Native php honors the exported PHPRC too, so the ini story
+    # is identical to the frankenphp path. Missing binary degrades to
+    # FrankenPHP rather than failing.
+    local site_dir="$1"
     local wp_path
     wp_path=$(command -v wp)
+    local root_flag=""
+    if [ "$(id -u)" -eq 0 ]; then
+        root_flag=" --allow-root"
+    fi
+    if [ -n "$site_dir" ]; then
+        local pinned prefix
+        pinned=$(site_php_version "$site_dir")
+        if [ -n "$pinned" ]; then
+            prefix=$(php_fpm_prefix_for "$pinned")
+            if [ -n "$prefix" ] && [ -x "$prefix/bin/php" ]; then
+                echo "$prefix/bin/php $wp_path$root_flag"
+                return 0
+            fi
+        fi
+    fi
     local frank
     frank=$(command -v frankenphp)
-    if [ "$(id -u)" -eq 0 ]; then
-        echo "$frank php-cli $wp_path --allow-root"
-    else
-        echo "$frank php-cli $wp_path"
-    fi
+    echo "$frank php-cli $wp_path$root_flag"
 }
 
 # Read a site's WordPress version straight out of wp-includes/version.php.
@@ -1525,6 +1590,169 @@ EOM
     fi
 }
 
+# --- Per-site PHP: native php-fpm services ---
+# Sites pinned to an older PHP (a `php_version` file in the site dir) are
+# served by Homebrew's php@<ver> php-fpm behind FrankenPHP. Cove owns the
+# whole FPM lifecycle (config + launchd unit) rather than `brew services`:
+# Homebrew's stock pool listens on 127.0.0.1:9000 for EVERY version (instant
+# collision with two pinned versions) and carries none of Cove's ini
+# semantics (mailpit sendmail, Whoops prepend, shared error log).
+
+# Write the generated php-fpm config for a version. Homebrew's own php.ini +
+# conf.d still load first (that's what enables the opcache extension); the
+# pool then overrides everything Cove cares about via php_admin_value — the
+# FPM analog of the frankenphp{} php_ini block in regenerate_caddyfile.
+write_php_fpm_config() {
+    local ver="$1"
+    local conf_dir="$PHP_FPM_DIR/$ver"
+    local mailpit_path
+    mailpit_path=$(command -v mailpit)
+    mkdir -p "$conf_dir" "$RUN_DIR" "$LOGS_DIR" "$COVE_DIR/cache/sessions"
+    cat > "$conf_dir/php-fpm.conf" << EOM
+[global]
+; Auto-generated by Cove (write_php_fpm_config in main). Do not edit —
+; regenerated on every pin, reload, and post-upgrade.
+error_log = $LOGS_DIR/php-fpm-$ver.log
+daemonize = no
+
+[cove]
+listen = $RUN_DIR/php-$ver.sock
+listen.mode = 0600
+; ondemand: workers spawn per request and idle out — right for a dev box
+; where a pinned site may go untouched for days.
+pm = ondemand
+pm.max_children = 10
+pm.process_idle_timeout = 60s
+pm.max_requests = 500
+catch_workers_output = yes
+; Mirror of the frankenphp{} php_ini block. The ZTS OPcache sizing there is
+; deliberately NOT replicated: this is NTS php-fpm with a per-pool cache, so
+; PHP's stock OPcache defaults are correct here.
+php_admin_value[sendmail_path] = $mailpit_path sendmail -t
+php_admin_flag[log_errors] = on
+php_admin_flag[display_errors] = off
+php_admin_value[error_log] = $LOGS_DIR/errors.log
+php_admin_value[auto_prepend_file] = $APP_DIR/whoops_bootstrap.php
+php_admin_value[memory_limit] = $(cove_ini_get memory_limit 1G)
+php_admin_value[upload_max_filesize] = $(cove_ini_get upload_max_filesize 1G)
+php_admin_value[post_max_size] = $(cove_ini_get post_max_size 1G)
+php_admin_value[session.save_path] = $COVE_DIR/cache/sessions
+EOM
+    echo "$conf_dir/php-fpm.conf"
+}
+
+# (Re)install the php-fpm unit for one version. Idempotent AND restart-shy:
+# when the config is unchanged and the master process is already up, this is
+# a no-op — regenerate_caddyfile calls the reconciler on every reload, and a
+# `cove add` must not bounce every pinned site's FPM as a side effect.
+install_php_fpm_service() {
+    local ver="$1"
+    local prefix
+    prefix=$(php_fpm_prefix_for "$ver")
+    if [ -z "$prefix" ]; then
+        echo "   ⚠️  php@$ver (php-fpm) not found; sites pinned to $ver fall back to FrankenPHP." >&2
+        return 1
+    fi
+
+    local conf_path="$PHP_FPM_DIR/$ver/php-fpm.conf"
+    local old_conf=""
+    [ -f "$conf_path" ] && old_conf=$(cat "$conf_path")
+    write_php_fpm_config "$ver" >/dev/null
+    local new_conf
+    new_conf=$(cat "$conf_path")
+
+    local label="com.cove.php-fpm-$ver"
+    local plist_path="$COVE_DIR/$label.plist"
+    if [ "$old_conf" == "$new_conf" ] && [ -f "$plist_path" ] \
+        && pgrep -f "php-fpm/$ver/php-fpm.conf" &>/dev/null; then
+        return 0
+    fi
+
+    launchctl unload "$plist_path" &>/dev/null || true
+    cat > "$plist_path" << EOM
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+        <key>KeepAlive</key>
+        <true/>
+        <key>ThrottleInterval</key>
+        <integer>10</integer>
+        <key>Label</key>
+        <string>$label</string>
+        <key>ProgramArguments</key>
+        <array>
+                <string>$prefix/sbin/php-fpm</string>
+                <string>--nodaemonize</string>
+                <string>--fpm-config</string>
+                <string>$conf_path</string>
+        </array>
+        <key>RunAtLoad</key>
+        <true/>
+        <key>StandardErrorPath</key>
+        <string>$LOGS_DIR/php-fpm-$ver.log</string>
+        <key>StandardOutPath</key>
+        <string>$LOGS_DIR/php-fpm-$ver.log</string>
+</dict>
+</plist>
+EOM
+    launchctl load "$plist_path"
+    launchctl start "$label"
+}
+
+# Stop + remove the unit for a version nothing pins anymore. The generated
+# config dir under $PHP_FPM_DIR is kept on purpose — it's tiny and makes a
+# re-pin instant.
+remove_php_fpm_service() {
+    local ver="$1"
+    local plist_path="$COVE_DIR/com.cove.php-fpm-$ver.plist"
+    launchctl unload "$plist_path" &>/dev/null || true
+    rm -f "$plist_path" "$RUN_DIR/php-$ver.sock"
+}
+
+# Reconcile running php-fpm units against what sites actually pin. Called
+# from regenerate_caddyfile, so pin, unpin, delete, clone, and plain `cove
+# reload` all converge service state for free — no eager teardown wiring
+# anywhere else.
+sync_php_fpm_services() {
+    local needed=" "
+    local site_path ver
+    if [ -d "$SITES_DIR" ]; then
+        for site_path in "$SITES_DIR"/*; do
+            [ -d "$site_path" ] || continue
+            ver=$(site_php_version "$site_path")
+            [ -n "$ver" ] || continue
+            if [ "$OS" != "macos" ] || [ "$MAC_BREW" != "brew" ]; then
+                echo "   ⚠️  $(basename "$site_path") pins PHP $ver, but per-site PHP requires Homebrew on macOS; serving with FrankenPHP." >&2
+                continue
+            fi
+            case "$needed" in
+                *" $ver "*) ;;
+                *) needed+="$ver " ;;
+            esac
+        done
+    fi
+
+    if [ "$OS" != "macos" ] || [ "$MAC_BREW" != "brew" ]; then
+        return 0
+    fi
+
+    for ver in $needed; do
+        install_php_fpm_service "$ver" || true
+    done
+
+    local plist
+    for plist in "$COVE_DIR"/com.cove.php-fpm-*.plist; do
+        [ -f "$plist" ] || continue
+        ver=$(basename "$plist" .plist)
+        ver="${ver#com.cove.php-fpm-}"
+        case "$needed" in
+            *" $ver "*) ;;
+            *) remove_php_fpm_service "$ver" ;;
+        esac
+    done
+}
+
 # Validate a Cove site name: lowercase letters, digits, and hyphens only, no
 # leading/trailing hyphen. Mirrors the rules cove_add enforces (add:14-23) and
 # the dashboard's add_site regex, so every command that turns a name into a
@@ -1729,6 +1957,24 @@ prune_delete_tombstones() {
     done
 }
 
+# Emit the PHP handler line for a site's server block: php_fastcgi to the
+# pinned native php-fpm when the site has a php_version AND the binary
+# resolves, php_server (FrankenPHP) otherwise. The fallback means a
+# half-installed pin degrades to "wrong PHP version" rather than a hard 502.
+# php_fastcgi ships the same try_files/index semantics as php_server, and its
+# default directive order already precedes file_server, so the plain-site
+# file_server conditional below needs no change.
+emit_site_php_handler() {
+    local site_path="$1"
+    local ver
+    ver=$(site_php_version "$site_path")
+    if [ -n "$ver" ] && [ -n "$(php_fpm_prefix_for "$ver")" ]; then
+        echo "    php_fastcgi unix/$(php_fpm_sock_for "$ver")" >> "$CADDYFILE_PATH"
+    else
+        echo "    php_server" >> "$CADDYFILE_PATH"
+    fi
+}
+
 regenerate_caddyfile() {
     echo "🔄 Regenerating Caddyfile..."
     if ! command -v mailpit &> /dev/null; then
@@ -1737,7 +1983,10 @@ regenerate_caddyfile() {
     fi
     # Ensure the user-owned PHP session dir referenced by the Caddyfile's
     # `php_ini session.save_path` exists before FrankenPHP tries to use it.
-    mkdir -p "$COVE_DIR/cache/sessions" 2>/dev/null
+    mkdir -p "$COVE_DIR/cache/sessions" "$RUN_DIR" 2>/dev/null
+    # Converge native php-fpm services with the sites' php_version pins BEFORE
+    # writing the config that points at their sockets.
+    sync_php_fpm_services
     local mailpit_path
     mailpit_path=$(command -v mailpit)
 
@@ -1866,7 +2115,7 @@ EOM
                     echo "" >> "$CADDYFILE_PATH"
                 fi
 
-                echo "    php_server" >> "$CADDYFILE_PATH"
+                emit_site_php_handler "$site_path"
 
                 if [ ! -f "$site_path/public/wp-config.php" ]; then
                     echo "    file_server" >> "$CADDYFILE_PATH"
@@ -1874,7 +2123,7 @@ EOM
 
                 echo "}" >> "$CADDYFILE_PATH"
                 echo "" >> "$CADDYFILE_PATH"
-                
+
                 # Check if LAN access is enabled for this site
                 local lan_config="$site_path/lan_config"
                 if [ -f "$lan_config" ]; then
@@ -1900,7 +2149,7 @@ EOM
                             echo "" >> "$CADDYFILE_PATH"
                         fi
 
-                        echo "    php_server" >> "$CADDYFILE_PATH"
+                        emit_site_php_handler "$site_path"
 
                         if [ ! -f "$site_path/public/wp-config.php" ]; then
                             echo "    file_server" >> "$CADDYFILE_PATH"
@@ -2003,8 +2252,8 @@ EOM
                             echo "" >> "$CADDYFILE_PATH"
                         fi
                         
-                        echo "    php_server" >> "$CADDYFILE_PATH"
-                        
+                        emit_site_php_handler "$site_path"
+
                         if [ ! -f "$site_path/public/wp-config.php" ]; then
                             echo "    file_server" >> "$CADDYFILE_PATH"
                         fi
@@ -2224,6 +2473,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
                         // Mirrors cove_add's `echo "cove_$name" | tr -c '[:alnum:]_' '_'`,
                         // so the UI can deep-link Adminer straight at this site's schema.
                         'db_name' => preg_replace('/[^a-zA-Z0-9_]/', '_', 'cove_' . str_replace('.localhost', '', $item)),
+                        // Per-site PHP pin (`cove php`); null = Cove's default PHP.
+                        'php_version' => is_file($site_path . '/php_version') ? trim((string) @file_get_contents($site_path . '/php_version')) : null,
                     ];
                 }
             }
@@ -4127,6 +4378,7 @@ show_general_help() {
     echo "  lan              Enable LAN access to sites for mobile app sync."
     echo "  ports            Reconfigure HTTP/HTTPS ports + update site URLs."
     echo "  memory           Show or raise PHP memory_limit across Cove + Homebrew PHPs."
+    echo "  php              Pin a site to an older PHP (native php-fpm behind FrankenPHP)."
     echo "  log              View logs for a site or the global error log."
     echo "  share            Create a temporary public tunnel to share a site."
     if [ "$IS_WSL" = true ]; then
@@ -4454,6 +4706,24 @@ display_command_help() {
             echo "  cove memory set 2G --yes Bump Cove + every writable ini (non-interactive)"
             echo "  cove memory set -1       Unlimited (use sparingly)"
             ;;
+        php)
+            echo "Usage: cove php [<site>] [<version>|default]"
+            echo ""
+            echo "Per-site PHP version switching. FrankenPHP (bundling the latest PHP)"
+            echo "serves every site by default; pinning a site routes its PHP through a"
+            echo "native Homebrew php-fpm (php@<version>) behind Caddy via php_fastcgi."
+            echo "TLS, logs, mappings, and custom directives are unaffected."
+            echo ""
+            echo "Commands:"
+            echo "  cove php                 Overview: every site's effective PHP + services."
+            echo "  cove php <site>          Show the site's effective PHP version."
+            echo "  cove php <site> 8.2      Pin the site to PHP 8.2 (installs php@8.2 if needed)."
+            echo "  cove php <site> default  Unpin — back to FrankenPHP's bundled PHP."
+            echo ""
+            echo "The pin is stored in the site's 'php_version' file and travels with the"
+            echo "site through clone and rename. wp-cli commands for a pinned site run"
+            echo "under the same native PHP. Requires Homebrew on macOS."
+            ;;
         log)
             echo "Usage: cove log [site] [--follow]"
             echo ""
@@ -4691,6 +4961,10 @@ main() {
             # Orphan-clearing mailpit runner + throttled KeepAlive. Safe to
             # re-run: rewrites the unit and restarts mailpit once.
             install_mailpit_service
+            # Regenerate per-version php-fpm configs/units so pinned sites pick
+            # up pool-template changes. Restart-shy: unchanged configs with a
+            # live master are left alone.
+            sync_php_fpm_services
             ;;
         status)
             check_dependencies
@@ -4769,6 +5043,10 @@ main() {
         memory)
             check_dependencies
             cove_memory "$@"
+            ;;
+        php)
+            check_dependencies
+            cove_php "$@"
             ;;
         log)
             cove_log "$@"

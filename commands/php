@@ -1,0 +1,172 @@
+# cove php — per-site PHP version switching.
+#
+# FrankenPHP (bundling the latest PHP) stays the front door for every site.
+# Pinning a site to an older version swaps its Caddyfile handler from
+# php_server to php_fastcgi against a Cove-managed Homebrew php-fpm on a unix
+# socket. Service lifecycle + pool config live in main (write_php_fpm_config,
+# sync_php_fpm_services, emit_site_php_handler); this file is the CLI.
+
+# Make sure php@<ver>'s php-fpm is available, offering a brew install when
+# the formula exists but isn't installed. Auto-confirms without a TTY so the
+# dashboard and scripts can pin non-interactively. Returns non-zero when the
+# binary still can't be resolved — callers must not write a php_version file
+# in that case.
+ensure_php_formula() {
+    local ver="$1"
+    if [ -n "$(php_fpm_prefix_for "$ver")" ]; then
+        return 0
+    fi
+    if [ "$OS" != "macos" ] || [ "$MAC_BREW" != "brew" ]; then
+        gum style --foreground red "❌ Per-site PHP versions currently require Homebrew on macOS." \
+            "Cove serves everything with FrankenPHP's bundled PHP on this platform."
+        return 1
+    fi
+    if ! brew info "php@$ver" &>/dev/null; then
+        gum style --foreground red "❌ Error: Homebrew has no formula 'php@$ver'."
+        return 1
+    fi
+    echo "📦 PHP $ver is not installed."
+    if [ -t 0 ]; then
+        if ! gum confirm "Install php@$ver via Homebrew now?"; then
+            echo "Aborted."
+            return 1
+        fi
+    else
+        echo "   Installing php@$ver via Homebrew..."
+    fi
+    if ! brew install "php@$ver"; then
+        gum style --foreground red "❌ Error: 'brew install php@$ver' failed."
+        return 1
+    fi
+    if [ -z "$(php_fpm_prefix_for "$ver")" ]; then
+        gum style --foreground red "❌ Error: php-fpm for PHP $ver still not found after install."
+        return 1
+    fi
+    return 0
+}
+
+# The no-argument overview: every site's effective PHP, plus the state of the
+# native php-fpm services backing the pins.
+cove_php_overview() {
+    local default_ver
+    default_ver=$(frankenphp_php_version)
+    echo "🐘 PHP versions (Cove default: ${default_ver:-unknown} via FrankenPHP)"
+    echo ""
+    if [ -d "$SITES_DIR" ]; then
+        local site_path site_name ver
+        for site_path in "$SITES_DIR"/*; do
+            [ -d "$site_path/public" ] || continue
+            site_name=$(basename "$site_path")
+            ver=$(site_php_version "$site_path")
+            if [ -n "$ver" ]; then
+                printf "  %-42s %s\n" "$site_name" "$ver (php-fpm)"
+            else
+                printf "  %-42s %s\n" "$site_name" "default"
+            fi
+        done
+    fi
+    if [ "$OS" == "macos" ] && [ "$MAC_BREW" == "brew" ]; then
+        echo ""
+        local plist ver state found=false
+        for plist in "$COVE_DIR"/com.cove.php-fpm-*.plist; do
+            [ -f "$plist" ] || continue
+            ver=$(basename "$plist" .plist)
+            ver="${ver#com.cove.php-fpm-}"
+            state="stopped"
+            pgrep -f "php-fpm/$ver/php-fpm.conf" &>/dev/null && state="running"
+            echo "  php-fpm $ver: $state ($RUN_DIR/php-$ver.sock)"
+            found=true
+        done
+        if [ "$found" = false ]; then
+            echo "  No native php-fpm services active. Pin one with: cove php <site> 8.2"
+        fi
+    fi
+}
+
+cove_php() {
+    local site_name="$1"
+    local requested="$2"
+
+    if [ -z "$site_name" ]; then
+        cove_php_overview
+        return 0
+    fi
+
+    site_name="${site_name%.localhost}"
+    local site_dir="$SITES_DIR/$site_name.localhost"
+    if [ ! -d "$site_dir" ]; then
+        gum style --foreground red "❌ Error: Site '$site_name.localhost' not found."
+        exit 1
+    fi
+
+    # Show mode: no version argument.
+    if [ -z "$requested" ]; then
+        local pinned
+        pinned=$(site_php_version "$site_dir")
+        if [ -n "$pinned" ]; then
+            echo "$site_name.localhost is pinned to PHP $pinned (native php-fpm)."
+        else
+            echo "$site_name.localhost uses Cove's default PHP $(frankenphp_php_version) (FrankenPHP)."
+        fi
+        return 0
+    fi
+
+    # Unpin: back to FrankenPHP.
+    if [ "$requested" == "default" ]; then
+        if [ ! -f "$site_dir/php_version" ]; then
+            echo "ℹ️  $site_name.localhost already uses Cove's default PHP."
+            return 0
+        fi
+        rm -f "$site_dir/php_version"
+        regenerate_caddyfile
+        gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 \
+            "✅ $site_name.localhost back on Cove's default PHP $(frankenphp_php_version)" \
+            "URL: $(url_for "$site_name.localhost")"
+        return 0
+    fi
+
+    local ver
+    ver=$(normalize_php_version "$requested")
+    if [ -z "$ver" ]; then
+        gum style --foreground red "❌ Error: Invalid PHP version '$requested'." \
+            "Use a version like 8.2, php@8.3, or 'default'."
+        exit 1
+    fi
+
+    # Pinning to FrankenPHP's own version means no pin at all — only OLDER
+    # versions run on native FPM, per the feature's design.
+    local default_mm
+    default_mm=$(normalize_php_version "$(frankenphp_php_version)")
+    if [ -n "$default_mm" ] && [ "$ver" == "$default_mm" ]; then
+        echo "ℹ️  PHP $ver is Cove's default (FrankenPHP); nothing to pin."
+        if [ -f "$site_dir/php_version" ]; then
+            rm -f "$site_dir/php_version"
+            regenerate_caddyfile
+            echo "   Removed the existing pin."
+        fi
+        return 0
+    fi
+
+    if ! ensure_php_formula "$ver"; then
+        exit 1
+    fi
+
+    echo "📌 Pinning $site_name.localhost to PHP $ver (native php-fpm behind FrankenPHP)..."
+    echo "$ver" > "$site_dir/php_version"
+    regenerate_caddyfile
+
+    # Same warm-poll as cove add: the reload is synchronous, but give the new
+    # fastcgi upstream a beat to accept its first connection.
+    local warm_url
+    warm_url=$(url_for "$site_name.localhost")
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        if curl -ks --max-time 1 -o /dev/null "$warm_url/" 2>/dev/null; then
+            break
+        fi
+        sleep 0.2
+    done
+
+    gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 \
+        "✅ $site_name.localhost is now running PHP $ver" \
+        "URL: $warm_url"
+}

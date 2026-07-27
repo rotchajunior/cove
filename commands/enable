@@ -12,6 +12,9 @@ cove_enable() {
         # otherwise thrash KeepAlive on a bind failure). Shared helper so
         # post-upgrade can refresh it without a full re-enable.
         install_mailpit_service
+
+        # Native php-fpm units for any sites pinned to an older PHP.
+        sync_php_fpm_services
     fi
     
     if [ "$OS" == "linux" ]; then

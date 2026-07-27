@@ -87,6 +87,8 @@ cove_list() {
                     // ASCII only: str_pad counts bytes, so a multibyte dash here
                     // would under-pad the column and skew the box border.
                     "wp" => $version === null ? "-" : $version . ($status === "insecure" ? " !" : ""),
+                    // Per-site PHP pin (`cove php`); "-" = Cove default PHP.
+                    "php" => is_file($site_path . "/php_version") ? trim((string) @file_get_contents($site_path . "/php_version")) : "-",
                 ];
             }
         }
@@ -118,6 +120,9 @@ cove_list() {
         $wp_width = max(array_map(fn($s) => strlen($s["wp"]), $sites));
         $wp_width = max($wp_width, 2) + $gap;
 
+        $php_width = max(array_map(fn($s) => strlen($s["php"]), $sites));
+        $php_width = max($php_width, 3) + $gap;
+
         $size_width = $show_totals ? 11 : 0;
 
         // ANSI colors
@@ -130,7 +135,7 @@ cove_list() {
         $h = "─"; $v = "│";
 
         // Calculate total width
-        $inner_width = $name_width + $domain_width + $type_width + $wp_width;
+        $inner_width = $name_width + $domain_width + $type_width + $wp_width + $php_width;
         if ($show_totals) {
             $inner_width += $size_width;
         }
@@ -141,7 +146,7 @@ cove_list() {
         $bot_line = $pink . $bl . str_repeat($h, $inner_width) . $br . $reset;
 
         // Header row (white text)
-        $header = $pink . $v . $reset . " " . str_pad("Name", $name_width - 1) . str_pad("Domain", $domain_width) . str_pad("Type", $type_width) . str_pad("WP", $wp_width);
+        $header = $pink . $v . $reset . " " . str_pad("Name", $name_width - 1) . str_pad("Domain", $domain_width) . str_pad("Type", $type_width) . str_pad("WP", $wp_width) . str_pad("PHP", $php_width);
         if ($show_totals) {
             $header .= str_pad("Size", $size_width);
         }
@@ -157,6 +162,7 @@ cove_list() {
             $row .= str_pad($site["domain"], $domain_width);
             $row .= str_pad($site["type"], $type_width);
             $row .= str_pad($site["wp"], $wp_width);
+            $row .= str_pad($site["php"], $php_width);
             if ($show_totals) {
                 $row .= str_pad($site["size"] ?? "N/A", $size_width);
             }

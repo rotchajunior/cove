@@ -53,7 +53,7 @@ cove_delete() {
     echo "🔥 Deleting site: $site_name.localhost"
     if [ -f "$site_dir/public/wp-config.php" ]; then
         local db_name wp_cmd
-        wp_cmd=$(get_wp_cmd)
+        wp_cmd=$(get_wp_cmd "$site_dir")
         # Prefer the DB actually named in wp-config.php. Deriving cove_<name>
         # blindly (as before) would orphan the real database for any site whose
         # DB_NAME was changed — and could drop an unrelated database that

@@ -7,7 +7,7 @@ cove_add() {
 
     if [ -z "$site_name" ]; then
         gum style --foreground red "❌ Error: A site name is required."
-        echo "Usage: cove add <name> [flavor] [--plain]"
+        echo "Usage: cove add <name> [flavor] [--plain] [--php=8.2]"
         exit 1
     fi
 
@@ -33,16 +33,35 @@ cove_add() {
     # forever so existing scripts and the dashboard never break.
     local flavor=""
     local plain_flag=false
+    local php_pin=""
     shift
     for arg in "$@"; do
         case "$arg" in
             --plain)        plain_flag=true ;;
             --no-reload)    no_reload_flag=true ;;
             --wp-version=*) flavor="${arg#*=}" ;;
+            --php=*)        php_pin="${arg#*=}" ;;
             -*)             ;;  # unknown flags ignored, as before
             *)              [ -z "$flavor" ] && flavor="$arg" ;;
         esac
     done
+
+    # --php pins the site to an older PHP served by native php-fpm (see
+    # `cove php`). A flag rather than a second positional: the flavor slot
+    # names what goes IN the site; the PHP version modifies how it runs.
+    if [ -n "$php_pin" ]; then
+        local php_pin_norm
+        php_pin_norm=$(normalize_php_version "$php_pin")
+        if [ -z "$php_pin_norm" ]; then
+            gum style --foreground red "❌ Error: Invalid PHP version '$php_pin'." "Use a version like 8.2 or php@8.3."
+            exit 1
+        fi
+        php_pin="$php_pin_norm"
+        # Pinning to FrankenPHP's own version is a no-op, matching `cove php`.
+        if [ "$php_pin" == "$(normalize_php_version "$(frankenphp_php_version)")" ]; then
+            php_pin=""
+        fi
+    fi
 
     # Resolve the flavor into a site type + an optional pinned version.
     case "$flavor" in
@@ -93,8 +112,19 @@ cove_add() {
         exit 1
     fi
 
+    # Resolve the PHP pin before creating anything so a failed brew install
+    # leaves no half-made site behind.
+    if [ -n "$php_pin" ] && ! ensure_php_formula "$php_pin"; then
+        exit 1
+    fi
+
     echo "➕ Creating $site_type site: $full_hostname"
     mkdir -p "$site_dir/public" "$site_dir/logs"
+    if [ -n "$php_pin" ]; then
+        # Written before the WordPress install so get_wp_cmd runs wp-cli under
+        # the pinned PHP from the very first `core download`.
+        echo "$php_pin" > "$site_dir/php_version"
+    fi
 
     if [ "$site_type" == "plain" ]; then
         write_plain_site_landing "$site_dir/public"
@@ -115,7 +145,11 @@ cove_add() {
             # notices in the site's debug.log are expected rather than a fault,
             # and seeing both numbers together makes that obvious up front.
             local php_ver
-            php_ver=$(frankenphp version 2>/dev/null | sed -n 's/.*PHP \([0-9][0-9.]*\).*/\1/p')
+            if [ -n "$php_pin" ]; then
+                php_ver="$php_pin"
+            else
+                php_ver=$(frankenphp_php_version)
+            fi
             if [ -n "$php_ver" ]; then
                 echo "📌 Installing WordPress $wp_version on PHP $php_ver"
             else
@@ -137,7 +171,7 @@ cove_add() {
         # leaked Deprecated lines while still passing through real wp-cli
         # error output (which doesn't carry the "Deprecated:" prefix).
         local wp_cmd
-        wp_cmd=$(get_wp_cmd)
+        wp_cmd=$(get_wp_cmd "$site_dir")
 
         (
             cd "$site_dir/public" || exit 1

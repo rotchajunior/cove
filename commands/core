@@ -85,7 +85,7 @@ cove_core_update_one() {
     local target="$2"
     local public_dir="$SITES_DIR/$name.localhost/public"
     local wp_cmd
-    wp_cmd=$(get_wp_cmd)
+    wp_cmd=$(get_wp_cmd "$SITES_DIR/$name.localhost")
 
     local before
     before=$(cove_wp_version "$public_dir" 2>/dev/null || echo "unknown")

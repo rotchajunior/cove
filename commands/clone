@@ -90,11 +90,18 @@ cove_clone() {
     fi
     mkdir -p "$new_dir/logs"
 
+    # Carry the PHP pin over before any wp-cli runs, so the clone's database
+    # work happens under the same PHP as its source (and the clone serves
+    # like its source after the reload below).
+    if [ -f "$source_dir/php_version" ]; then
+        cp "$source_dir/php_version" "$new_dir/php_version"
+    fi
+
     # --- Database ---
     if [ "$is_wordpress" = true ]; then
         source_config
         local wp_cmd
-        wp_cmd=$(get_wp_cmd)
+        wp_cmd=$(get_wp_cmd "$new_dir")
 
         local source_db new_db
         source_db=$(echo "cove_$source_name" | tr -c '[:alnum:]_' '_')
@@ -167,7 +174,7 @@ cove_clone() {
 
     if [ "$is_wordpress" = true ]; then
         local wp_cmd_final admin_login one_time_login_url
-        wp_cmd_final=$(get_wp_cmd)
+        wp_cmd_final=$(get_wp_cmd "$new_dir")
         # Unlike a fresh install there is no known admin username here, so pick
         # the first administrator out of the cloned database.
         admin_login=$($wp_cmd_final user list --role=administrator --field=user_login --number=1 --path="$new_dir/public/" 2>/dev/null </dev/null | head -1)

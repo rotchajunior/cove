@@ -20,9 +20,10 @@ cove_login() {
     local site_dir="$SITES_DIR/$site_name.localhost"
     local public_dir="$site_dir/public"
     
-    # Get WP-CLI command (adds --allow-root if running as root)
+    # Get WP-CLI command (adds --allow-root if running as root; uses the
+    # site's pinned PHP when one is set)
     local wp_cmd
-    wp_cmd=$(get_wp_cmd)
+    wp_cmd=$(get_wp_cmd "$site_dir")
 
     # 2. Check if the site exists and is a WordPress installation.
     if [ ! -d "$site_dir" ] || [ ! -f "$public_dir/wp-config.php" ]; then

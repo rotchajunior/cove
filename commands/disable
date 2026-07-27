@@ -17,6 +17,18 @@ cove_disable() {
         # and thrash KeepAlive on the next enable (see install_mailpit_service).
         # -x matches basename only — never a random path containing "mailpit".
         pkill -x mailpit &>/dev/null || true
+        # Per-site php-fpm units. Unload only — the plists stay on disk so the
+        # next enable's sync_php_fpm_services restores them from the sites'
+        # php_version files. The -f pattern matches the master's process title
+        # ("php-fpm: master process (~/Cove/php-fpm/<ver>/php-fpm.conf)"),
+        # which takes its workers down with it.
+        local fpm_plist
+        for fpm_plist in "$COVE_DIR"/com.cove.php-fpm-*.plist; do
+            [ -f "$fpm_plist" ] || continue
+            echo "   - Stopping PHP-FPM ($(basename "$fpm_plist" .plist | sed 's/com\.cove\.php-fpm-//'))..."
+            launchctl unload "$fpm_plist" &>/dev/null
+        done
+        pkill -f "Cove/php-fpm/.*/php-fpm\.conf" &>/dev/null || true
     fi
 
     # Stop services on Linux

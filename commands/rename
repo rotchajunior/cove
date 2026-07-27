@@ -52,9 +52,10 @@ cove_rename() {
     if [ -f "$new_site_dir/public/wp-config.php" ]; then
         source_config
         
-        # Get WP-CLI command (adds --allow-root if running as root)
+        # Get WP-CLI command (adds --allow-root if running as root; uses the
+        # site's pinned PHP when one is set)
         local wp_cmd
-        wp_cmd=$(get_wp_cmd)
+        wp_cmd=$(get_wp_cmd "$new_site_dir")
         
         local old_db_name
         old_db_name=$(echo "cove_$old_name" | tr -c '[:alnum:]_' '_')

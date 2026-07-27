@@ -39,10 +39,31 @@ cove_status() {
         fi
     fi
     
+    # Native php-fpm units for sites pinned to an older PHP (`cove php`).
+    # One row per version with an installed unit; nothing pinned = no rows.
+    local fpm_lines=""
+    if [ "$OS" == "macos" ]; then
+        local fpm_plist fpm_ver fpm_state
+        for fpm_plist in "$COVE_DIR"/com.cove.php-fpm-*.plist; do
+            [ -f "$fpm_plist" ] || continue
+            fpm_ver=$(basename "$fpm_plist" .plist)
+            fpm_ver="${fpm_ver#com.cove.php-fpm-}"
+            fpm_state="❌ Stopped"
+            # Same reasoning as the mailpit pgrep above: probe the process,
+            # not the launchd label. The master's title carries the config
+            # path, which pins the match to this exact version.
+            if pgrep -f "php-fpm/$fpm_ver/php-fpm.conf" &>/dev/null; then
+                fpm_state="✅ Running"
+            fi
+            fpm_lines+="  PHP-FPM $fpm_ver:  $fpm_state"$'\n'
+        done
+    fi
+
     echo ""
     echo "  Caddy Server: $caddy_status"
     echo "  MariaDB:      $mariadb_status"
     echo "  Mailpit:      $mailpit_status"
+    [ -n "$fpm_lines" ] && printf '%s' "$fpm_lines"
     echo ""
 
     if [[ "$caddy_status" == "✅ Running" && "$mariadb_status" == "✅ Running" && "$mailpit_status" == "✅ Running" ]]; then

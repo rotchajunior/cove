@@ -3019,9 +3019,15 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
         .site-row { display: grid; grid-column: 1 / -1; grid-template-columns: subgrid; align-items: center; padding: 0.8rem 1.5rem; border-bottom: 1px solid var(--panel-border); transition: background 100ms; cursor: pointer; }
         .site-row:last-child { border-bottom: 0; }
         .site-row:hover { background: var(--panel-hover); }
-        .site-domain { font-family: var(--font-mono); font-size: 0.88rem; color: var(--text-dim); text-decoration: none; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .site-domain-cell { display: inline-flex; align-items: center; gap: 0.35rem; min-width: 0; }
+        .site-domain { font-family: var(--font-mono); font-size: 0.88rem; color: var(--text-dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
         .site-domain .host-accent { color: var(--accent); }
-        .site-domain:hover { color: var(--accent); }
+        /* The one spot on a row that opens the site — everywhere else on the
+           row opens the context menu. Always visible (not hover-gated) so a
+           site stays one tap away on touch. */
+        .site-open-link { display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; border-radius: 6px; color: var(--text-faint); flex: none; }
+        .site-open-link:hover { color: var(--accent); background: var(--panel-border); }
+        .site-open-link svg { width: 13px; height: 13px; }
         .site-domain mark { background: rgba(58, 151, 169, 0.28); background: color-mix(in oklch, var(--accent) 28%, transparent); color: inherit; padding: 0 1px; border-radius: 3px; }
         .site-type { display: inline-flex; justify-content: center; min-width: 64px; padding: 0.2rem 0.55rem; border-radius: var(--radius-pill); font-family: var(--font-mono); font-size: 0.68rem; font-weight: 500; letter-spacing: 0.08em; text-transform: uppercase; cursor: pointer; user-select: none; transition: filter 120ms; }
         .site-type:hover { filter: brightness(1.15); }
@@ -3095,14 +3101,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
         /* Pinned sites float to the top of the list. */
         .site-row.is-pinned .site-domain::before { content: '●'; color: var(--accent); font-size: 0.62rem; margin-right: 0.4rem; vertical-align: middle; opacity: 0.9; }
 
-        /* Row overflow trigger. Always rendered (not hover-gated) so the row's
-           actions are reachable by touch — Cove is explicitly used from phones
-           over Tailscale, where :hover never fires and the old text links were
-           therefore unreachable. */
-        .row-menu-btn { background: transparent; border: 0; color: var(--text-faint); cursor: pointer; font-size: 1rem; line-height: 1; padding: 0.15rem 0.4rem; border-radius: 6px; }
-        .row-menu-btn:hover, .row-menu-btn.active { color: var(--text); background: var(--panel-hover); }
-
-        /* Context menu — shared by right-click and the ⋯ button. */
+        /* Context menu — opened by clicking a row (right- or left-click). */
         .ctx-menu { position: fixed; z-index: 300; min-width: 190px; padding: 0.3rem; background: var(--panel); border: 1px solid var(--panel-border); border-radius: 10px; box-shadow: 0 12px 34px rgba(0,0,0,0.28); font-size: 0.85rem; }
         .ctx-title { padding: 0.35rem 0.6rem 0.45rem; font-family: var(--font-mono); font-size: 0.72rem; color: var(--text-faint); border-bottom: 1px solid var(--panel-border); margin-bottom: 0.25rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
         .ctx-item { display: flex; align-items: center; justify-content: space-between; gap: 1rem; width: 100%; background: transparent; border: 0; text-align: left; padding: 0.42rem 0.6rem; border-radius: 6px; color: var(--text); cursor: pointer; font: inherit; }
@@ -3309,7 +3308,12 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 </li>
                 <template id="tpl-site-row">
                     <li class="site-row">
-                        <a class="site-domain" target="_blank" rel="noopener"></a>
+                        <span class="site-domain-cell">
+                            <span class="site-domain"></span>
+                            <a class="site-open-link" target="_blank" rel="noopener">
+                                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6.5 4.5h5v5"/><path d="M11.5 4.5 4.5 11.5"/></svg>
+                            </a>
+                        </span>
                         <span class="site-type-cell">
                             <span class="site-type"></span>
                             <span class="site-wp-version"></span>
@@ -3321,9 +3325,6 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                                 <span class="btn-label">login</span>
                                 <span class="btn-spinner" aria-hidden="true"></span>
                             </button>
-                            <!-- Always rendered, unlike the hover-only links: this is the
-                                 only way the row's actions are reachable on touch. -->
-                            <button class="row-menu-btn" title="Actions">⋯</button>
                         </div>
                     </li>
                 </template>
@@ -3417,8 +3418,9 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
         </div>
     </div>
 
-    <!-- Context menu: one component driven by both right-click on a row and the
-         row's ⋯ button, so the two affordances can never drift apart. -->
+    <!-- Context menu: one component driven by right- OR left-click anywhere on
+         a row, so the two affordances can never drift apart. Opening the site
+         itself lives on the row's ↗ icon. -->
     <div class="ctx-menu" id="ctxMenu" style="display: none;">
         <div>
             <div class="ctx-title" id="ctxTitle"></div>
@@ -3756,17 +3758,22 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 });
 
                 // Site rows: one delegated listener instead of per-row handlers.
+                // The ↗ icon is the only thing that opens the site; the type
+                // pill filters and the login button logs in; a click anywhere
+                // else on the row opens the context menu.
                 const list = $id('siteList');
                 list.addEventListener('click', (e) => {
                     const row = e.target.closest('.site-row');
                     if (!row) return;
                     const site = this.sites.find(s => s.name === row.dataset.name);
                     if (!site) return;
-                    if (e.target.closest('.site-domain')) return; // plain link — let it navigate
+                    if (e.target.closest('.site-open-link')) return; // plain link — let it navigate
                     if (e.target.closest('.site-type')) { this.setTypeFilter(site.type); return; }
                     if (e.target.closest('.site-login-btn')) { this.getLoginLink(site.name); return; }
-                    if (e.target.closest('.row-menu-btn')) { this.openRowMenu(site, e); return; }
-                    this.openSite(site);
+                    // Don't pop the menu when the click ends a drag-to-select —
+                    // users still grab the domain/size text to copy it.
+                    if (window.getSelection && window.getSelection().toString()) return;
+                    this.openRowMenu(site, e);
                 });
                 list.addEventListener('contextmenu', (e) => {
                     const row = e.target.closest('.site-row');
@@ -3951,9 +3958,10 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                     row.classList.toggle('has-menu', this.ctxMenu.open && this.ctxMenu.site && this.ctxMenu.site.name === site.name);
                     row.classList.toggle('is-pinned', this.isPinned(site.name));
 
-                    const domain = row.querySelector('.site-domain');
-                    domain.href = site.domain;
-                    domain.innerHTML = this.highlightedDomain(site.domain, this.filter);
+                    row.querySelector('.site-domain').innerHTML = this.highlightedDomain(site.domain, this.filter);
+                    const openLink = row.querySelector('.site-open-link');
+                    openLink.href = site.domain;
+                    openLink.title = 'Open ' + site.domain.replace('https://', '');
 
                     const isWp = site.type === 'WordPress';
                     const type = row.querySelector('.site-type');
@@ -3985,10 +3993,6 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                     } else {
                         login.remove();
                     }
-                    row.querySelector('.row-menu-btn').classList.toggle('active',
-                        this.ctxMenu.open && this.ctxMenu.site && this.ctxMenu.site.name === site.name);
-                    row.querySelector('.row-menu-btn').setAttribute('aria-label', 'Actions for ' + site.name);
-
                     list.insertBefore(row, anchor);
                 }
             },

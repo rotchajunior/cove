@@ -1,0 +1,190 @@
+# Copy a directory tree, preferring a copy-on-write clone where the filesystem
+# supports one. On APFS this is roughly 3x faster than a byte copy and the two
+# copies share blocks until one of them is written to, which matters when the
+# whole point is stamping throwaway copies of a seeded site.
+cove_copy_tree() {
+    local src="$1"
+    local dst="$2"
+
+    # macOS / APFS.
+    if cp -c -R "$src" "$dst" 2>/dev/null; then
+        return 0
+    fi
+    rm -rf "$dst"
+
+    # Linux with btrfs/xfs reflink support.
+    if cp -R --reflink=auto "$src" "$dst" 2>/dev/null; then
+        return 0
+    fi
+    rm -rf "$dst"
+
+    # Plain byte copy — always correct, just slower.
+    cp -R "$src" "$dst"
+}
+
+cove_clone() {
+    cd ~/
+    local source_name="$1"
+    local new_name="$2"
+    local no_reload_flag=false
+
+    for arg in "$@"; do
+        [ "$arg" == "--no-reload" ] && no_reload_flag=true
+    done
+
+    # --- Validation ---
+    if [ -z "$source_name" ] || [ -z "$new_name" ]; then
+        gum style --foreground red "❌ Error: Both a source site and a new name are required."
+        echo "Usage: cove clone <source> <new-name>"
+        exit 1
+    fi
+
+    if [ "$source_name" == "$new_name" ]; then
+        gum style --foreground red "❌ Error: The new name must be different from the source."
+        exit 1
+    fi
+
+    local source_dir="$SITES_DIR/$source_name.localhost"
+    if [ ! -d "$source_dir" ]; then
+        gum style --foreground red "❌ Error: Site '$source_name.localhost' not found."
+        exit 1
+    fi
+
+    # Same name rules as cove_add — a clone must produce a site add could have.
+    if [[ "$new_name" =~ [^a-z0-9-] ]]; then
+        gum style --foreground red "❌ Error: Invalid site name '$new_name'." "Site names can only contain lowercase letters, numbers, and hyphens."
+        exit 1
+    fi
+    if [[ "$new_name" == -* || "$new_name" == *- ]]; then
+        gum style --foreground red "❌ Error: Invalid site name '$new_name'." "Site names cannot begin or end with a hyphen."
+        exit 1
+    fi
+    for protected_name in $PROTECTED_NAMES; do
+        if [ "$new_name" == "$protected_name" ]; then
+            gum style --foreground red "❌ Error: '$new_name' is a reserved name. Choose another."
+            exit 1
+        fi
+    done
+
+    local new_dir="$SITES_DIR/$new_name.localhost"
+    if [ -d "$new_dir" ]; then
+        gum style --foreground red "❌ Error: A site named '$new_name.localhost' already exists."
+        exit 1
+    fi
+
+    local is_wordpress=false
+    [ -f "$source_dir/public/wp-config.php" ] && is_wordpress=true
+
+    echo "🧬 Cloning $source_name.localhost → $new_name.localhost"
+
+    # --- Files ---
+    # Only public/ is cloned. logs/ is the source's own request history and
+    # would be actively misleading under a new hostname, so the clone starts
+    # with an empty one.
+    mkdir -p "$new_dir"
+    echo "   - Copying files..."
+    if ! cove_copy_tree "$source_dir/public" "$new_dir/public"; then
+        gum style --foreground red "❌ Error: Failed to copy site files."
+        rm -rf "$new_dir"
+        exit 1
+    fi
+    mkdir -p "$new_dir/logs"
+
+    # --- Database ---
+    if [ "$is_wordpress" = true ]; then
+        source_config
+        local wp_cmd
+        wp_cmd=$(get_wp_cmd)
+
+        local source_db new_db
+        source_db=$(echo "cove_$source_name" | tr -c '[:alnum:]_' '_')
+        new_db=$(echo "cove_$new_name" | tr -c '[:alnum:]_' '_')
+
+        local temp_sql
+        temp_sql=$(mktemp) || {
+            gum style --foreground red "❌ Error: Could not create a temporary file for the database dump."
+            rm -rf "$new_dir"
+            exit 1
+        }
+        # Cleans up on every exit path below, including the error returns.
+        trap 'rm -f "$temp_sql"' EXIT
+
+        echo "   - Dumping database '$source_db'..."
+        if ! mysqldump -u "$DB_USER" -p"$DB_PASSWORD" "$source_db" > "$temp_sql" 2>/dev/null; then
+            gum style --foreground red "❌ Error: Failed to dump the source database '$source_db'."
+            rm -rf "$new_dir"
+            exit 1
+        fi
+
+        echo "   - Creating database '$new_db'..."
+        mysql -u "$DB_USER" -p"$DB_PASSWORD" -e "CREATE DATABASE IF NOT EXISTS \`$new_db\`;"
+        if ! mysql -u "$DB_USER" -p"$DB_PASSWORD" "$new_db" < "$temp_sql" 2>/dev/null; then
+            gum style --foreground red "❌ Error: Failed to import into '$new_db'."
+            mysql -u "$DB_USER" -p"$DB_PASSWORD" -e "DROP DATABASE IF EXISTS \`$new_db\`;"
+            rm -rf "$new_dir"
+            exit 1
+        fi
+
+        echo "   - Pointing wp-config.php at '$new_db'..."
+        if ! (cd "$new_dir/public" && $wp_cmd config set DB_NAME "$new_db" --quiet </dev/null); then
+            gum style --foreground red "❌ Error: Failed to update wp-config.php."
+            mysql -u "$DB_USER" -p"$DB_PASSWORD" -e "DROP DATABASE IF EXISTS \`$new_db\`;"
+            rm -rf "$new_dir"
+            exit 1
+        fi
+
+        echo "   - Rewriting site URLs..."
+        # Non-fatal, matching cove_rename: the clone already exists and points at
+        # its own database, so a search-replace hiccup is a thing to warn about
+        # rather than a reason to destroy the copy.
+        if ! (cd "$new_dir/public" && $wp_cmd search-replace "$(url_for "$source_name.localhost")" "$(url_for "$new_name.localhost")" --all-tables --skip-plugins --skip-themes --quiet </dev/null); then
+            gum style --foreground yellow "⚠️  search-replace did not complete cleanly; verify the cloned site's URLs."
+        fi
+
+        inject_mu_plugin "$new_dir/public"
+    fi
+
+    # --- Custom Caddy directives ---
+    # Carried over so the clone behaves like its source. Directives can hardcode
+    # the old hostname, so say so rather than letting it fail mysteriously.
+    local source_conf="$CUSTOM_CADDY_DIR/$source_name.localhost"
+    if [ -f "$source_conf" ]; then
+        cp "$source_conf" "$CUSTOM_CADDY_DIR/$new_name.localhost"
+        echo "   - Copied custom Caddy directives (check them for hardcoded hostnames)."
+    fi
+
+    if [ "$no_reload_flag" = false ]; then
+        regenerate_caddyfile
+        local warm_url
+        warm_url=$(url_for "$new_name.localhost")
+        for _ in 1 2 3 4 5 6 7 8 9 10; do
+            if curl -ks --max-time 1 -o /dev/null "$warm_url/" 2>/dev/null; then
+                break
+            fi
+            sleep 0.2
+        done
+    fi
+
+    if [ "$is_wordpress" = true ]; then
+        local wp_cmd_final admin_login one_time_login_url
+        wp_cmd_final=$(get_wp_cmd)
+        # Unlike a fresh install there is no known admin username here, so pick
+        # the first administrator out of the cloned database.
+        admin_login=$($wp_cmd_final user list --role=administrator --field=user_login --number=1 --path="$new_dir/public/" 2>/dev/null </dev/null | head -1)
+        # Credentials come from the source site, so they are deliberately not
+        # printed here — a one-time link is the useful thing to hand back.
+        if [ -n "$admin_login" ]; then
+            one_time_login_url=$($wp_cmd_final user login "$admin_login" --path="$new_dir/public/" 2>/dev/null </dev/null | head -1)
+        fi
+        [ -n "$one_time_login_url" ] || one_time_login_url="(no administrator found — log in as you would on '$source_name')"
+        gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 \
+            "✅ Cloned '$source_name' → '$new_name'" \
+            "URL: $(url_for "$new_name.localhost")" \
+            "Logins are the same as '$source_name'." \
+            "One-time login URL: $one_time_login_url"
+    else
+        gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 \
+            "✅ Cloned '$source_name' → '$new_name'" \
+            "URL: $(url_for "$new_name.localhost")"
+    fi
+}

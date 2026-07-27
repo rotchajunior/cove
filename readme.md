@@ -68,9 +68,12 @@ Cove provides a simple set of commands to manage your local environment.
 | Command | Description |
 | --- | --- |
 | `cove add <name> [flavor]` | Creates a new WordPress site (`<name>.localhost`). The optional flavor says what goes inside it: a version (`6.4.3`, `6.9-RC1`), `nightly`, `latest` (the default), or `plain` for a static site with no database. |
+| `cove clone <source> <new-name>` | Copies a site — files, database, and custom Caddy rules — under a new name, rewriting stored URLs to the new domain. Uses a copy-on-write clone on APFS and btrfs, so it's fast and the two copies share disk until one is written to. |
 | `cove delete <name> [--force]` | Deletes a site's directory and its associated database. |
 | `cove rename <old-name> <new-name>` | Renames a site, its directory, database, and runs `wp search-replace` so stored URLs (siteurl, home, serialized content) all update to the new domain. |
-| `cove list [--totals]` | Lists all sites managed by Cove. Use `--totals` to show disk usage. |
+| `cove list [--totals]` | Lists all sites managed by Cove, including each one's WordPress version. Use `--totals` to show disk usage. |
+| `cove core check` | Reports the WordPress version of every site, flagging releases wp.org marks outdated or insecure. |
+| `cove core update <site> [version]` | Updates a site's WordPress core to the latest release, or to a specific version (which may be a downgrade). Use `--all` to update every site that's behind. |
 | `cove login <site> [<user>]` | Generates a one-time login link for a WordPress site. |
 | `cove path <name>` | Outputs the full system path to a site's public directory. |
 | `cove url <name>` | Prints the full HTTPS URL for a site (including the port suffix when on alternative ports). |

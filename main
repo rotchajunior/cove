@@ -994,6 +994,26 @@ get_wp_cmd() {
     fi
 }
 
+# Read a site's WordPress version straight out of wp-includes/version.php.
+# Deliberately not `wp core version`: that boots WordPress, which costs ~200ms
+# per site and fails outright on a site whose database or plugins are broken —
+# exactly the sites you most want listed. Parsing the constant is a few
+# milliseconds and works on a site that cannot currently serve a request.
+cove_wp_version() {
+    local public_dir="$1"
+    local version_file="$public_dir/wp-includes/version.php"
+    [ -f "$version_file" ] || return 1
+    local version
+    version=$(sed -n "s/^\$wp_version = '\([^']*\)'.*/\1/p" "$version_file" | head -1)
+    [ -n "$version" ] || return 1
+    echo "$version"
+}
+
+# Where the dashboard caches wp.org's stable-check data. Shared with the CLI so
+# `cove list` and `cove core` can flag insecure versions without a network call
+# of their own; absent or stale is always tolerable, never fatal.
+COVE_WPVER_CACHE="$COVE_DIR/cache/wp-versions.json"
+
 # Safely single-quote a value for interpolation into a remote shell command.
 # Interior single quotes become the standard '\'' escape sequence, so the
 # result can be dropped into ssh "... $(shell_quote "$v") ..." without injection.
@@ -2149,6 +2169,22 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
     if ($action === 'list_sites') {
         $sites_info = [];
         $size_cache = cove_read_size_cache($__cove_sizes_cache);
+
+        // Read whatever stable-check data is already cached. Deliberately does
+        // not fetch: list_sites is on the critical path for the dashboard's
+        // first paint, and version status is a nicety. The add-site form's
+        // wp_versions call is what populates this.
+        $__cove_wpver_status = [];
+        if (is_file($__cove_wpver_cache)) {
+            $__cove_wpver_cached = @json_decode(@file_get_contents($__cove_wpver_cache), true);
+            if (is_array($__cove_wpver_cached)) {
+                foreach ($__cove_wpver_cached as $__e) {
+                    if (isset($__e['version'], $__e['status'])) {
+                        $__cove_wpver_status[$__e['version']] = $__e['status'];
+                    }
+                }
+            }
+        }
         if (file_exists($sitedir) && is_dir($sitedir)) {
             $items = scandir($sitedir);
             foreach ($items as $item) {
@@ -2161,10 +2197,26 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
                     $mtime = @filemtime($site_path . '/public');
                     if (!$mtime) $mtime = @filemtime($site_path);
 
+                    // Parsed from version.php rather than booting WordPress —
+                    // 250 sites of `wp core version` would take a minute, and
+                    // this still reports on a site too broken to serve.
+                    $wp_version = null;
+                    $vfile = $site_path . '/public/wp-includes/version.php';
+                    if (is_file($vfile)) {
+                        $head = @file_get_contents($vfile, false, null, 0, 4096);
+                        if ($head !== false && preg_match('/\$wp_version\s*=\s*\'([^\']+)\'/', $head, $m)) {
+                            $wp_version = $m[1];
+                        }
+                    }
+
                     $sites_info[] = [
                         'name' => str_replace('.localhost', '', $item),
                         'domain' => 'https://' . $item . $__cove_port_suffix,
                         'type' => file_exists($site_path . "/public/wp-config.php") ? 'WordPress' : 'Plain',
+                        'wp_version' => $wp_version,
+                        // latest | outdated | insecure | null when wp.org's
+                        // stable-check data has not been fetched yet.
+                        'wp_status' => $wp_version !== null ? ($__cove_wpver_status[$wp_version] ?? null) : null,
                         'display_path' => '~/Cove/Sites/' . $item,
                         'full_path' => $site_path,
                         'size_bytes' => isset($size_cache[$item]) ? (int) $size_cache[$item] : null,
@@ -2723,6 +2775,14 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
         .site-domain mark { background: rgba(58, 151, 169, 0.28); background: color-mix(in oklch, var(--accent) 28%, transparent); color: inherit; padding: 0 1px; border-radius: 3px; }
         .site-type { display: inline-flex; justify-content: center; min-width: 64px; padding: 0.2rem 0.55rem; border-radius: var(--radius-pill); font-family: var(--font-mono); font-size: 0.68rem; font-weight: 500; letter-spacing: 0.08em; text-transform: uppercase; cursor: pointer; user-select: none; transition: filter 120ms; }
         .site-type:hover { filter: brightness(1.15); }
+        /* One grid child holding the pill plus its version, so adding the
+           version does not shift the row's subgrid columns. */
+        .site-type-cell { display: inline-flex; align-items: baseline; gap: 0.45rem; min-width: 0; }
+        .site-wp-version { font-family: var(--font-mono); font-size: 0.7rem; color: var(--text-faint); white-space: nowrap; }
+        /* Local sites aren't exposed, so an insecure release is a nudge to
+           update rather than a warning — hence the dot, not a red badge. */
+        .site-wp-version.insecure { color: var(--text-dim); }
+        .site-wp-version.insecure::after { content: "●"; margin-left: 0.25rem; color: var(--pill-warn-fg, #d08c30); font-size: 0.6em; vertical-align: middle; }
         .site-type.wp { background: var(--pill-wp-bg); color: var(--pill-wp-fg); }
         .site-type.static { background: var(--pill-static-bg); color: var(--pill-static-fg); }
         .site-modified { font-family: var(--font-mono); font-size: 0.8rem; color: var(--text-faint); min-width: 44px; text-align: right; }
@@ -3006,7 +3066,10 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 <template x-for="site in filteredSites" :key="site.name">
                     <li class="site-row" :class="{ 'is-selected': selectedName === site.name, 'has-menu': ctxMenu.open && ctxMenu.site && ctxMenu.site.name === site.name, 'is-pinned': isPinned(site.name) }" @click="openSite(site)" @contextmenu.prevent="openRowMenu(site, $event)">
                         <a class="site-domain" :href="site.domain" target="_blank" rel="noopener" @click.stop x-html="highlightedDomain(site.domain, filter)"></a>
-                        <span class="site-type" :class="site.type === 'WordPress' ? 'wp' : 'static'" @click.stop="typeFilter = site.type" :title="'Filter to ' + (site.type === 'WordPress' ? 'WordPress' : 'static') + ' sites'" x-text="site.type === 'WordPress' ? 'WP' : 'STATIC'"></span>
+                        <span class="site-type-cell">
+                            <span class="site-type" :class="site.type === 'WordPress' ? 'wp' : 'static'" @click.stop="typeFilter = site.type" :title="'Filter to ' + (site.type === 'WordPress' ? 'WordPress' : 'static') + ' sites'" x-text="site.type === 'WordPress' ? 'WP' : 'STATIC'"></span>
+                            <span class="site-wp-version" x-show="site.wp_version" :class="site.wp_status" :title="site.wp_status === 'insecure' ? 'WordPress ' + site.wp_version + ' — wp.org marks this release insecure. Update with: cove core update ' + site.name : 'WordPress ' + site.wp_version" x-text="site.wp_version" style="display: none;"></span>
+                        </span>
                         <span class="site-modified" x-text="formatRelative(site.modified_at)" :title="site.modified_at ? new Date(site.modified_at * 1000).toLocaleString() : ''"></span>
                         <span class="site-size" x-text="formatSize(site.size_bytes)"></span>
                         <div class="site-actions">
@@ -4049,6 +4112,8 @@ show_general_help() {
     echo "  trust            Install Cove's local CA into browser + system trust stores."
     echo "  list             Lists all sites currently managed by Cove."
     echo "  add              Creates a new WordPress or plain static site."
+    echo "  clone            Copies an existing site, database and all, under a new name."
+    echo "  core             Report or update the WordPress version of your sites."
     echo "  delete           Deletes a site's directory and associated database."
     echo "  login            Generates a one-time login link for a WordPress site."
     echo "  rename           Renames a site, its directory, and database."
@@ -4167,6 +4232,51 @@ display_command_help() {
             echo "  cove add mysite 6.4.3        WordPress pinned to 6.4.3."
             echo "  cove add mysite nightly      WordPress trunk."
             echo "  cove add mysite plain        Static site, no database."
+            ;;
+        clone)
+            echo "Usage: cove clone <source> <new-name>"
+            echo ""
+            echo "Copies an existing site to a new one — files, database, and custom"
+            echo "Caddy directives — rewriting the site URL to the new hostname."
+            echo ""
+            echo "Seed a site once (WooCommerce, users, sample content) and stamp copies"
+            echo "of it instead of building the same fixture over and over."
+            echo ""
+            echo "Arguments:"
+            echo "  <source>       The existing site to copy."
+            echo "  <new-name>     Name for the copy. Becomes the subdomain."
+            echo ""
+            echo "Notes:"
+            echo "  Admin credentials are inherited from the source site."
+            echo "  On APFS and btrfs the file copy is copy-on-write, so it is fast and"
+            echo "  the two copies share disk until one is written to."
+            echo ""
+            echo "Example:"
+            echo "  cove clone woo-template poc-acme"
+            ;;
+        core)
+            echo "Usage: cove core <check|update> [options]"
+            echo ""
+            echo "Reports and updates the WordPress version installed on your sites."
+            echo "Distinct from 'cove upgrade', which upgrades Cove itself."
+            echo ""
+            echo "Subcommands:"
+            echo "  check                        Show every site's WordPress version, flagging"
+            echo "                               releases wp.org marks outdated or insecure."
+            echo "  update <site> [version]      Update one site to the latest release, or to a"
+            echo "                               specific version (which may be a downgrade)."
+            echo "  update --all                 Update every site that is behind."
+            echo ""
+            echo "Flags:"
+            echo "  --all          Apply to every WordPress site."
+            echo "  --dry-run      List what would change without touching anything."
+            echo "  --yes, -y      Skip the confirmation prompt."
+            echo ""
+            echo "Examples:"
+            echo "  cove core check"
+            echo "  cove core update mysite"
+            echo "  cove core update mysite 6.4.3"
+            echo "  cove core update --all --dry-run"
             ;;
         delete)
             echo "Usage: cove delete <name> [--force]"
@@ -4515,6 +4625,14 @@ main() {
         add)
             check_dependencies
             cove_add "$@"
+            ;;
+        clone)
+            check_dependencies
+            cove_clone "$@"
+            ;;
+        core)
+            check_dependencies
+            cove_core "$@"
             ;;
         delete)
             check_dependencies

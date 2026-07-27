@@ -1,0 +1,287 @@
+# Refresh the wp.org stable-check cache the dashboard also reads. Best-effort:
+# every failure leaves whatever cache already exists and returns non-zero, so
+# callers degrade to "no status information" rather than aborting.
+cove_wpver_refresh() {
+    local max_age="${1:-86400}"
+
+    if [ -f "$COVE_WPVER_CACHE" ]; then
+        local age
+        age=$(( $(date +%s) - $(cove_file_mtime "$COVE_WPVER_CACHE") ))
+        [ "$age" -lt "$max_age" ] && return 0
+    fi
+
+    local tmp
+    tmp=$(mktemp "${TMPDIR:-/tmp}/cove-wpver-XXXXXX") || return 1
+    if ! curl -fsSL --max-time 8 "https://api.wordpress.org/core/stable-check/1.0/" -o "$tmp" 2>/dev/null; then
+        rm -f "$tmp"
+        return 1
+    fi
+
+    mkdir -p "$(dirname "$COVE_WPVER_CACHE")"
+    # Normalised to the same {version,status} shape the dashboard writes, so one
+    # cache file serves both and either side can refresh it.
+    if ! SRC="$tmp" DEST="$COVE_WPVER_CACHE" frankenphp php-cli -r '
+        $all = json_decode(@file_get_contents(getenv("SRC")), true);
+        if (!is_array($all) || empty($all)) { exit(1); }
+        $versions = array_keys($all);
+        usort($versions, fn($a, $b) => version_compare($b, $a));
+        $out = [];
+        foreach (array_slice($versions, 0, 40) as $v) {
+            $out[] = ["version" => $v, "status" => $all[$v]];
+        }
+        file_put_contents(getenv("DEST"), json_encode($out));
+    ' 2>/dev/null; then
+        rm -f "$tmp"
+        return 1
+    fi
+    rm -f "$tmp"
+    return 0
+}
+
+# Portable stat -- BSD and GNU disagree on the flag for mtime.
+cove_file_mtime() {
+    stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null || echo 0
+}
+
+# Emit "name<TAB>version<TAB>status" for every WordPress site, in one PHP
+# process. Doing this per-site from bash would mean 250+ interpreter starts.
+cove_core_scan() {
+    SITES_DIR="$SITES_DIR" WPVER_CACHE="$COVE_WPVER_CACHE" frankenphp php-cli -r '
+        $sites_dir = getenv("SITES_DIR");
+        if (!is_dir($sites_dir)) exit;
+
+        $status_map = [];
+        $cache = getenv("WPVER_CACHE");
+        if ($cache && is_file($cache)) {
+            $cached = @json_decode(@file_get_contents($cache), true);
+            if (is_array($cached)) {
+                foreach ($cached as $e) {
+                    if (isset($e["version"], $e["status"])) $status_map[$e["version"]] = $e["status"];
+                }
+            }
+        }
+
+        $q = chr(39);
+        $pattern = "/\\\$wp_version\\s*=\\s*" . $q . "([^" . $q . "]+)" . $q . "/";
+
+        foreach (scandir($sites_dir) as $item) {
+            if ($item === "." || $item === "..") continue;
+            $public = $sites_dir . "/" . $item . "/public";
+            if (!is_file($public . "/wp-config.php")) continue;
+            $file = $public . "/wp-includes/version.php";
+            if (!is_file($file)) continue;
+            $head = @file_get_contents($file, false, null, 0, 4096);
+            if ($head === false || !preg_match($pattern, $head, $m)) continue;
+            $v = $m[1];
+            echo str_replace(".localhost", "", $item) . "\t" . $v . "\t" . ($status_map[$v] ?? "unknown") . "\n";
+        }
+    ' 2>/dev/null
+}
+
+# Update a single site in place. Echoes a one-line result; never exits, so a
+# fleet run keeps going past a broken site.
+cove_core_update_one() {
+    local name="$1"
+    local target="$2"
+    local public_dir="$SITES_DIR/$name.localhost/public"
+    local wp_cmd
+    wp_cmd=$(get_wp_cmd)
+
+    local before
+    before=$(cove_wp_version "$public_dir" 2>/dev/null || echo "unknown")
+
+    # --force lets an explicit target move in either direction; reinstalling the
+    # same version to repair core files is a legitimate reason to run this too.
+    local args="core update"
+    [ -n "$target" ] && args="core update --version=$target --force"
+
+    # Capture the status of wp-cli itself, not of the filter. Piping straight
+    # into grep would report a silent success as a failure, because grep exits
+    # non-zero when it filters every line away.
+    # stdin is closed for both wp-cli calls. The fleet loop feeds candidates in
+    # on stdin via a here-string, and any child that reads stdin would swallow
+    # the remaining lines -- silently updating one site and reporting success
+    # for the whole run.
+    local output status
+    output=$( (cd "$public_dir" && $wp_cmd $args --quiet) 2>&1 </dev/null )
+    status=$?
+    output=$(printf '%s\n' "$output" | grep -v -E '^(PHP )?Deprecated:' || true)
+    if [ "$status" -ne 0 ]; then
+        local reason
+        reason=$(printf '%s\n' "$output" | grep -v '^$' | tail -1)
+        echo "   ❌ $name — ${reason:-wp core update failed}"
+        return 1
+    fi
+
+    # Schema migrations are a separate step in WP-CLI, and skipping it leaves
+    # the site showing the database-update screen on first admin load.
+    (cd "$public_dir" && $wp_cmd core update-db --quiet) >/dev/null 2>&1 </dev/null || true
+
+    local after
+    after=$(cove_wp_version "$public_dir" 2>/dev/null || echo "unknown")
+    if [ "$before" == "$after" ]; then
+        echo "   • $name — already on $after"
+    else
+        echo "   ✅ $name — $before → $after"
+    fi
+    return 0
+}
+
+cove_core() {
+    local sub="${1:-}"
+    shift 2>/dev/null || true
+
+    case "$sub" in
+        check)
+            cove_wpver_refresh || true
+            local scan
+            scan=$(cove_core_scan)
+            if [ -z "$scan" ]; then
+                gum style --padding "1 2" "No WordPress sites found."
+                return 0
+            fi
+            local latest
+            latest=$(echo "$scan" | awk -F'\t' '$3=="latest"{print $2; exit}')
+            local total insecure outdated
+            total=$(echo "$scan" | wc -l | tr -d ' ')
+            insecure=$(echo "$scan" | awk -F'\t' '$3=="insecure"' | wc -l | tr -d ' ')
+            outdated=$(echo "$scan" | awk -F'\t' '$3=="outdated"' | wc -l | tr -d ' ')
+
+            echo ""
+            echo "🔎 WordPress core across $total site(s)"
+            [ -n "$latest" ] && echo "   latest release: $latest"
+            echo ""
+            echo "$scan" | awk -F'\t' '$3!="latest"' | sort -t'	' -k3,3 -k1,1 | while IFS=$'\t' read -r n v s; do
+                case "$s" in
+                    insecure) echo "   ❗ $n — $v (insecure)" ;;
+                    outdated) echo "   ⚠️  $n — $v (outdated)" ;;
+                    *)        echo "   ?  $n — $v" ;;
+                esac
+            done
+            echo ""
+            echo "   $insecure insecure, $outdated outdated, $((total - insecure - outdated)) current"
+            [ $((insecure + outdated)) -gt 0 ] && echo "   Update them all with: cove core update --all"
+            echo ""
+            ;;
+        update)
+            local all=false dry_run=false assume_yes=false site="" target=""
+            for arg in "$@"; do
+                case "$arg" in
+                    --all)              all=true ;;
+                    --dry-run)          dry_run=true ;;
+                    --yes|-y|--force)   assume_yes=true ;;
+                    -*)                 ;;
+                    *)
+                        # Same grammar as `cove add`: a bare token that starts
+                        # with a digit is a version, anything else is a site.
+                        if [[ "$arg" == [0-9]* ]]; then target="$arg"; else site="$arg"; fi ;;
+                esac
+            done
+
+            if [ -n "$target" ] && ! [[ "$target" =~ ^[0-9]+(\.[0-9]+){1,2}(-[A-Za-z0-9.]+)?$ ]]; then
+                gum style --foreground red "❌ Error: Invalid WordPress version '$target'." "Use a version like 6.4, 6.4.3, or 6.9-RC1."
+                exit 1
+            fi
+
+            if [ "$all" = false ] && [ -z "$site" ]; then
+                gum style --foreground red "❌ Error: Name a site or pass --all."
+                echo "Usage: cove core update <site> [version]"
+                echo "       cove core update --all [--dry-run] [--yes]"
+                exit 1
+            fi
+
+            # --- Single site ---
+            if [ "$all" = false ]; then
+                local public_dir="$SITES_DIR/$site.localhost/public"
+                if [ ! -d "$SITES_DIR/$site.localhost" ]; then
+                    gum style --foreground red "❌ Error: Site '$site.localhost' not found."
+                    exit 1
+                fi
+                if [ ! -f "$public_dir/wp-config.php" ]; then
+                    gum style --foreground red "❌ Error: '$site.localhost' is not a WordPress site."
+                    exit 1
+                fi
+                source_config
+                echo "🔄 Updating WordPress core on $site.localhost..."
+                cove_core_update_one "$site" "$target"
+                return $?
+            fi
+
+            # --- Fleet ---
+            cove_wpver_refresh || true
+            local scan
+            scan=$(cove_core_scan)
+            if [ -z "$scan" ]; then
+                gum style --padding "1 2" "No WordPress sites found."
+                return 0
+            fi
+
+            # With an explicit target every site is a candidate; otherwise only
+            # the ones wp.org says are behind.
+            local candidates
+            if [ -n "$target" ]; then
+                candidates=$(echo "$scan" | awk -F'\t' -v t="$target" '$2!=t{print $1"\t"$2"\t"$3}')
+            else
+                candidates=$(echo "$scan" | awk -F'\t' '$3!="latest"')
+            fi
+
+            if [ -z "$candidates" ]; then
+                gum style --padding "1 2" "✅ Every WordPress site is already up to date."
+                return 0
+            fi
+
+            local count
+            count=$(echo "$candidates" | wc -l | tr -d ' ')
+
+            echo ""
+            echo "$candidates" | while IFS=$'\t' read -r n v s; do
+                echo "   $n — $v${target:+ → $target}${s:+ ($s)}"
+            done
+            echo ""
+
+            if [ "$dry_run" = true ]; then
+                echo "🔎 Dry run — $count site(s) would be updated. Nothing changed."
+                return 0
+            fi
+
+            if [ "$assume_yes" = false ]; then
+                if ! gum confirm "Update $count site(s)?"; then
+                    echo "Aborted."
+                    return 1
+                fi
+            fi
+
+            source_config
+            local ok=0 failed=0
+            # Sequential on purpose: parallel wp-cli runs would contend on the
+            # same MariaDB and make a failure impossible to attribute.
+            while IFS=$'\t' read -r n v s; do
+                [ -z "$n" ] && continue
+                if cove_core_update_one "$n" "$target" </dev/null; then
+                    ok=$((ok + 1))
+                else
+                    failed=$((failed + 1))
+                fi
+            done <<< "$candidates"
+
+            echo ""
+            if [ "$failed" -gt 0 ]; then
+                gum style --foreground yellow "⚠️  $ok updated, $failed failed."
+            else
+                gum style --foreground green "✅ $ok site(s) updated."
+            fi
+            ;;
+        *)
+            echo "Usage: cove core <check|update>"
+            echo ""
+            echo "  cove core check                    Report the WordPress version of every site."
+            echo "  cove core update <site> [version]  Update one site to the latest, or to a version."
+            echo "  cove core update --all             Update every site that is behind."
+            echo ""
+            echo "Flags:"
+            echo "  --all          Apply to every WordPress site."
+            echo "  --dry-run      List what would change without touching anything."
+            echo "  --yes, -y      Skip the confirmation prompt."
+            ;;
+    esac
+}

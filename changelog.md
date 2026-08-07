@@ -1,5 +1,12 @@
 # Changelog
 
+## [Unreleased]
+
+### 🔒 Security & Bug Fixes
+
+* **Installer No Longer Dies in Non-Interactive Environments:** `install-cove.sh` tested whether `/dev/tty` was readable before wiring it to `cove install`'s interactive prompts — but in containers, CI runners, and `ssh host 'curl | bash'` sessions, `/dev/tty` exists and passes the readability test while actually *opening* it fails with "No such device or address", killing the install before Cove ever ran. The installer now tests that `/dev/tty` can genuinely be opened, so environments without a controlling terminal fall through cleanly to Cove's non-interactive install path. Found by running the installer across six Linux distros in fresh system containers.
+* **Binary Fallback Now Works on Minimal RHEL-Family Systems:** Installing a dependency from a release tarball (gum on Fedora/RHEL, where no native package exists) piped it into `tar` — which minimal Rocky/RHEL images don't ship. Worse, the extraction's stderr was suppressed, so the only symptom was a generic "Failed to install gum" with no cause. Cove now installs `tar` via the package manager before its first tarball extraction and lets extraction errors reach the terminal, taking a Rocky Linux 9 container from hard failure to a clean end-to-end install.
+
 ## [1.13] - 2026-08-07
 
 Cove learns versions. Pin any site to an older PHP with `cove php` — a native Homebrew php-fpm running behind FrankenPHP, switchable from the dashboard with one click — choose the WordPress release at creation with `cove add mysite 6.4.3`, and audit or update every site's core at once with the new `cove core`. `cove clone` stamps out copies of a seeded site — files, database, URLs — in seconds via copy-on-write. The dashboard dropped its last external dependency so it loads without internet, clicking a row now opens its action menu, and the bundled Adminer jumped to 6.0.

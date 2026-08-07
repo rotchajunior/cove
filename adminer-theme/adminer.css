@@ -912,6 +912,10 @@ td pre { margin: 0; }
 .jush-sql_var { color: var(--syn-var); }
 .jush-bac,
 .jush-sql_bac { color: var(--syn-type); }
+/* Adminer 6 wraps keywords in doc-link anchors colored by jush's own
+   --keyword-color (navy) — unreadable on the dark theme. Inherit the
+   token color from the wrapping span instead. */
+.jush a { color: inherit; }
 
 /* ============================================
    Paragraphs, link groups, pagination

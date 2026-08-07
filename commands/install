@@ -497,8 +497,8 @@ memory_limit = 1G
 display_errors = 0
 error_reporting = 6143
 INI
-    echo "🗃️ Downloading Adminer 5.4.2..."
-    curl -sL "https://github.com/vrana/adminer/releases/download/v5.4.2/adminer-5.4.2.php" -o "$ADMINER_DIR/adminer-core.php"
+    echo "🗃️ Downloading Adminer 6.0.0..."
+    curl -sL "https://github.com/vrana/adminer/releases/download/v6.0.0/adminer-6.0.0.php" -o "$ADMINER_DIR/adminer-core.php"
     # Entry point + theme assets. Keep in sync with cove_upgrade so upgraders
     # pick up index.php/head() and CSS/JS changes without a full reinstall.
     deploy_adminer_theme

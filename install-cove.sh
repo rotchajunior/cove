@@ -265,7 +265,7 @@ echo "--------------------------------------------------"
 # Redirect stdin from /dev/tty so interactive prompts (gum confirm/choose,
 # read) work when this installer is run via `curl | bash`, which would
 # otherwise hand the child a closed stdin and silently fail every prompt.
-if [ -r /dev/tty ]; then
+if (exec < /dev/tty) 2>/dev/null; then
     "$DESTINATION_PATH" install < /dev/tty
 else
     "$DESTINATION_PATH" install

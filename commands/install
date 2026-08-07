@@ -80,8 +80,18 @@ install_dependency() {
             
             # Check if URL is a tarball or direct binary
             if [[ "$binary_url" == *.tar.gz ]] || [[ "$binary_url" == *.tgz ]]; then
+                # Minimal RHEL-family images (containers, cloud) ship without tar,
+                # which makes the extraction below fail with no useful error.
+                if ! command -v tar &>/dev/null; then
+                    echo "   - Installing tar (required to extract)..."
+                    if [ "$PKG_MANAGER" == "apt" ]; then
+                        $SUDO_CMD apt-get install -y tar >/dev/null 2>&1
+                    else
+                        $SUDO_CMD dnf install -y tar >/dev/null 2>&1
+                    fi
+                fi
                 echo "   - Downloading and extracting tarball..."
-                if curl -sL "$binary_url" | tar -xz -C "$temp_dir" 2>/dev/null; then
+                if curl -sL "$binary_url" | tar -xz -C "$temp_dir"; then
                     # Find the binary in extracted contents
                     local binary_file
                     binary_file=$(find "$temp_dir" -name "$cmd_name" -type f -executable 2>/dev/null | head -1)

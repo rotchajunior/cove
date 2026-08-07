@@ -181,8 +181,12 @@ GUI_DIR="$APP_DIR/gui"
 ADMINER_DIR="$APP_DIR/adminer"
 CUSTOM_CADDY_DIR="$APP_DIR/directives"
 
+# Per-site PHP version switching (native php-fpm behind FrankenPHP).
+RUN_DIR="$COVE_DIR/run"          # unix sockets: php-<ver>.sock
+PHP_FPM_DIR="$COVE_DIR/php-fpm"  # generated php-fpm configs: <ver>/php-fpm.conf
+
 PROTECTED_NAMES="cove"
-COVE_VERSION="1.12"
+COVE_VERSION="1.13"
 # Bundled Whoops release. Pinned here so cove install and cove upgrade deploy
 # the same version. 2.15.3 fatally broke under FrankenPHP's PHP 8.5 (web SAPI),
 # 500-ing every site via the auto_prepend bootstrap; 2.18.0 is compatible.
@@ -268,6 +272,50 @@ cove_ini_get() {
             | sed -E 's/[[:space:]]+$//')
     fi
     echo "${val:-$fallback}"
+}
+
+# --- Per-site PHP version helpers ---
+# A site pinned to an older PHP carries a single-line `php_version` file in its
+# site dir (peer of mappings/lan_config). FrankenPHP stays the front door for
+# every site; pinned sites are handed to a native Homebrew php-fpm over a unix
+# socket via php_fastcgi. See sync_php_fpm_services / emit_site_php_handler.
+
+# Normalize "php@8.2" / "8.2.29" / "8.2" → "8.2". Echoes nothing on garbage.
+normalize_php_version() {
+    local ver="${1#php@}"
+    if [[ "$ver" =~ ^([578]\.[0-9]+)(\.[0-9]+)?$ ]]; then
+        echo "${BASH_REMATCH[1]}"
+    fi
+}
+
+# Echo the pinned version for a site dir, or nothing when unpinned.
+site_php_version() {
+    cat "$1/php_version" 2>/dev/null
+}
+
+# Homebrew prefix for php@<ver> (e.g. /opt/homebrew/opt/php@8.2), but only
+# when its php-fpm binary actually exists. Empty on nanobrew/Linux or when the
+# formula isn't installed — callers treat empty as "no native PHP available"
+# and fall back to FrankenPHP.
+php_fpm_prefix_for() {
+    local ver="$1"
+    if [ "$OS" != "macos" ] || [ "$MAC_BREW" != "brew" ]; then
+        return 0
+    fi
+    local prefix
+    prefix=$(brew --prefix "php@$ver" 2>/dev/null)
+    if [ -n "$prefix" ] && [ -x "$prefix/sbin/php-fpm" ]; then
+        echo "$prefix"
+    fi
+}
+
+php_fpm_sock_for() {
+    echo "$RUN_DIR/php-$1.sock"
+}
+
+# The PHP version FrankenPHP bundles (e.g. "8.5.2"), parsed from its banner.
+frankenphp_php_version() {
+    frankenphp version 2>/dev/null | sed -n 's/.*PHP \([0-9][0-9.]*\).*/\1/p'
 }
 
 # Returns the process name(s) listening on $1 for display purposes, or empty
@@ -400,8 +448,6 @@ update_wp_site_urls_for_port_change() {
     [ -d "$SITES_DIR" ] || return 0
 
     local wp_cmd
-    wp_cmd=$(get_wp_cmd)
-
     local total_sites=0 updated_sites=0 failed_hosts=0
     local site_path site_name hostname mapping old_url new_url
     local -a hostnames
@@ -411,6 +457,7 @@ update_wp_site_urls_for_port_change() {
         [ -f "$site_path/public/wp-config.php" ] || continue
         total_sites=$((total_sites + 1))
         site_name=$(basename "$site_path")
+        wp_cmd=$(get_wp_cmd "$site_path")
 
         hostnames=("$site_name")
         if [ -f "$site_path/mappings" ]; then
@@ -983,16 +1030,54 @@ check_dependencies() {
 #
 # --allow-root is needed in WSL/Docker where the script runs as root.
 get_wp_cmd() {
+    # Optional $1: a site dir. A site pinned to an older PHP (php_version
+    # file) runs wp-cli under that same native php binary — version-gated
+    # plugins and core requirement checks must see the PHP the site actually
+    # serves with. Native php honors the exported PHPRC too, so the ini story
+    # is identical to the frankenphp path. Missing binary degrades to
+    # FrankenPHP rather than failing.
+    local site_dir="$1"
     local wp_path
     wp_path=$(command -v wp)
+    local root_flag=""
+    if [ "$(id -u)" -eq 0 ]; then
+        root_flag=" --allow-root"
+    fi
+    if [ -n "$site_dir" ]; then
+        local pinned prefix
+        pinned=$(site_php_version "$site_dir")
+        if [ -n "$pinned" ]; then
+            prefix=$(php_fpm_prefix_for "$pinned")
+            if [ -n "$prefix" ] && [ -x "$prefix/bin/php" ]; then
+                echo "$prefix/bin/php $wp_path$root_flag"
+                return 0
+            fi
+        fi
+    fi
     local frank
     frank=$(command -v frankenphp)
-    if [ "$(id -u)" -eq 0 ]; then
-        echo "$frank php-cli $wp_path --allow-root"
-    else
-        echo "$frank php-cli $wp_path"
-    fi
+    echo "$frank php-cli $wp_path$root_flag"
 }
+
+# Read a site's WordPress version straight out of wp-includes/version.php.
+# Deliberately not `wp core version`: that boots WordPress, which costs ~200ms
+# per site and fails outright on a site whose database or plugins are broken —
+# exactly the sites you most want listed. Parsing the constant is a few
+# milliseconds and works on a site that cannot currently serve a request.
+cove_wp_version() {
+    local public_dir="$1"
+    local version_file="$public_dir/wp-includes/version.php"
+    [ -f "$version_file" ] || return 1
+    local version
+    version=$(sed -n "s/^\$wp_version = '\([^']*\)'.*/\1/p" "$version_file" | head -1)
+    [ -n "$version" ] || return 1
+    echo "$version"
+}
+
+# Where the dashboard caches wp.org's stable-check data. Shared with the CLI so
+# `cove list` and `cove core` can flag insecure versions without a network call
+# of their own; absent or stale is always tolerable, never fatal.
+COVE_WPVER_CACHE="$COVE_DIR/cache/wp-versions.json"
 
 # Safely single-quote a value for interpolation into a remote shell command.
 # Interior single quotes become the standard '\'' escape sequence, so the
@@ -1505,6 +1590,169 @@ EOM
     fi
 }
 
+# --- Per-site PHP: native php-fpm services ---
+# Sites pinned to an older PHP (a `php_version` file in the site dir) are
+# served by Homebrew's php@<ver> php-fpm behind FrankenPHP. Cove owns the
+# whole FPM lifecycle (config + launchd unit) rather than `brew services`:
+# Homebrew's stock pool listens on 127.0.0.1:9000 for EVERY version (instant
+# collision with two pinned versions) and carries none of Cove's ini
+# semantics (mailpit sendmail, Whoops prepend, shared error log).
+
+# Write the generated php-fpm config for a version. Homebrew's own php.ini +
+# conf.d still load first (that's what enables the opcache extension); the
+# pool then overrides everything Cove cares about via php_admin_value — the
+# FPM analog of the frankenphp{} php_ini block in regenerate_caddyfile.
+write_php_fpm_config() {
+    local ver="$1"
+    local conf_dir="$PHP_FPM_DIR/$ver"
+    local mailpit_path
+    mailpit_path=$(command -v mailpit)
+    mkdir -p "$conf_dir" "$RUN_DIR" "$LOGS_DIR" "$COVE_DIR/cache/sessions"
+    cat > "$conf_dir/php-fpm.conf" << EOM
+[global]
+; Auto-generated by Cove (write_php_fpm_config in main). Do not edit —
+; regenerated on every pin, reload, and post-upgrade.
+error_log = $LOGS_DIR/php-fpm-$ver.log
+daemonize = no
+
+[cove]
+listen = $RUN_DIR/php-$ver.sock
+listen.mode = 0600
+; ondemand: workers spawn per request and idle out — right for a dev box
+; where a pinned site may go untouched for days.
+pm = ondemand
+pm.max_children = 10
+pm.process_idle_timeout = 60s
+pm.max_requests = 500
+catch_workers_output = yes
+; Mirror of the frankenphp{} php_ini block. The ZTS OPcache sizing there is
+; deliberately NOT replicated: this is NTS php-fpm with a per-pool cache, so
+; PHP's stock OPcache defaults are correct here.
+php_admin_value[sendmail_path] = $mailpit_path sendmail -t
+php_admin_flag[log_errors] = on
+php_admin_flag[display_errors] = off
+php_admin_value[error_log] = $LOGS_DIR/errors.log
+php_admin_value[auto_prepend_file] = $APP_DIR/whoops_bootstrap.php
+php_admin_value[memory_limit] = $(cove_ini_get memory_limit 1G)
+php_admin_value[upload_max_filesize] = $(cove_ini_get upload_max_filesize 1G)
+php_admin_value[post_max_size] = $(cove_ini_get post_max_size 1G)
+php_admin_value[session.save_path] = $COVE_DIR/cache/sessions
+EOM
+    echo "$conf_dir/php-fpm.conf"
+}
+
+# (Re)install the php-fpm unit for one version. Idempotent AND restart-shy:
+# when the config is unchanged and the master process is already up, this is
+# a no-op — regenerate_caddyfile calls the reconciler on every reload, and a
+# `cove add` must not bounce every pinned site's FPM as a side effect.
+install_php_fpm_service() {
+    local ver="$1"
+    local prefix
+    prefix=$(php_fpm_prefix_for "$ver")
+    if [ -z "$prefix" ]; then
+        echo "   ⚠️  php@$ver (php-fpm) not found; sites pinned to $ver fall back to FrankenPHP." >&2
+        return 1
+    fi
+
+    local conf_path="$PHP_FPM_DIR/$ver/php-fpm.conf"
+    local old_conf=""
+    [ -f "$conf_path" ] && old_conf=$(cat "$conf_path")
+    write_php_fpm_config "$ver" >/dev/null
+    local new_conf
+    new_conf=$(cat "$conf_path")
+
+    local label="com.cove.php-fpm-$ver"
+    local plist_path="$COVE_DIR/$label.plist"
+    if [ "$old_conf" == "$new_conf" ] && [ -f "$plist_path" ] \
+        && pgrep -f "php-fpm/$ver/php-fpm.conf" &>/dev/null; then
+        return 0
+    fi
+
+    launchctl unload "$plist_path" &>/dev/null || true
+    cat > "$plist_path" << EOM
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+        <key>KeepAlive</key>
+        <true/>
+        <key>ThrottleInterval</key>
+        <integer>10</integer>
+        <key>Label</key>
+        <string>$label</string>
+        <key>ProgramArguments</key>
+        <array>
+                <string>$prefix/sbin/php-fpm</string>
+                <string>--nodaemonize</string>
+                <string>--fpm-config</string>
+                <string>$conf_path</string>
+        </array>
+        <key>RunAtLoad</key>
+        <true/>
+        <key>StandardErrorPath</key>
+        <string>$LOGS_DIR/php-fpm-$ver.log</string>
+        <key>StandardOutPath</key>
+        <string>$LOGS_DIR/php-fpm-$ver.log</string>
+</dict>
+</plist>
+EOM
+    launchctl load "$plist_path"
+    launchctl start "$label"
+}
+
+# Stop + remove the unit for a version nothing pins anymore. The generated
+# config dir under $PHP_FPM_DIR is kept on purpose — it's tiny and makes a
+# re-pin instant.
+remove_php_fpm_service() {
+    local ver="$1"
+    local plist_path="$COVE_DIR/com.cove.php-fpm-$ver.plist"
+    launchctl unload "$plist_path" &>/dev/null || true
+    rm -f "$plist_path" "$RUN_DIR/php-$ver.sock"
+}
+
+# Reconcile running php-fpm units against what sites actually pin. Called
+# from regenerate_caddyfile, so pin, unpin, delete, clone, and plain `cove
+# reload` all converge service state for free — no eager teardown wiring
+# anywhere else.
+sync_php_fpm_services() {
+    local needed=" "
+    local site_path ver
+    if [ -d "$SITES_DIR" ]; then
+        for site_path in "$SITES_DIR"/*; do
+            [ -d "$site_path" ] || continue
+            ver=$(site_php_version "$site_path")
+            [ -n "$ver" ] || continue
+            if [ "$OS" != "macos" ] || [ "$MAC_BREW" != "brew" ]; then
+                echo "   ⚠️  $(basename "$site_path") pins PHP $ver, but per-site PHP requires Homebrew on macOS; serving with FrankenPHP." >&2
+                continue
+            fi
+            case "$needed" in
+                *" $ver "*) ;;
+                *) needed+="$ver " ;;
+            esac
+        done
+    fi
+
+    if [ "$OS" != "macos" ] || [ "$MAC_BREW" != "brew" ]; then
+        return 0
+    fi
+
+    for ver in $needed; do
+        install_php_fpm_service "$ver" || true
+    done
+
+    local plist
+    for plist in "$COVE_DIR"/com.cove.php-fpm-*.plist; do
+        [ -f "$plist" ] || continue
+        ver=$(basename "$plist" .plist)
+        ver="${ver#com.cove.php-fpm-}"
+        case "$needed" in
+            *" $ver "*) ;;
+            *) remove_php_fpm_service "$ver" ;;
+        esac
+    done
+}
+
 # Validate a Cove site name: lowercase letters, digits, and hyphens only, no
 # leading/trailing hyphen. Mirrors the rules cove_add enforces (add:14-23) and
 # the dashboard's add_site regex, so every command that turns a name into a
@@ -1709,6 +1957,29 @@ prune_delete_tombstones() {
     done
 }
 
+# Emit the PHP handler line for a site's server block: php_fastcgi to the
+# pinned native php-fpm when the site has a php_version AND the binary
+# resolves, php_server (FrankenPHP) otherwise. The fallback means a
+# half-installed pin degrades to "wrong PHP version" rather than a hard 502.
+# php_fastcgi ships the same try_files/index semantics as php_server, and its
+# default directive order already precedes file_server, so the plain-site
+# file_server conditional below needs no change.
+emit_site_php_handler() {
+    local site_path="$1"
+    local ver
+    ver=$(site_php_version "$site_path")
+    if [ -n "$ver" ] && [ -n "$(php_fpm_prefix_for "$ver")" ]; then
+        # php_server is shorthand for php_fastcgi + file_server. When swapping
+        # in a pinned socket, file_server must come along explicitly or every
+        # static asset (JS/CSS/images) falls through to no handler and Caddy
+        # answers with an empty 200 — which presents as a broken wp-admin.
+        echo "    php_fastcgi unix/$(php_fpm_sock_for "$ver")" >> "$CADDYFILE_PATH"
+        echo "    file_server" >> "$CADDYFILE_PATH"
+    else
+        echo "    php_server" >> "$CADDYFILE_PATH"
+    fi
+}
+
 regenerate_caddyfile() {
     echo "🔄 Regenerating Caddyfile..."
     if ! command -v mailpit &> /dev/null; then
@@ -1717,7 +1988,10 @@ regenerate_caddyfile() {
     fi
     # Ensure the user-owned PHP session dir referenced by the Caddyfile's
     # `php_ini session.save_path` exists before FrankenPHP tries to use it.
-    mkdir -p "$COVE_DIR/cache/sessions" 2>/dev/null
+    mkdir -p "$COVE_DIR/cache/sessions" "$RUN_DIR" 2>/dev/null
+    # Converge native php-fpm services with the sites' php_version pins BEFORE
+    # writing the config that points at their sockets.
+    sync_php_fpm_services
     local mailpit_path
     mailpit_path=$(command -v mailpit)
 
@@ -1846,7 +2120,7 @@ EOM
                     echo "" >> "$CADDYFILE_PATH"
                 fi
 
-                echo "    php_server" >> "$CADDYFILE_PATH"
+                emit_site_php_handler "$site_path"
 
                 if [ ! -f "$site_path/public/wp-config.php" ]; then
                     echo "    file_server" >> "$CADDYFILE_PATH"
@@ -1854,7 +2128,7 @@ EOM
 
                 echo "}" >> "$CADDYFILE_PATH"
                 echo "" >> "$CADDYFILE_PATH"
-                
+
                 # Check if LAN access is enabled for this site
                 local lan_config="$site_path/lan_config"
                 if [ -f "$lan_config" ]; then
@@ -1880,7 +2154,7 @@ EOM
                             echo "" >> "$CADDYFILE_PATH"
                         fi
 
-                        echo "    php_server" >> "$CADDYFILE_PATH"
+                        emit_site_php_handler "$site_path"
 
                         if [ ! -f "$site_path/public/wp-config.php" ]; then
                             echo "    file_server" >> "$CADDYFILE_PATH"
@@ -1983,8 +2257,8 @@ EOM
                             echo "" >> "$CADDYFILE_PATH"
                         fi
                         
-                        echo "    php_server" >> "$CADDYFILE_PATH"
-                        
+                        emit_site_php_handler "$site_path"
+
                         if [ ! -f "$site_path/public/wp-config.php" ]; then
                             echo "    file_server" >> "$CADDYFILE_PATH"
                         fi
@@ -2086,6 +2360,49 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
 // disk and the UI falls back to '—' when an entry is missing.
 $__cove_sizes_cache = $user_home . '/Cove/cache/site-sizes.json';
 
+// The add-site form offers real WordPress versions rather than a free-text box,
+// so a typo can't turn into a failed install two minutes later. wp.org's
+// stable-check endpoint is the only source that lists every shipped version, so
+// it's fetched once and cached for a day — the dashboard must stay usable
+// offline, so every failure path here falls back to "latest" and never blocks.
+$__cove_wpver_cache = $user_home . '/Cove/cache/wp-versions.json';
+
+function cove_wp_versions($cache_path, $ttl = 86400) {
+    if (is_file($cache_path) && (time() - filemtime($cache_path)) < $ttl) {
+        $cached = @json_decode(@file_get_contents($cache_path), true);
+        if (is_array($cached) && !empty($cached)) return $cached;
+    }
+
+    // Short timeouts: this runs inline on a dashboard request, and a slow or
+    // unreachable wp.org must degrade to a plain "latest" rather than hang.
+    $raw = @file_get_contents('https://api.wordpress.org/core/stable-check/1.0/', false, stream_context_create([
+        'http' => ['timeout' => 4, 'user_agent' => 'Cove'],
+        'ssl'  => ['verify_peer' => true, 'verify_peer_name' => true],
+    ]));
+    $all = $raw ? @json_decode($raw, true) : null;
+    if (!is_array($all) || empty($all)) {
+        // Serve a stale cache in preference to nothing at all.
+        $stale = is_file($cache_path) ? @json_decode(@file_get_contents($cache_path), true) : null;
+        return is_array($stale) ? $stale : [];
+    }
+
+    // stable-check maps every version -> 'latest' | 'outdated' | 'insecure'.
+    // Sort newest-first and keep a usable slice: the whole list is ~700 entries
+    // going back to 0.71, which is noise in a dropdown.
+    $versions = array_keys($all);
+    usort($versions, static fn($a, $b) => version_compare($b, $a));
+    $versions = array_slice($versions, 0, 40);
+
+    $out = [];
+    foreach ($versions as $v) {
+        $out[] = ['version' => $v, 'status' => $all[$v]];
+    }
+
+    @mkdir(dirname($cache_path), 0755, true);
+    @file_put_contents($cache_path, json_encode($out));
+    return $out;
+}
+
 function cove_read_size_cache($path) {
     if (!file_exists($path)) return [];
     $data = @json_decode(@file_get_contents($path), true);
@@ -2106,6 +2423,22 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
     if ($action === 'list_sites') {
         $sites_info = [];
         $size_cache = cove_read_size_cache($__cove_sizes_cache);
+
+        // Read whatever stable-check data is already cached. Deliberately does
+        // not fetch: list_sites is on the critical path for the dashboard's
+        // first paint, and version status is a nicety. The add-site form's
+        // wp_versions call is what populates this.
+        $__cove_wpver_status = [];
+        if (is_file($__cove_wpver_cache)) {
+            $__cove_wpver_cached = @json_decode(@file_get_contents($__cove_wpver_cache), true);
+            if (is_array($__cove_wpver_cached)) {
+                foreach ($__cove_wpver_cached as $__e) {
+                    if (isset($__e['version'], $__e['status'])) {
+                        $__cove_wpver_status[$__e['version']] = $__e['status'];
+                    }
+                }
+            }
+        }
         if (file_exists($sitedir) && is_dir($sitedir)) {
             $items = scandir($sitedir);
             foreach ($items as $item) {
@@ -2118,10 +2451,26 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
                     $mtime = @filemtime($site_path . '/public');
                     if (!$mtime) $mtime = @filemtime($site_path);
 
+                    // Parsed from version.php rather than booting WordPress —
+                    // 250 sites of `wp core version` would take a minute, and
+                    // this still reports on a site too broken to serve.
+                    $wp_version = null;
+                    $vfile = $site_path . '/public/wp-includes/version.php';
+                    if (is_file($vfile)) {
+                        $head = @file_get_contents($vfile, false, null, 0, 4096);
+                        if ($head !== false && preg_match('/\$wp_version\s*=\s*\'([^\']+)\'/', $head, $m)) {
+                            $wp_version = $m[1];
+                        }
+                    }
+
                     $sites_info[] = [
                         'name' => str_replace('.localhost', '', $item),
                         'domain' => 'https://' . $item . $__cove_port_suffix,
                         'type' => file_exists($site_path . "/public/wp-config.php") ? 'WordPress' : 'Plain',
+                        'wp_version' => $wp_version,
+                        // latest | outdated | insecure | null when wp.org's
+                        // stable-check data has not been fetched yet.
+                        'wp_status' => $wp_version !== null ? ($__cove_wpver_status[$wp_version] ?? null) : null,
                         'display_path' => '~/Cove/Sites/' . $item,
                         'full_path' => $site_path,
                         'size_bytes' => isset($size_cache[$item]) ? (int) $size_cache[$item] : null,
@@ -2129,6 +2478,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
                         // Mirrors cove_add's `echo "cove_$name" | tr -c '[:alnum:]_' '_'`,
                         // so the UI can deep-link Adminer straight at this site's schema.
                         'db_name' => preg_replace('/[^a-zA-Z0-9_]/', '_', 'cove_' . str_replace('.localhost', '', $item)),
+                        // Per-site PHP pin (`cove php`); null = Cove's default PHP.
+                        'php_version' => is_file($site_path . '/php_version') ? trim((string) @file_get_contents($site_path . '/php_version')) : null,
                     ];
                 }
             }
@@ -2141,6 +2492,32 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
             }
         }
         echo json_encode($sites_info);
+        exit;
+    }
+    if ($action === 'wp_versions') {
+        echo json_encode(cove_wp_versions($__cove_wpver_cache));
+        exit;
+    }
+    if ($action === 'php_info') {
+        // Which PHP versions the dashboard can offer for per-site pins. The
+        // dashboard itself runs under FrankenPHP, so PHP_VERSION here IS
+        // Cove's default PHP — only OLDER versions run on native php-fpm.
+        // Installed = the Homebrew formula's php-fpm binary exists, mirroring
+        // php_fpm_prefix_for in the CLI.
+        $default_mm = preg_replace('/^(\d+\.\d+).*$/', '$1', PHP_VERSION);
+        $brew_opt = is_dir('/opt/homebrew/opt') ? '/opt/homebrew/opt' : (is_dir('/usr/local/opt') ? '/usr/local/opt' : null);
+        $supported = (PHP_OS_FAMILY === 'Darwin') && $brew_opt !== null;
+        $versions = [];
+        foreach (['8.4', '8.3', '8.2', '8.1', '8.0', '7.4'] as $v) {
+            if (version_compare($v, $default_mm, '>=')) continue;
+            $installed = $supported && is_executable($brew_opt . '/php@' . $v . '/sbin/php-fpm');
+            // 8.0 and 7.4 left Homebrew core, so they can't be offered as
+            // one-click installs — but when a tap already provides them
+            // (shivammathur/php), pinning works, so show what's there.
+            if (!$installed && version_compare($v, '8.1', '<')) continue;
+            $versions[] = ['version' => $v, 'installed' => $installed];
+        }
+        echo json_encode(['supported' => $supported, 'default' => $default_mm, 'versions' => $versions]);
         exit;
     }
 }
@@ -2172,8 +2549,21 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     switch ($action) {
         case 'add_site':
             if (!empty($site_name) && preg_match('/^[a-zA-Z0-9-]+$/', $site_name)) {
-                $type_flag = ($input['is_plain'] ?? false) ? '--plain' : '';
-                $command = sprintf('HOME=%s %s add %s %s --no-reload 2>&1', escapeshellarg($user_home), escapeshellarg($cove_path), escapeshellarg($site_name), $type_flag);
+                // One positional "flavor" slot, mirroring the CLI: 'plain', a
+                // WordPress version, 'nightly', or nothing at all for latest.
+                // Validated here as well as in cove_add — escapeshellarg stops
+                // shell injection, but there's no reason to hand the CLI a
+                // value the UI already knows is malformed.
+                $flavor = '';
+                if ($input['is_plain'] ?? false) {
+                    $flavor = 'plain';
+                } elseif (!empty($input['wp_version']) && $input['wp_version'] !== 'latest') {
+                    $v = $input['wp_version'];
+                    if ($v === 'nightly' || preg_match('/^\d+(\.\d+){1,2}(-[A-Za-z0-9.]+)?$/', $v)) {
+                        $flavor = $v;
+                    }
+                }
+                $command = sprintf('HOME=%s %s add %s %s --no-reload 2>&1', escapeshellarg($user_home), escapeshellarg($cove_path), escapeshellarg($site_name), $flavor !== '' ? escapeshellarg($flavor) : '');
                 // Remember we're adding so the post-exec block below can
                 // measure the new site's size and fold it into the cache.
                 $add_site_target = $site_name;
@@ -2305,6 +2695,42 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }
             echo json_encode($response);
             exit; // Exit immediately
+        case 'set_php':
+            // Pin a site to an older PHP (native php-fpm) or back to the
+            // default. Charset gates mirror add/delete; the version must be a
+            // major.minor or the literal 'default'.
+            $php_version = $input['php_version'] ?? '';
+            if (empty($site_name) || !preg_match('/^[a-zA-Z0-9-]+$/', $site_name)) {
+                $response['message'] = 'Invalid site name provided.';
+                break;
+            }
+            if (!preg_match('/^(default|\d+\.\d+)$/', $php_version)) {
+                $response['message'] = 'Invalid PHP version.';
+                break;
+            }
+            $pin_file = $sitedir . '/' . $site_name . '.localhost/php_version';
+            $current_pin = is_file($pin_file) ? trim((string) @file_get_contents($pin_file)) : null;
+            // Idempotent retry, same reasoning as rename: pinning reloads the
+            // Caddy serving this dashboard, so a dropped response gets retried
+            // by the UI after the work already happened.
+            if (($php_version === 'default' && $current_pin === null) || $php_version === $current_pin) {
+                echo json_encode(['success' => true, 'message' => 'Already set.']);
+                exit;
+            }
+            $brew_opt = is_dir('/opt/homebrew/opt') ? '/opt/homebrew/opt' : '/usr/local/opt';
+            $needs_install = $php_version !== 'default' && !is_executable($brew_opt . '/php@' . $php_version . '/sbin/php-fpm');
+            // Always applied in the background — even an installed-version pin
+            // regenerates the Caddyfile and reloads the Caddy serving this
+            // dashboard, so a synchronous exec just hangs the response until
+            // the client gives up. Return immediately; the UI polls list_sites
+            // for the pin state. cove php auto-confirms brew installs when it
+            // has no TTY, so the missing-formula case rides the same path.
+            $apply_log = $user_home . '/Cove/cache/php-apply-' . $site_name . '.log';
+            shell_exec(sprintf('HOME=%s %s php %s %s > %s 2>&1 &',
+                escapeshellarg($user_home), escapeshellarg($cove_path),
+                escapeshellarg($site_name), escapeshellarg($php_version), escapeshellarg($apply_log)));
+            echo json_encode(['success' => true, 'applying' => true, 'installing' => $needs_install]);
+            exit;
         case 'reload_server':
             // This command is run in the background to prevent deadlocking the server.
             // Output is redirected to /dev/null and the '&' backgrounds the process.
@@ -2428,8 +2854,8 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
     <script>
         // Set data-theme synchronously before any CSS paints, so the correct
         // theme's background is used from the very first frame (no FOUC).
-        // Alpine re-reads the same localStorage key in init() — values stay
-        // in sync with no extra flip.
+        // The dashboard script re-reads the same localStorage key in init()
+        // — values stay in sync with no extra flip.
         (function () {
             try {
                 var s = localStorage.getItem('theme');
@@ -2444,7 +2870,6 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,400..600;1,9..144,400..600&family=Geist:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
-    <script src="//unpkg.com/alpinejs" defer></script>
     <style>
         *, *::before, *::after { box-sizing: border-box; }
         html, body { margin: 0; padding: 0; }
@@ -2647,6 +3072,8 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
         .add-row input[type="text"]:focus { outline: 0; border-color: var(--accent); }
         .add-row .plain-toggle { display: inline-flex; align-items: center; gap: 0.4rem; color: var(--text-dim); font-size: 0.85rem; cursor: pointer; }
         .add-row .plain-toggle input { accent-color: var(--accent); }
+        .add-row select.wp-version { background: var(--input-bg); border: 1px solid var(--panel-border); color: var(--text); font-family: var(--font-mono); font-size: 0.85rem; padding: 0.5rem 0.7rem; border-radius: var(--radius-md); flex: none; cursor: pointer; }
+        .add-row select.wp-version:focus { outline: 0; border-color: var(--accent); }
 
         /* Site list — one grid on the <ul>, rows inherit its columns via
            subgrid so type/modified/size/actions align vertically across rows
@@ -2655,14 +3082,34 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
         .site-row { display: grid; grid-column: 1 / -1; grid-template-columns: subgrid; align-items: center; padding: 0.8rem 1.5rem; border-bottom: 1px solid var(--panel-border); transition: background 100ms; cursor: pointer; }
         .site-row:last-child { border-bottom: 0; }
         .site-row:hover { background: var(--panel-hover); }
-        .site-domain { font-family: var(--font-mono); font-size: 0.88rem; color: var(--text-dim); text-decoration: none; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .site-domain-cell { display: inline-flex; align-items: center; gap: 0.35rem; min-width: 0; }
+        .site-domain { font-family: var(--font-mono); font-size: 0.88rem; color: var(--text-dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
         .site-domain .host-accent { color: var(--accent); }
-        .site-domain:hover { color: var(--accent); }
+        /* The one spot on a row that opens the site — everywhere else on the
+           row opens the context menu. Always visible (not hover-gated) so a
+           site stays one tap away on touch. */
+        .site-open-link { display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; border-radius: 6px; color: var(--text-faint); flex: none; }
+        .site-open-link:hover { color: var(--accent); background: var(--panel-border); }
+        .site-open-link svg { width: 13px; height: 13px; }
         .site-domain mark { background: rgba(58, 151, 169, 0.28); background: color-mix(in oklch, var(--accent) 28%, transparent); color: inherit; padding: 0 1px; border-radius: 3px; }
         .site-type { display: inline-flex; justify-content: center; min-width: 64px; padding: 0.2rem 0.55rem; border-radius: var(--radius-pill); font-family: var(--font-mono); font-size: 0.68rem; font-weight: 500; letter-spacing: 0.08em; text-transform: uppercase; cursor: pointer; user-select: none; transition: filter 120ms; }
         .site-type:hover { filter: brightness(1.15); }
+        /* One grid child holding the pill plus its version, so adding the
+           version does not shift the row's subgrid columns. */
+        .site-type-cell { display: inline-flex; align-items: baseline; gap: 0.45rem; min-width: 0; }
+        .site-wp-version { font-family: var(--font-mono); font-size: 0.7rem; color: var(--text-faint); white-space: nowrap; }
+        /* Local sites aren't exposed, so an insecure release is a nudge to
+           update rather than a warning — hence the dot, not a red badge. */
+        .site-wp-version.insecure { color: var(--text-dim); }
+        .site-wp-version.insecure::after { content: "●"; margin-left: 0.25rem; color: var(--pill-warn-fg, #d08c30); font-size: 0.6em; vertical-align: middle; }
         .site-type.wp { background: var(--pill-wp-bg); color: var(--pill-wp-fg); }
         .site-type.static { background: var(--pill-static-bg); color: var(--pill-static-fg); }
+        /* Pinned-PHP chip: only rendered when a site is pinned off the default,
+           so the common case stays visually quiet. While a version change is
+           applying (or installing), the chip pulses with the target version. */
+        .site-php-version { font-family: var(--font-mono); font-size: 0.66rem; color: var(--text-faint); white-space: nowrap; border: 1px solid var(--panel-border); border-radius: var(--radius-pill); padding: 0.05rem 0.45rem; }
+        .site-php-version.applying { border-color: var(--accent); color: var(--text-dim); animation: php-pulse 1.2s ease-in-out infinite; }
+        @keyframes php-pulse { 50% { opacity: 0.45; } }
         .site-modified { font-family: var(--font-mono); font-size: 0.8rem; color: var(--text-faint); min-width: 44px; text-align: right; }
         .site-size { font-family: var(--font-mono); font-size: 0.82rem; color: var(--text-dim); min-width: 64px; text-align: right; }
         .site-actions { display: flex; gap: 0.15rem; opacity: 0; transition: opacity 100ms; }
@@ -2723,14 +3170,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
         /* Pinned sites float to the top of the list. */
         .site-row.is-pinned .site-domain::before { content: '●'; color: var(--accent); font-size: 0.62rem; margin-right: 0.4rem; vertical-align: middle; opacity: 0.9; }
 
-        /* Row overflow trigger. Always rendered (not hover-gated) so the row's
-           actions are reachable by touch — Cove is explicitly used from phones
-           over Tailscale, where :hover never fires and the old text links were
-           therefore unreachable. */
-        .row-menu-btn { background: transparent; border: 0; color: var(--text-faint); cursor: pointer; font-size: 1rem; line-height: 1; padding: 0.15rem 0.4rem; border-radius: 6px; }
-        .row-menu-btn:hover, .row-menu-btn.active { color: var(--text); background: var(--panel-hover); }
-
-        /* Context menu — shared by right-click and the ⋯ button. */
+        /* Context menu — opened by clicking a row (right- or left-click). */
         .ctx-menu { position: fixed; z-index: 300; min-width: 190px; padding: 0.3rem; background: var(--panel); border: 1px solid var(--panel-border); border-radius: 10px; box-shadow: 0 12px 34px rgba(0,0,0,0.28); font-size: 0.85rem; }
         .ctx-title { padding: 0.35rem 0.6rem 0.45rem; font-family: var(--font-mono); font-size: 0.72rem; color: var(--text-faint); border-bottom: 1px solid var(--panel-border); margin-bottom: 0.25rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
         .ctx-item { display: flex; align-items: center; justify-content: space-between; gap: 1rem; width: 100%; background: transparent; border: 0; text-align: left; padding: 0.42rem 0.6rem; border-radius: 6px; color: var(--text); cursor: pointer; font: inherit; }
@@ -2768,6 +3208,12 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
         .refresh-btn.spinning { animation: spin 1s linear infinite; pointer-events: none; }
         @keyframes spin { to { transform: rotate(360deg); } }
 
+        /* Pop-in fade for banners, menus, modals, palette and snackbar.
+           Toggling display:none → visible replays the animation, so showing
+           an element is all it takes to get the fade. */
+        @keyframes cove-fade { from { opacity: 0; } }
+        .new-site-alert, .filter-chip, .add-row, .modal-backdrop, .ctx-menu, .palette-backdrop, .snackbar { animation: cove-fade 140ms ease; }
+
         /* Modal */
         .modal-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,0.55); display: grid; place-items: center; z-index: 80; padding: 1rem; }
         html[data-theme="light"] .modal-backdrop { background: rgba(20,20,18,0.35); }
@@ -2781,6 +3227,17 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
         .db-cred-value { color: var(--text); word-break: break-all; background: transparent; padding: 0; }
         .modal .modal-foot { margin-top: 1rem; display: flex; justify-content: space-between; align-items: center; color: var(--text-faint); font-family: var(--font-mono); font-size: 0.75rem; }
 
+        /* PHP version picker rows. Installed versions are one click; missing
+           ones are greyed but still actionable — clicking installs the brew
+           formula first, then pins. */
+        .php-options { display: flex; flex-direction: column; gap: 0.35rem; }
+        .php-option { display: flex; align-items: center; justify-content: space-between; gap: 1rem; width: 100%; background: var(--input-bg); border: 1px solid var(--panel-border); border-radius: var(--radius-md); padding: 0.55rem 0.9rem; color: var(--text); cursor: pointer; font-family: var(--font-mono); font-size: 0.85rem; text-align: left; transition: border-color 120ms, background 120ms; }
+        .php-option:hover { border-color: var(--accent); }
+        .php-option.current { border-color: var(--accent); background: var(--pill-wp-bg); cursor: default; }
+        .php-option.uninstalled .php-option-name { color: var(--text-faint); }
+        .php-option .php-option-meta { font-size: 0.72rem; color: var(--text-faint); }
+        .php-option:disabled { opacity: 0.65; cursor: default; }
+
         /* Wider variant for log output, which is unreadable at 540px. */
         .modal-wide { max-width: min(900px, 92vw); width: 900px; }
         .modal-title-dim { font-family: var(--font-mono); font-style: normal; font-size: 0.9rem; color: var(--text-faint); }
@@ -2792,9 +3249,8 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
         .log-pane { max-height: 55vh; overflow: auto; white-space: pre-wrap; word-break: break-word; font-size: 0.76rem !important; line-height: 1.5; }
 
         /* Snackbar */
-        /* Centered via auto margins + fit-content width, NOT transform — Alpine
-           writes transform inline during x-transition, which would wipe out a
-           translateX(-50%) centering and slide the snackbar in from the edge. */
+        /* Centered via auto margins + fit-content width — no transform needed,
+           so the fade animation can't interfere with positioning. */
         .snackbar { position: fixed; bottom: 1.5rem; left: 0; right: 0; margin-inline: auto; width: max-content; max-width: 90vw; display: flex; align-items: center; gap: 0.9rem; background: var(--text); color: var(--bg); padding: 0.7rem 1.15rem; border-radius: 10px; font-size: 0.88rem; z-index: 200; box-shadow: 0 10px 30px rgba(0,0,0,0.25); }
         .snackbar.error { background: var(--danger); color: white; }
         .snackbar-action { background: transparent; border: 0; padding: 0; color: inherit; font: inherit; font-weight: 600; text-decoration: underline; text-underline-offset: 2px; cursor: pointer; }
@@ -2814,7 +3270,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
         }
     </style>
 </head>
-<body x-data="dashboard" x-init="init()">
+<body>
     <div class="wrap">
         <nav class="nav">
             <a class="logo" href="/">
@@ -2838,10 +3294,10 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             </a>
             <div class="nav-services services">
                 <span class="dot" title="Caddy is serving this page — it's running">caddy</span>
-                <button type="button" class="dot link" @click="showDbModal = true" title="Database credentials">mariadb</button>
-                <a class="dot link" :href="mailpitUrl" target="_blank" rel="noopener" title="Open Mailpit">mailpit</a>
+                <button type="button" id="btnDbDot" class="dot link" title="Database credentials">mariadb</button>
+                <a class="dot link" href="https://mail.cove.localhost<?= $__cove_port_suffix ?>" target="_blank" rel="noopener" title="Open Mailpit">mailpit</a>
             </div>
-            <button class="theme-btn" @click="toggleTheme()" :title="theme === 'light' ? 'Switch to dark mode' : 'Switch to light mode'" aria-label="Toggle theme">
+            <button class="theme-btn" id="btnTheme" title="Toggle theme" aria-label="Toggle theme">
                 <svg class="icon-moon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13.5 9.2A5.5 5.5 0 0 1 6.8 2.5a5.75 5.75 0 1 0 6.7 6.7Z"/></svg>
                 <svg class="icon-sun" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="8" cy="8" r="3"/><path d="M8 1.5v1.8M8 12.7v1.8M2.6 2.6l1.3 1.3M12.1 12.1l1.3 1.3M1.5 8h1.8M12.7 8h1.8M2.6 13.4l1.3-1.3M12.1 3.9l1.3-1.3"/></svg>
             </button>
@@ -2859,105 +3315,102 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                         <svg class="pill-icon" width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="4" width="12" height="9" rx="1.5"/><path d="M2.5 5 8 9l5.5-4"/></svg>
                         mail
                     </a>
-                    <button class="pill primary" @click="toggleAdd()" x-text="adding ? 'cancel' : '+ add site'"></button>
+                    <button class="pill primary" id="btnToggleAdd">+ add site</button>
                 </div>
             </header>
 
-            <template x-for="alert in alerts" :key="alert.id">
-                <div class="new-site-alert" x-transition.opacity>
+            <div id="alerts"></div>
+            <template id="tpl-alert">
+                <div class="new-site-alert">
                     <span class="new-site-alert-icon" aria-hidden="true">
                         <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 8.2l3 3 7-7"/></svg>
                     </span>
                     <div class="new-site-alert-text">
-                        <strong x-text="alert.name + '.localhost'"></strong> is ready.
+                        <strong></strong> is ready.
                     </div>
-                    <template x-if="!alert.isPlain">
-                        <button class="pill primary" :disabled="alert.isLoggingIn" @click="loginToNewSite(alert)" x-text="alert.isLoggingIn ? 'opening…' : 'log in to admin'"></button>
-                    </template>
-                    <template x-if="alert.isPlain">
-                        <a class="pill primary" :href="'https://' + alert.name + '.localhost' + PORT_SUFFIX" target="_blank" rel="noopener" @click="dismissAlert(alert.id)">open site</a>
-                    </template>
-                    <button class="new-site-alert-close" @click="dismissAlert(alert.id)" aria-label="Dismiss" title="Dismiss">×</button>
+                    <button class="pill primary alert-login">log in to admin</button>
+                    <a class="pill primary alert-open" target="_blank" rel="noopener">open site</a>
+                    <button class="new-site-alert-close" aria-label="Dismiss" title="Dismiss">×</button>
                 </div>
             </template>
 
             <div class="filter-row">
-                <span class="filter-chip" x-show="typeFilter" x-transition.opacity aria-label="Active type filter" style="display: none;">
-                    <span x-text="typeFilterLabel"></span>
-                    <button type="button" class="filter-chip-x" @click="typeFilter = null; $refs.filterInput.focus()" aria-label="Remove type filter" title="Remove">×</button>
+                <span class="filter-chip" id="typeChip" aria-label="Active type filter" style="display: none;">
+                    <span id="typeChipLabel"></span>
+                    <button type="button" class="filter-chip-x" id="typeChipClear" aria-label="Remove type filter" title="Remove">×</button>
                 </span>
                 <input
                     class="filter-input"
+                    id="filterInput"
                     type="text"
-                    x-model="filter"
-                    x-ref="filterInput"
                     placeholder="filter sites by name or type…"
                     spellcheck="false"
                     autocomplete="off"
                     autocapitalize="off"
                     autocorrect="off"
-                    @keydown.escape.prevent="filter = ''; $event.target.blur()"
                     aria-label="Filter sites"
                 >
                 <button
                     type="button"
                     class="bulk-delete-btn"
-                    :class="{ armed: bulkArmed }"
-                    x-show="(filter || typeFilter) && filteredSites.length > 0 && filteredSites.length < sites.length"
-                    @click="bulkDelete()"
-                    :title="'Delete every site matching the current filter'"
-                    x-text="bulkArmed ? ('sure? delete ' + filteredSites.length) : ('delete ' + filteredSites.length + ' shown')"
+                    id="btnBulkDelete"
+                    title="Delete every site matching the current filter"
                     style="display: none;"></button>
-                <span class="filter-kbd" x-show="!filter && !typeFilter" aria-hidden="true">/</span>
-                <button class="filter-clear" x-show="filter || typeFilter" @click="clearAllFilters(); $refs.filterInput.focus()" aria-label="Clear filter" title="Clear all (Esc)">×</button>
+                <span class="filter-kbd" id="filterKbd" aria-hidden="true">/</span>
+                <button class="filter-clear" id="btnFilterClear" aria-label="Clear filter" title="Clear all (Esc)" style="display: none;">×</button>
             </div>
 
-            <div x-show="adding" x-transition.opacity class="add-row" :class="{ 'is-creating': newSite.isLoading }" style="display: none;">
-                <form @submit.prevent="addSite()">
-                    <input type="text" x-model="newSite.name" @input="newSite.name = newSite.name.toLowerCase().replace(/[^a-z0-9-]/g, '')" placeholder="site-name" required :disabled="newSite.isLoading" x-ref="newSiteInput">
+            <div class="add-row" id="addRow" style="display: none;">
+                <form id="addForm">
+                    <input type="text" id="newSiteName" placeholder="site-name" required>
                     <label class="plain-toggle">
-                        <input type="checkbox" x-model="newSite.isPlain" :disabled="newSite.isLoading">
+                        <input type="checkbox" id="newSitePlain">
                         plain (no WordPress)
                     </label>
-                    <button class="pill primary" type="submit" :disabled="!newSite.name || newSite.isLoading">
-                        <span class="btn-spinner" x-show="newSite.isLoading" aria-hidden="true" style="display: none;"></span>
-                        <span x-text="newSite.isLoading ? 'creating…' : 'create'"></span>
+                    <select class="wp-version" id="wpVersionSelect" title="WordPress version to install" aria-label="WordPress version">
+                        <option value="latest">latest</option>
+                        <option value="nightly">nightly</option>
+                    </select>
+                    <button class="pill primary" type="submit" id="btnCreate" disabled>
+                        <span class="btn-spinner" id="createSpinner" aria-hidden="true" style="display: none;"></span>
+                        <span id="createLabel">create</span>
                     </button>
                 </form>
             </div>
 
-            <ul class="site-list">
-                <li class="site-head" x-show="!isLoading && filteredSites.length > 0">
-                    <button type="button" class="site-head-btn" :class="{ active: sort === 'name' }" @click="setSort('name')" title="Sort by name">name<span class="sort-arrow" x-text="sortArrow('name')"></span></button>
-                    <span class="site-head-label">type</span>
-                    <button type="button" class="site-head-btn site-head-right head-modified" :class="{ active: sort === 'modified' }" @click="setSort('modified')" title="Sort by last modified">modified<span class="sort-arrow" x-text="sortArrow('modified')"></span></button>
-                    <button type="button" class="site-head-btn site-head-right head-size" :class="{ active: sort === 'size' }" @click="setSort('size')" title="Sort by disk size">size<span class="sort-arrow" x-text="sortArrow('size')"></span></button>
+            <ul class="site-list" id="siteList">
+                <li class="site-head" id="siteHead" style="display: none;">
+                    <button type="button" class="site-head-btn" data-sort="name" title="Sort by name">name<span class="sort-arrow"></span></button>
+                    <button type="button" class="site-head-btn" data-sort="type" title="Sort by type">type<span class="sort-arrow"></span></button>
+                    <button type="button" class="site-head-btn site-head-right head-modified" data-sort="modified" title="Sort by last modified">modified<span class="sort-arrow"></span></button>
+                    <button type="button" class="site-head-btn site-head-right head-size" data-sort="size" title="Sort by disk size">size<span class="sort-arrow"></span></button>
                     <span aria-hidden="true"></span>
                 </li>
-                <template x-for="site in filteredSites" :key="site.name">
-                    <li class="site-row" :class="{ 'is-selected': selectedName === site.name, 'has-menu': ctxMenu.open && ctxMenu.site && ctxMenu.site.name === site.name, 'is-pinned': isPinned(site.name) }" @click="openSite(site)" @contextmenu.prevent="openRowMenu(site, $event)">
-                        <a class="site-domain" :href="site.domain" target="_blank" rel="noopener" @click.stop x-html="highlightedDomain(site.domain, filter)"></a>
-                        <span class="site-type" :class="site.type === 'WordPress' ? 'wp' : 'static'" @click.stop="typeFilter = site.type" :title="'Filter to ' + (site.type === 'WordPress' ? 'WordPress' : 'static') + ' sites'" x-text="site.type === 'WordPress' ? 'WP' : 'STATIC'"></span>
-                        <span class="site-modified" x-text="formatRelative(site.modified_at)" :title="site.modified_at ? new Date(site.modified_at * 1000).toLocaleString() : ''"></span>
-                        <span class="site-size" x-text="formatSize(site.size_bytes)"></span>
+                <template id="tpl-site-row">
+                    <li class="site-row">
+                        <span class="site-domain-cell">
+                            <span class="site-domain"></span>
+                            <a class="site-open-link" target="_blank" rel="noopener">
+                                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6.5 4.5h5v5"/><path d="M11.5 4.5 4.5 11.5"/></svg>
+                            </a>
+                        </span>
+                        <span class="site-type-cell">
+                            <span class="site-type"></span>
+                            <span class="site-wp-version"></span>
+                            <span class="site-php-version"></span>
+                        </span>
+                        <span class="site-modified"></span>
+                        <span class="site-size"></span>
                         <div class="site-actions">
-                            <template x-if="site.type === 'WordPress'">
-                                <button class="site-action-btn" :class="{ loading: site.isLoggingIn }" @click.stop="getLoginLink(site.name)" :disabled="site.isLoggingIn" :title="'One-time admin login for ' + site.name">
-                                    <span class="btn-label">login</span>
-                                    <span class="btn-spinner" aria-hidden="true"></span>
-                                </button>
-                            </template>
-                            <!-- Always rendered, unlike the hover-only links: this is the
-                                 only way the row's actions are reachable on touch. -->
-                            <button class="row-menu-btn" :class="{ active: ctxMenu.open && ctxMenu.site && ctxMenu.site.name === site.name }" @click.stop="openRowMenu(site, $event)" :aria-label="'Actions for ' + site.name" title="Actions">⋯</button>
+                            <button class="site-action-btn site-login-btn">
+                                <span class="btn-label">login</span>
+                                <span class="btn-spinner" aria-hidden="true"></span>
+                            </button>
                         </div>
                     </li>
                 </template>
-                <template x-if="isLoading">
-                    <li class="loading">Loading sites…</li>
-                </template>
-                <template x-if="!isLoading && sites.length === 0">
-                    <li class="empty">
+                <li class="loading" id="siteLoading">Loading sites…</li>
+                <li class="empty" id="emptyNone" style="display: none;">
                         <svg class="empty-art" viewBox="0 0 104 68" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                             <path class="art-fill" d="M52 12 L68 38 H52 Z"/>
                             <path class="art-line" d="M52 10 v30"/>
@@ -2967,12 +3420,10 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                             <path class="art-wave" d="M8 56 Q 15 52, 22 56 T 36 56 T 50 56 T 64 56 T 78 56 T 92 56"/>
                             <path class="art-wave" d="M20 62 Q 27 58, 34 62 T 48 62 T 62 62 T 76 62" opacity="0.35"/>
                         </svg>
-                        <div>No sites in the cove yet.</div>
-                        <div class="empty-hint">Click <em>+ add site</em>, or run <code>cove add myblog</code>.</div>
-                    </li>
-                </template>
-                <template x-if="!isLoading && sites.length > 0 && filteredSites.length === 0">
-                    <li class="empty">
+                    <div>No sites in the cove yet.</div>
+                    <div class="empty-hint">Click <em>+ add site</em>, or run <code>cove add myblog</code>.</div>
+                </li>
+                <li class="empty" id="emptyFilter" style="display: none;">
                         <svg class="empty-art" viewBox="0 0 104 68" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                             <path class="art-line" d="M52 44 v-14 q0 -6 6 -6 h4"/>
                             <path class="art-line" d="M62 18 h8 q3 0 3 3 v3 h-11 q-3 0 -3 -3 v-3 Z"/>
@@ -2982,23 +3433,22 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                             <path class="art-wave" d="M8 56 Q 15 52, 22 56 T 36 56 T 50 56 T 64 56 T 78 56 T 92 56"/>
                             <path class="art-wave" d="M20 62 Q 27 58, 34 62 T 48 62 T 62 62 T 76 62" opacity="0.35"/>
                         </svg>
-                        <div>Nothing surfaced for <code x-text="filter || typeFilterLabel"></code>.</div>
-                        <div class="empty-hint">Press Esc to clear.</div>
-                    </li>
-                </template>
+                    <div>Nothing surfaced for <code id="emptyFilterQuery"></code>.</div>
+                    <div class="empty-hint">Press Esc to clear.</div>
+                </li>
             </ul>
 
             <footer class="card-foot">
                 <div class="totals">
-                    <span x-text="siteCountLabel"></span>
-                    <span x-show="totalBytes > 0" x-text="'· ' + formatSize(totalBytes)"></span>
-                    <button type="button" class="refresh-btn" :class="{ spinning: isRefreshingSizes }" @click="refreshSizes()" :disabled="isRefreshingSizes" :title="isRefreshingSizes ? 'Refreshing…' : 'Refresh disk sizes'">↻</button>
+                    <span id="siteCount"></span>
+                    <span id="totalSize" style="display: none;"></span>
+                    <button type="button" class="refresh-btn" id="btnRefreshSizes" title="Refresh disk sizes">↻</button>
                 </div>
             </footer>
         </section>
     </div>
 
-    <div x-show="showDbModal" x-transition.opacity class="modal-backdrop" @click.self="showDbModal = false" @keydown.escape.window="showDbModal = false" style="display: none;">
+    <div class="modal-backdrop" id="dbModal" style="display: none;">
         <div class="modal">
             <h3>Database credentials</h3>
             <p class="modal-sub">Cove uses these to create new WordPress databases.</p>
@@ -3014,103 +3464,106 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             </div>
             <div class="modal-foot">
                 <span>stored in <?= htmlspecialchars(str_replace(getenv('HOME'), '~', $config_file)) ?></span>
-                <button class="pill" @click="showDbModal = false">close</button>
+                <button class="pill" id="btnDbClose">close</button>
             </div>
         </div>
     </div>
 
     <!-- Rename -->
-    <div x-show="rename.open" x-transition.opacity class="modal-backdrop" @click.self="rename.open = false" @keydown.escape.window="rename.open = false" style="display: none;">
+    <div class="modal-backdrop" id="renameModal" style="display: none;">
         <div class="modal">
             <h3>Rename site</h3>
             <p class="modal-sub">Renames the directory, the database, and the local URL. Any bookmark to the old address stops working.</p>
-            <form @submit.prevent="submitRename()">
-                <input class="modal-input" type="text" x-model="rename.value" x-ref="renameInput" spellcheck="false" autocomplete="off"
-                    placeholder="new-name" :disabled="rename.busy" @keydown.escape.prevent="rename.open = false">
-                <div class="modal-hint"><span x-text="rename.value ? rename.value + '.localhost' : '\u00a0'"></span></div>
+            <form id="renameForm">
+                <input class="modal-input" type="text" id="renameInput" spellcheck="false" autocomplete="off" placeholder="new-name">
+                <div class="modal-hint"><span id="renameHint">&nbsp;</span></div>
                 <div class="modal-actions">
-                    <button type="button" class="pill" @click="rename.open = false" :disabled="rename.busy">cancel</button>
-                    <button type="submit" class="pill primary" :disabled="rename.busy || !rename.value" x-text="rename.busy ? 'renaming…' : 'rename'"></button>
+                    <button type="button" class="pill" id="btnRenameCancel">cancel</button>
+                    <button type="submit" class="pill primary" id="btnRenameSubmit">rename</button>
                 </div>
             </form>
         </div>
     </div>
 
-    <!-- Site log -->
-    <div x-show="logView.open" x-transition.opacity class="modal-backdrop" @click.self="logView.open = false" @keydown.escape.window="logView.open = false" style="display: none;">
-        <div class="modal modal-wide">
-            <h3>Log <span class="modal-title-dim" x-text="logView.site"></span></h3>
-            <p class="modal-sub" x-show="logView.truncated">Showing the most recent 64KB.</p>
-            <pre class="log-pane" x-ref="logPane" x-text="logDisplay"></pre>
-            <div class="modal-actions">
-                <button type="button" class="pill" @click="logView.raw = !logView.raw" x-text="logView.raw ? 'formatted' : 'raw'"></button>
-                <button type="button" class="pill" @click="viewLog({ name: logView.site }, true)" :disabled="logView.busy">refresh</button>
-                <button type="button" class="pill primary" @click="logView.open = false">close</button>
+    <!-- PHP version picker -->
+    <div class="modal-backdrop" id="phpModal" style="display: none;">
+        <div class="modal">
+            <h3>PHP version <span class="modal-title-dim" id="phpModalSite"></span></h3>
+            <p class="modal-sub">Pinned sites run on a native Homebrew php-fpm behind FrankenPHP — TLS, logs and the URL stay the same.</p>
+            <div class="php-options" id="phpOptions"></div>
+            <template id="tpl-php-option">
+                <button type="button" class="php-option">
+                    <span class="php-option-name"></span>
+                    <span class="php-option-meta"></span>
+                </button>
+            </template>
+            <div class="modal-foot">
+                <span id="phpModalHint"></span>
+                <button class="pill" id="btnPhpClose">close</button>
             </div>
         </div>
     </div>
 
-    <!-- Context menu: one component driven by both right-click on a row and the
-         row's ⋯ button, so the two affordances can never drift apart. -->
-    <div x-show="ctxMenu.open" class="ctx-menu" :style="{ left: ctxMenu.x + 'px', top: ctxMenu.y + 'px' }" @click.outside="closeRowMenu()" x-transition.opacity.duration.100ms style="display: none;">
-        <template x-if="ctxMenu.site">
-            <div>
-                <div class="ctx-title" x-text="ctxMenu.site.domain.replace('https://','')"></div>
-                <button class="ctx-item" @click="openSite(ctxMenu.site); closeRowMenu()"><span>Open site</span><span class="ctx-key">↵</span></button>
-                <template x-if="ctxMenu.site.type === 'WordPress'">
-                    <button class="ctx-item" @click="getLoginLink(ctxMenu.site.name); closeRowMenu()"><span>Log in to admin</span><span class="ctx-key">⌘↵</span></button>
-                </template>
-                <div class="ctx-sep"></div>
-                <button class="ctx-item" @click="promptRename(ctxMenu.site); closeRowMenu()"><span>Rename…</span></button>
-                <button class="ctx-item" @click="revealSite(ctxMenu.site.name); closeRowMenu()"><span x-text="revealLabel"></span></button>
-                <template x-if="ctxMenu.site.type === 'WordPress'">
-                    <button class="ctx-item" @click="openSiteDb(ctxMenu.site); closeRowMenu()"><span>Open database</span></button>
-                </template>
-                <button class="ctx-item" @click="viewLog(ctxMenu.site); closeRowMenu()"><span>View log</span></button>
-                <div class="ctx-sep"></div>
-                <button class="ctx-item" @click="copyPath(ctxMenu.site.full_path); closeRowMenu()"><span>Copy path</span></button>
-                <button class="ctx-item" @click="togglePin(ctxMenu.site.name); closeRowMenu()"><span x-text="isPinned(ctxMenu.site.name) ? 'Unpin from top' : 'Pin to top'"></span></button>
-                <div class="ctx-sep"></div>
-                <button class="ctx-item danger" @click="deleteSite(ctxMenu.site.name); closeRowMenu()"><span>Delete site</span><span class="ctx-key">⌘⌫</span></button>
+    <!-- Site log -->
+    <div class="modal-backdrop" id="logModal" style="display: none;">
+        <div class="modal modal-wide">
+            <h3>Log <span class="modal-title-dim" id="logTitle"></span></h3>
+            <p class="modal-sub" id="logTruncated" style="display: none;">Showing the most recent 64KB.</p>
+            <pre class="log-pane" id="logPane"></pre>
+            <div class="modal-actions">
+                <button type="button" class="pill" id="btnLogRaw">raw</button>
+                <button type="button" class="pill" id="btnLogRefresh">refresh</button>
+                <button type="button" class="pill primary" id="btnLogClose">close</button>
             </div>
-        </template>
+        </div>
+    </div>
+
+    <!-- Context menu: one component driven by right- OR left-click anywhere on
+         a row, so the two affordances can never drift apart. Opening the site
+         itself lives on the row's ↗ icon. -->
+    <div class="ctx-menu" id="ctxMenu" style="display: none;">
+        <div>
+            <div class="ctx-title" id="ctxTitle"></div>
+            <button class="ctx-item" id="ctxOpen"><span>Open site</span><span class="ctx-key">↵</span></button>
+            <button class="ctx-item" id="ctxLogin"><span>Log in to admin</span><span class="ctx-key">⌘↵</span></button>
+            <div class="ctx-sep"></div>
+            <button class="ctx-item" id="ctxRename"><span>Rename…</span></button>
+            <button class="ctx-item" id="ctxReveal"><span>Open folder</span></button>
+            <button class="ctx-item" id="ctxDb"><span>Open database</span></button>
+            <button class="ctx-item" id="ctxPhp"><span>PHP version…</span><span class="ctx-key" id="ctxPhpMeta"></span></button>
+            <button class="ctx-item" id="ctxLog"><span>View log</span></button>
+            <div class="ctx-sep"></div>
+            <button class="ctx-item" id="ctxCopy"><span>Copy path</span></button>
+            <button class="ctx-item" id="ctxPin"><span>Pin to top</span></button>
+            <div class="ctx-sep"></div>
+            <button class="ctx-item danger" id="ctxDelete"><span>Delete site</span><span class="ctx-key">⌘⌫</span></button>
+        </div>
     </div>
 
     <!-- Command palette. Primary navigation once the list is longer than a
          screen, which on a real install it always is. -->
-    <div x-show="palette.open" class="palette-backdrop" @click.self="closePalette()" x-transition.opacity.duration.120ms style="display: none;">
+    <div class="palette-backdrop" id="paletteBackdrop" style="display: none;">
         <div class="palette">
-            <input class="palette-input" type="text" x-model="palette.query" x-ref="paletteInput"
+            <input class="palette-input" id="paletteInput" type="text"
                 placeholder="Search sites, or type a command…" spellcheck="false" autocomplete="off"
-                @keydown.arrow-down.prevent="paletteMove(1)"
-                @keydown.arrow-up.prevent="paletteMove(-1)"
-                @keydown.enter.prevent="paletteRun($event)"
-                @keydown.escape.prevent="closePalette()"
                 aria-label="Command palette">
-            <ul class="palette-list" x-ref="paletteList">
-                <template x-for="(item, i) in paletteResults" :key="item.key">
-                    <li class="palette-item" :class="{ active: i === palette.index }" @click="paletteRunItem(item)" @mouseenter="palette.index = i">
-                        <span class="pi-kind" x-text="item.kind"></span>
-                        <span class="pi-name" x-text="item.label"></span>
-                        <span class="pi-meta" x-text="item.meta"></span>
-                    </li>
-                </template>
-                <template x-if="paletteResults.length === 0">
-                    <li class="palette-empty">No matches.</li>
-                </template>
-            </ul>
+            <ul class="palette-list" id="paletteList"></ul>
+            <template id="tpl-palette-item">
+                <li class="palette-item">
+                    <span class="pi-kind"></span>
+                    <span class="pi-name"></span>
+                    <span class="pi-meta"></span>
+                </li>
+            </template>
             <div class="palette-hint">
                 <span>↑↓ navigate</span><span>↵ open</span><span>⌘↵ log in</span><span>esc close</span>
             </div>
         </div>
     </div>
 
-    <div x-show="snackbar.visible" x-transition.opacity.duration.200ms class="snackbar" :class="{ error: snackbar.isError }" style="display: none;">
-        <span x-text="snackbar.message"></span>
-        <!-- !! matters: x-show/@click expressions that RESULT in a function get
-             auto-invoked by Alpine, so a bare `snackbar.action` here would run
-             the undo handler on every render. -->
-        <button type="button" class="snackbar-action" x-show="!!snackbar.action" @click="if (snackbar.action) snackbar.action()" x-text="snackbar.actionLabel" style="display: none;"></button>
+    <div class="snackbar" id="snackbar" style="display: none;">
+        <span id="snackMsg"></span>
+        <button type="button" class="snackbar-action" id="snackAction" style="display: none;"></button>
     </div>
 
     <script>
@@ -3119,793 +3572,1486 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
         // Adminer needs the username to deep-link straight into a site's schema.
         const DB_USER = '<?= htmlspecialchars($config_data['DB_USER'] ?? '', ENT_QUOTES) ?>';
 
-        document.addEventListener('alpine:init', () => {
-            Alpine.data('dashboard', () => ({
-                // Respect the OS theme preference on first visit, dark otherwise.
-                theme: localStorage.getItem('theme') || (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark'),
-                sites: [],
-                isLoading: true,
-                adding: false,
-                showDbModal: false,
-                isRefreshingSizes: false,
-                filter: '',
-                typeFilter: null, // null | 'WordPress' | 'Plain' — set via the row type pills, cleared via the chip × or overall filter clear
-                // Default to most-recently-modified rather than alphabetical: on an
-                // install with hundreds of sites, "what was I just working on" is a
-                // far better landing state than "what starts with A".
-                sort: ['name', 'size', 'modified'].includes(localStorage.getItem('sort')) ? localStorage.getItem('sort') : 'modified',
-                sortDir: ['asc', 'desc'].includes(localStorage.getItem('sortDir')) ? localStorage.getItem('sortDir') : 'desc',
-                pinned: (() => { try { return JSON.parse(localStorage.getItem('pinned')) || []; } catch (e) { return []; } })(),
-                selectedName: null,
-                ctxMenu: { open: false, site: null, x: 0, y: 0 },
-                palette: { open: false, query: '', index: 0 },
-                rename: { open: false, site: null, value: '', busy: false },
-                logView: { open: false, site: '', text: '', truncated: false, busy: false, raw: false },
-                _initialised: false,
-                newSite: { name: '', isPlain: false, isLoading: false },
-                snackbar: { visible: false, message: '', isError: false, timer: null, action: null, actionLabel: '' },
-                // Deletes are staged for a short undo window before anything is
-                // sent to the backend. One batch at a time; staging more sites
-                // merges into it and restarts the window.
-                pendingDelete: null, // { sites: [...], timer }
-                bulkArmed: false,
-                bulkArmTimer: null,
-                // Persistent dismissible banners for newly-created sites — the
-                // snackbar only lives ~3.5s, not long enough to reach for the
-                // admin login after spinning up a fresh install.
-                alerts: [],
-                deleteQueue: [],
-                isProcessingQueue: false,
+        // No framework: state lives on `app`, and every method that mutates
+        // state ends by calling render(). Renderers are idempotent and only
+        // write DOM they own — crucially they never write input values, so
+        // typing never fights the renderer; inputs push into state via their
+        // own listeners and open()-style methods set values explicitly.
+        const $id = (id) => document.getElementById(id);
+        const show = (el, on) => { if (el) el.style.display = on ? '' : 'none'; };
 
-                get adminerUrl() { return 'https://db.cove.localhost' + PORT_SUFFIX; },
-                get mailpitUrl() { return 'https://mail.cove.localhost' + PORT_SUFFIX; },
-                get totalBytes() { return this.sites.reduce((t, s) => t + (s.size_bytes || 0), 0); },
-                get filteredSites() {
-                    // Two independent filters ANDed together: typeFilter (chip,
-                    // exact match on site.type) and filter (free text, substring
-                    // match on name OR type). Keeping them separate means the
-                    // user can type anything in the input without worrying about
-                    // stepping on the type constraint.
-                    let base = [...this.sites];
-                    if (this.typeFilter) {
-                        base = base.filter(s => s.type === this.typeFilter);
-                    }
-                    const q = this.filter.trim().toLowerCase();
-                    if (q) {
-                        base = base.filter(s =>
-                            s.name.toLowerCase().includes(q) ||
-                            (s.type || '').toLowerCase().includes(q));
-                    }
-                    const dir = this.sortDir === 'asc' ? 1 : -1;
-                    if (this.sort === 'size') {
-                        base.sort((a, b) => dir * ((a.size_bytes || 0) - (b.size_bytes || 0)));
-                    } else if (this.sort === 'modified') {
-                        base.sort((a, b) => dir * ((a.modified_at || 0) - (b.modified_at || 0)));
-                    } else {
-                        base.sort((a, b) => dir * a.name.localeCompare(b.name));
-                    }
-                    // Pinned sites float above the chosen sort rather than replacing
-                    // it: out of hundreds of sites only a handful are ever active.
-                    if (this.pinned.length) {
-                        base.sort((a, b) => (this.pinned.includes(b.name) ? 1 : 0) - (this.pinned.includes(a.name) ? 1 : 0));
-                    }
-                    return base;
-                },
+        const app = {
+            // Respect the OS theme preference on first visit, dark otherwise.
+            theme: localStorage.getItem('theme') || (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark'),
+            sites: [],
+            isLoading: true,
+            adding: false,
+            showDbModal: false,
+            isRefreshingSizes: false,
+            filter: '',
+            typeFilter: null, // null | 'WordPress' | 'Plain' — set via the row type pills, cleared via the chip × or overall filter clear
+            // Default to most-recently-modified rather than alphabetical: on an
+            // install with hundreds of sites, "what was I just working on" is a
+            // far better landing state than "what starts with A".
+            sort: ['name', 'type', 'size', 'modified'].includes(localStorage.getItem('sort')) ? localStorage.getItem('sort') : 'modified',
+            sortDir: ['asc', 'desc'].includes(localStorage.getItem('sortDir')) ? localStorage.getItem('sortDir') : 'desc',
+            pinned: (() => { try { return JSON.parse(localStorage.getItem('pinned')) || []; } catch (e) { return []; } })(),
+            selectedName: null,
+            ctxMenu: { open: false, site: null, x: 0, y: 0, openedAt: 0 },
+            palette: { open: false, query: '', index: 0 },
+            rename: { open: false, site: null, value: '', busy: false },
+            logView: { open: false, site: '', text: '', truncated: false, busy: false, raw: false },
+            phpModal: { open: false, site: null },
+            // { supported, default, versions: [{version, installed}] } — fetched
+            // lazily; null until loaded, refreshed after any pin change.
+            phpInfo: null,
+            phpInstallPoll: null,
+            // name → target version while a change is in flight. Kept separate
+            // from the site objects because getSites() rebuilds those from the
+            // server and would drop a flag stored on them mid-install.
+            phpApplying: {},
+            newSite: { name: '', isPlain: false, wpVersion: 'latest', isLoading: false },
+            // Populated lazily the first time the add row opens — no reason
+            // to hit wp.org on a page load that never creates a site. Stays
+            // empty when offline, leaving 'latest' and 'nightly' available.
+            wpVersions: [],
+            wpVersionsLoaded: false,
+            snackbar: { visible: false, message: '', isError: false, timer: null, action: null, actionLabel: '' },
+            // Deletes are staged for a short undo window before anything is
+            // sent to the backend. One batch at a time; staging more sites
+            // merges into it and restarts the window.
+            pendingDelete: null, // { sites: [...], timer }
+            bulkArmed: false,
+            bulkArmTimer: null,
+            // Persistent dismissible banners for newly-created sites — the
+            // snackbar only lives ~3.5s, not long enough to reach for the
+            // admin login after spinning up a fresh install.
+            alerts: [],
+            deleteQueue: [],
+            isProcessingQueue: false,
+            _paletteItems: [],
 
-                get typeFilterLabel() {
-                    return this.typeFilter === 'WordPress' ? 'type: wp' : 'type: static';
-                },
-
-                clearAllFilters() {
-                    this.filter = '';
-                    this.typeFilter = null;
-                },
-                get siteCountLabel() {
-                    const total = this.sites.length;
-                    const visible = this.filteredSites.length;
-                    const suffix = ' site' + (total === 1 ? '' : 's');
-                    return visible === total ? total + suffix : visible + ' of ' + total + suffix;
-                },
-
-                init() {
-                    if (this._initialised) return;
-                    this._initialised = true;
-
-                    this.applyTheme();
-                    this.$watch('theme', () => { this.applyTheme(); localStorage.setItem('theme', this.theme); });
-
-                    // An armed bulk-delete is scoped to the current result set —
-                    // disarm if the filter changes underneath it.
-                    this.$watch('filter', () => { this.bulkArmed = false; });
-                    this.$watch('typeFilter', () => { this.bulkArmed = false; });
-
-                    // If the tab closes during an undo window, flush the staged
-                    // deletes with keepalive requests so they aren't lost. No
-                    // reload_server here: the next reload from any source
-                    // regenerates from disk and prunes via tombstones.
-                    window.addEventListener('pagehide', () => {
-                        if (!this.pendingDelete) return;
-                        for (const s of this.pendingDelete.sites) {
-                            fetch('api.php', {
-                                method: 'POST',
-                                headers: { 'Content-Type': 'application/json' },
-                                body: JSON.stringify({ action: 'delete_site', site_name: s.name }),
-                                keepalive: true
-                            }).catch(() => {});
+            get adminerUrl() { return 'https://db.cove.localhost' + PORT_SUFFIX; },
+            get mailpitUrl() { return 'https://mail.cove.localhost' + PORT_SUFFIX; },
+            get totalBytes() { return this.sites.reduce((t, s) => t + (s.size_bytes || 0), 0); },
+            get filteredSites() {
+                // Two independent filters ANDed together: typeFilter (chip,
+                // exact match on site.type) and filter (free text, substring
+                // match on name OR type). Keeping them separate means the
+                // user can type anything in the input without worrying about
+                // stepping on the type constraint.
+                let base = [...this.sites];
+                if (this.typeFilter) {
+                    base = base.filter(s => s.type === this.typeFilter);
+                }
+                const q = this.filter.trim().toLowerCase();
+                if (q) {
+                    base = base.filter(s =>
+                        s.name.toLowerCase().includes(q) ||
+                        (s.type || '').toLowerCase().includes(q));
+                }
+                const dir = this.sortDir === 'asc' ? 1 : -1;
+                if (this.sort === 'size') {
+                    base.sort((a, b) => dir * ((a.size_bytes || 0) - (b.size_bytes || 0)));
+                } else if (this.sort === 'modified') {
+                    base.sort((a, b) => dir * ((a.modified_at || 0) - (b.modified_at || 0)));
+                } else if (this.sort === 'type') {
+                    // Version segments compare numerically so 6.10 outranks 6.9.
+                    // Plain sites have no wp_version and stay grouped together.
+                    const vcmp = (a, b) => {
+                        const pa = (a.wp_version || '').split('.'), pb = (b.wp_version || '').split('.');
+                        for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+                            const d = (parseInt(pa[i], 10) || 0) - (parseInt(pb[i], 10) || 0);
+                            if (d) return d;
                         }
-                        this.pendingDelete = null;
-                    });
-
-                    // `/` focuses the filter (GitHub-style). Ignored when typing
-                    // in a form field or holding a modifier key.
-                    window.addEventListener('keydown', (e) => {
-                        const el = document.activeElement;
-                        const tag = el && el.tagName;
-                        const typing = tag === 'INPUT' || tag === 'TEXTAREA' || (el && el.isContentEditable);
-
-                        // Cmd/Ctrl+K opens the palette from anywhere, including
-                        // from inside the filter box — it's the one shortcut that
-                        // should never be swallowed by a focused field.
-                        if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
-                            e.preventDefault();
-                            this.palette.open ? this.closePalette() : this.openPalette();
-                            return;
-                        }
-                        if (this.palette.open) return; // palette owns its own keys
-
-                        // Arrows work while filtering (type to narrow, arrow to pick).
-                        // j/k only outside a text field, or they'd eat typed letters.
-                        const isDown = e.key === 'ArrowDown' || (!typing && e.key === 'j');
-                        const isUp   = e.key === 'ArrowUp'   || (!typing && e.key === 'k');
-                        if ((isDown || isUp) && !e.metaKey && !e.ctrlKey && !e.altKey) {
-                            e.preventDefault();
-                            this.moveSelection(isDown ? 1 : -1);
-                            return;
-                        }
-
-                        if (e.key === 'Enter' && this.selectedName && !this.adding) {
-                            const site = this.selectedSite();
-                            if (!site) return;
-                            e.preventDefault();
-                            if ((e.metaKey || e.ctrlKey) && site.type === 'WordPress') {
-                                this.getLoginLink(site.name);
-                            } else {
-                                this.openSite(site);
-                            }
-                            return;
-                        }
-
-                        if ((e.metaKey || e.ctrlKey) && (e.key === 'Backspace' || e.key === 'Delete') && this.selectedName) {
-                            e.preventDefault();
-                            this.deleteSite(this.selectedName);
-                            return;
-                        }
-
-                        if (e.key === 'Escape') {
-                            if (this.ctxMenu.open) { this.closeRowMenu(); return; }
-                            if (this.selectedName && !typing) { this.selectedName = null; return; }
-                        }
-
-                        if (e.key === '/' && !e.ctrlKey && !e.metaKey && !e.altKey) {
-                            if (typing) return;
-                            e.preventDefault();
-                            this.$refs.filterInput && this.$refs.filterInput.focus();
-                        }
-                    });
-
-                    // A scroll or resize would leave the menu floating away from
-                    // the row it belongs to, so dismiss rather than reposition.
-                    window.addEventListener('scroll', () => { if (this.ctxMenu.open) this.closeRowMenu(); }, { passive: true });
-                    window.addEventListener('resize', () => { if (this.ctxMenu.open) this.closeRowMenu(); });
-
-                    this.getSites().then(() => {
-                        // If the size cache is empty (fresh install or just deleted),
-                        // kick off a background refresh so sizes populate without
-                        // making the user hunt for the ↻ button.
-                        if (this.sites.length > 0 && this.sites.every(s => s.size_bytes === null)) {
-                            this.refreshSizes();
-                        }
-                    });
-                },
-
-                applyTheme() {
-                    document.documentElement.dataset.theme = this.theme;
-                },
-
-                toggleTheme() {
-                    this.theme = this.theme === 'light' ? 'dark' : 'light';
-                },
-
-                toggleAdd() {
-                    this.adding = !this.adding;
-                    if (this.adding) {
-                        this.$nextTick(() => { if (this.$refs.newSiteInput) this.$refs.newSiteInput.focus(); });
-                    }
-                },
-
-                formatSize(bytes) {
-                    if (bytes === null || bytes === undefined) return '—';
-                    if (bytes === 0) return '0 B';
-                    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
-                    const i = Math.min(units.length - 1, Math.floor(Math.log(bytes) / Math.log(1024)));
-                    const v = bytes / Math.pow(1024, i);
-                    return (v >= 10 || i === 0 ? Math.round(v) : v.toFixed(1)) + ' ' + units[i];
-                },
-
-                formatRelative(ts) {
-                    if (!ts) return '—';
-                    const s = Math.max(0, Date.now() / 1000 - ts);
-                    if (s < 60) return 'now';
-                    if (s < 3600) return Math.floor(s / 60) + 'm';
-                    if (s < 86400) return Math.floor(s / 3600) + 'h';
-                    if (s < 86400 * 30) return Math.floor(s / 86400) + 'd';
-                    if (s < 86400 * 365) return Math.floor(s / 86400 / 30) + 'mo';
-                    return Math.floor(s / 86400 / 365) + 'y';
-                },
-
-                escapeHtml(s) {
-                    return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-                },
-
-                // Wrap every case-insensitive occurrence of `query` in <mark> while
-                // escaping every other substring. Safe for x-html use because the
-                // inner text comes from the trusted domain, not from query (query
-                // only controls WHERE to split).
-                highlightMatch(text, query) {
-                    const q = (query || '').trim();
-                    if (!q) return this.escapeHtml(text);
-                    const lower = text.toLowerCase();
-                    const lowerQ = q.toLowerCase();
-                    let out = '';
-                    let i = 0;
-                    while (i < text.length) {
-                        const idx = lower.indexOf(lowerQ, i);
-                        if (idx === -1) { out += this.escapeHtml(text.slice(i)); break; }
-                        out += this.escapeHtml(text.slice(i, idx));
-                        out += '<mark>' + this.escapeHtml(text.slice(idx, idx + q.length)) + '</mark>';
-                        i = idx + q.length;
-                    }
-                    return out;
-                },
-
-                // Wrap the site name in <span class="host-accent"> so it reads
-                // teal while the .localhost suffix stays dim — matches the
-                // landing-page dashboard mock. Split at the first dot; if
-                // there's none, the whole string is treated as the name.
-                highlightedDomain(domain, query) {
-                    const stripped = String(domain).replace(/^https?:\/\//, '');
-                    const dotIdx = stripped.indexOf('.');
-                    if (dotIdx === -1) return '<span class="host-accent">' + this.highlightMatch(stripped, query) + '</span>';
-                    const name = stripped.slice(0, dotIdx);
-                    const suffix = stripped.slice(dotIdx);
-                    return '<span class="host-accent">' + this.highlightMatch(name, query) + '</span>' + this.highlightMatch(suffix, query);
-                },
-
-                // --- Command palette -------------------------------------------
-                // Results mix matching sites with global commands. Sites are ranked
-                // by match position so a prefix hit beats a mid-string one.
-                get paletteResults() {
-                    const q = this.palette.query.trim().toLowerCase();
-                    const out = [];
-                    const commands = [
-                        { key: 'cmd:add',     kind: 'cmd', label: 'Add site',            meta: '',  run: () => { this.closePalette(); this.toggleAdd(); } },
-                        { key: 'cmd:reload',  kind: 'cmd', label: 'Reload server',       meta: '',  run: () => { this.closePalette(); this.reloadServer(); } },
-                        { key: 'cmd:sizes',   kind: 'cmd', label: 'Refresh disk sizes',  meta: '',  run: () => { this.closePalette(); this.refreshSizes(); } },
-                        { key: 'cmd:db',      kind: 'cmd', label: 'Open database',       meta: '',  run: () => { this.closePalette(); window.open('https://db.cove.localhost' + PORT_SUFFIX, '_blank', 'noopener'); } },
-                        { key: 'cmd:mail',    kind: 'cmd', label: 'Open Mailpit',        meta: '',  run: () => { this.closePalette(); window.open(this.mailpitUrl, '_blank', 'noopener'); } },
-                        { key: 'cmd:creds',   kind: 'cmd', label: 'Database credentials',meta: '',  run: () => { this.closePalette(); this.showDbModal = true; } },
-                        { key: 'cmd:theme',   kind: 'cmd', label: 'Toggle theme',        meta: '',  run: () => { this.closePalette(); this.toggleTheme(); } },
-                    ];
-                    let sites = this.sites;
-                    if (q) {
-                        sites = sites
-                            .map(s => ({ s, i: s.name.toLowerCase().indexOf(q) }))
-                            .filter(x => x.i !== -1)
-                            .sort((a, b) => a.i - b.i || a.s.name.localeCompare(b.s.name))
-                            .map(x => x.s);
-                    } else {
-                        // No query: show pinned first, then whatever the list is
-                        // sorted by, capped so the palette stays a menu not a dump.
-                        sites = this.filteredSites;
-                    }
-                    for (const site of sites.slice(0, 40)) {
-                        out.push({
-                            key: 'site:' + site.name,
-                            kind: site.type === 'WordPress' ? 'wp' : 'static',
-                            label: site.name + '.localhost',
-                            meta: this.formatSize(site.size_bytes),
-                            site,
-                            run: () => { this.closePalette(); this.openSite(site); }
-                        });
-                    }
-                    for (const c of commands) {
-                        if (!q || c.label.toLowerCase().includes(q)) out.push(c);
-                    }
-                    return out;
-                },
-
-                async reloadServer() {
-                    this.showSnack('Reloading server…');
-                    const res = await this.apiPostRetry('reload_server', {}, 3, 10000);
-                    if (res.success) this.showSnack('Server reloaded.');
-                },
-
-                // --- Row actions -----------------------------------------------
-                // macOS says "Finder"; everywhere else the file manager has no
-                // one name, so stay generic rather than lie about it.
-                get revealLabel() {
-                    return navigator.platform && navigator.platform.startsWith('Mac')
-                        ? 'Reveal in Finder' : 'Open folder';
-                },
-
-                promptRename(site) {
-                    this.rename = { open: true, site, value: site.name, busy: false };
-                    this.$nextTick(() => {
-                        const el = this.$refs.renameInput;
-                        if (el) { el.focus(); el.select(); }
-                    });
-                },
-
-                async submitRename() {
-                    const site = this.rename.site;
-                    const next = (this.rename.value || '').trim();
-                    if (!site || !next || next === site.name) { this.rename.open = false; return; }
-                    if (!/^[a-zA-Z0-9-]+$/.test(next)) {
-                        this.showSnack('Use letters, numbers and hyphens only.', true);
-                        return;
-                    }
-                    this.rename.busy = true;
-                    // Renaming rewrites the Caddyfile, so the response can land
-                    // mid-reload exactly like a delete does — same retry policy.
-                    const res = await this.apiPostRetry('rename_site', { site_name: site.name, new_name: next });
-                    this.rename.busy = false;
-                    if (!res.success) return;   // apiPost surfaced the reason
-                    this.rename.open = false;
-                    // Carry over UI state that is keyed by name, or a pinned site
-                    // would silently unpin itself on rename.
-                    if (this.isPinned(site.name)) {
-                        this.pinned = this.pinned.map(n => (n === site.name ? next : n));
-                        localStorage.setItem('pinned', JSON.stringify(this.pinned));
-                    }
-                    if (this.selectedName === site.name) this.selectedName = next;
-                    this.showSnack(res.message || 'Renamed.');
-                    await this.getSites();
-                },
-
-                async revealSite(name) {
-                    const res = await this.apiPost('reveal_site', { site_name: name });
-                    if (res.success) this.showSnack(res.message || 'Opened in the file manager.');
-                },
-
-                openSiteDb(site) {
-                    // Adminer takes the schema in the query string, so this lands
-                    // on the site's own tables instead of the server root.
-                    const url = this.adminerUrl + '/?username=' + encodeURIComponent(DB_USER) +
-                                '&db=' + encodeURIComponent(site.db_name || ('cove_' + site.name).replace(/[^a-zA-Z0-9_]/g, '_'));
-                    window.open(url, '_blank', 'noopener');
-                },
-
-                // Caddy writes one JSON object per line, which is unreadable as a
-                // wall of text. Fold each request down to the fields you'd
-                // actually scan for — time, status, method, path, duration —
-                // and leave anything that isn't a request line untouched.
-                get logDisplay() {
-                    if (this.logView.busy) return 'Loading…';
-                    const raw = this.logView.text || '';
-                    if (!raw) return 'No log entries yet.';
-                    if (this.logView.raw) return raw;
-                    const out = [];
-                    for (const line of raw.split('\n')) {
-                        const t = line.trim();
-                        if (!t) continue;
-                        if (t[0] !== '{') { out.push(t); continue; }
-                        let o;
-                        try { o = JSON.parse(t); } catch (e) { out.push(t); continue; }
-                        const req = o.request || {};
-                        if (!req.method) { out.push(o.msg ? (o.level || '') + ' ' + o.msg : t); continue; }
-                        const time = o.ts ? new Date(o.ts * 1000).toLocaleTimeString() : '';
-                        const status = o.status !== undefined ? String(o.status) : '';
-                        const dur = typeof o.duration === 'number' ? (o.duration * 1000).toFixed(0) + 'ms' : '';
-                        out.push([
-                            time,
-                            status.padEnd(3),
-                            (req.method || '').padEnd(6),
-                            req.uri || '',
-                            dur
-                        ].filter(Boolean).join('  '));
-                    }
-                    return out.join('\n') || 'No log entries yet.';
-                },
-
-                async viewLog(site, refresh = false) {
-                    this.logView = { open: true, site: site.name, text: refresh ? this.logView.text : '', truncated: false, busy: true };
-                    const res = await this.apiPost('site_log', { site_name: site.name });
-                    this.logView.busy = false;
-                    if (!res.success) { this.logView.open = false; return; }
-                    this.logView.text = res.log || '';
-                    this.logView.truncated = !!res.truncated;
-                    // Logs are read tail-first; jump to the newest lines.
-                    this.$nextTick(() => {
-                        const el = this.$refs.logPane;
-                        if (el) el.scrollTop = el.scrollHeight;
-                    });
-                },
-
-                openPalette() {
-                    this.palette.open = true;
-                    this.palette.query = '';
-                    this.palette.index = 0;
-                    this.closeRowMenu();
-                    this.$nextTick(() => this.$refs.paletteInput && this.$refs.paletteInput.focus());
-                },
-
-                closePalette() { this.palette.open = false; },
-
-                paletteMove(delta) {
-                    const n = this.paletteResults.length;
-                    if (!n) return;
-                    this.palette.index = (this.palette.index + delta + n) % n;
-                    this.$nextTick(() => {
-                        const list = this.$refs.paletteList;
-                        if (!list) return;
-                        const el = list.children[this.palette.index];
-                        if (el && el.scrollIntoView) el.scrollIntoView({ block: 'nearest' });
-                    });
-                },
-
-                paletteRun(event) {
-                    const item = this.paletteResults[this.palette.index];
-                    if (!item) return;
-                    // Cmd/Ctrl+Enter logs into a WordPress site instead of opening it.
-                    if (event && (event.metaKey || event.ctrlKey) && item.site && item.site.type === 'WordPress') {
-                        this.closePalette();
-                        this.getLoginLink(item.site.name);
-                        return;
-                    }
-                    item.run();
-                },
-
-                paletteRunItem(item) { item.run(); },
-
-                // --- Row context menu ------------------------------------------
-                openRowMenu(site, event) {
-                    // Clamp into the viewport so a right-click near the right or
-                    // bottom edge doesn't push the menu off-screen.
-                    const w = 200, h = 230;
-                    const x = Math.min(event.clientX, window.innerWidth - w - 8);
-                    const y = Math.min(event.clientY, window.innerHeight - h - 8);
-                    this.ctxMenu = { open: true, site, x: Math.max(8, x), y: Math.max(8, y) };
-                },
-
-                closeRowMenu() { this.ctxMenu.open = false; },
-
-                // --- Pinning ---------------------------------------------------
-                isPinned(name) { return this.pinned.includes(name); },
-
-                togglePin(name) {
-                    if (this.isPinned(name)) {
-                        this.pinned = this.pinned.filter(n => n !== name);
-                    } else {
-                        this.pinned = [...this.pinned, name];
-                    }
-                    localStorage.setItem('pinned', JSON.stringify(this.pinned));
-                },
-
-                // --- Keyboard list navigation ----------------------------------
-                moveSelection(delta) {
-                    const list = this.filteredSites;
-                    if (!list.length) return;
-                    const cur = list.findIndex(s => s.name === this.selectedName);
-                    let next = cur === -1 ? (delta > 0 ? 0 : list.length - 1) : cur + delta;
-                    next = Math.max(0, Math.min(list.length - 1, next));
-                    this.selectedName = list[next].name;
-                    this.$nextTick(() => {
-                        const rows = document.querySelectorAll('.site-row');
-                        const el = rows[next];
-                        if (el && el.scrollIntoView) el.scrollIntoView({ block: 'nearest' });
-                    });
-                },
-
-                selectedSite() {
-                    return this.filteredSites.find(s => s.name === this.selectedName) || null;
-                },
-
-                setSort(key) {
-                    // Click the active header to flip direction; a new key
-                    // starts at its natural default (a→z for name, biggest /
-                    // most recent first for size and modified).
-                    if (this.sort === key) {
-                        this.sortDir = this.sortDir === 'asc' ? 'desc' : 'asc';
-                    } else {
-                        this.sort = key;
-                        this.sortDir = key === 'name' ? 'asc' : 'desc';
-                    }
-                    localStorage.setItem('sort', this.sort);
-                    localStorage.setItem('sortDir', this.sortDir);
-                },
-
-                sortArrow(key) {
-                    if (this.sort !== key) return '';
-                    return this.sortDir === 'asc' ? '↑' : '↓';
-                },
-
-                openSite(site) {
-                    // Don't navigate when the click was part of a drag-to-select,
-                    // so users can still grab the domain/size text to copy.
-                    if (window.getSelection && window.getSelection().toString()) return;
-                    window.open(site.domain, '_blank', 'noopener');
-                },
-
-                showSnack(msg, isError = false, opts = {}) {
-                    if (this.snackbar.timer) clearTimeout(this.snackbar.timer);
-                    this.snackbar = {
-                        visible: true, message: msg, isError, timer: null,
-                        action: opts.action || null,
-                        actionLabel: opts.actionLabel || ''
+                        return 0;
                     };
-                    this.snackbar.timer = setTimeout(() => { this.snackbar.visible = false; }, opts.duration || 3500);
-                },
+                    base.sort((a, b) => dir * (a.type.localeCompare(b.type) || vcmp(a, b)) || a.name.localeCompare(b.name));
+                } else {
+                    base.sort((a, b) => dir * a.name.localeCompare(b.name));
+                }
+                // Pinned sites float above the chosen sort rather than replacing
+                // it: out of hundreds of sites only a handful are ever active.
+                if (this.pinned.length) {
+                    base.sort((a, b) => (this.pinned.includes(b.name) ? 1 : 0) - (this.pinned.includes(a.name) ? 1 : 0));
+                }
+                return base;
+            },
 
-                async apiPost(action, payload = {}, opts = {}) {
-                    const { timeoutMs = 0, quiet = false } = opts;
-                    const ctrl = timeoutMs ? new AbortController() : null;
-                    const timer = ctrl ? setTimeout(() => ctrl.abort(), timeoutMs) : null;
-                    try {
-                        const res = await fetch('api.php', {
+            get typeFilterLabel() {
+                return this.typeFilter === 'WordPress' ? 'type: wp' : 'type: static';
+            },
+
+            setTypeFilter(v) {
+                this.typeFilter = v;
+                // An armed bulk-delete is scoped to the current result set —
+                // disarm when the filter changes underneath it.
+                this.bulkArmed = false;
+                this.render();
+            },
+
+            clearAllFilters() {
+                this.filter = '';
+                $id('filterInput').value = '';
+                this.typeFilter = null;
+                this.bulkArmed = false;
+                this.render();
+            },
+
+            get siteCountLabel() {
+                const total = this.sites.length;
+                const visible = this.filteredSites.length;
+                const suffix = ' site' + (total === 1 ? '' : 's');
+                return visible === total ? total + suffix : visible + ' of ' + total + suffix;
+            },
+
+            init() {
+                this.applyTheme();
+                this.bindStaticEvents();
+                this.render();
+
+                // If the tab closes during an undo window, flush the staged
+                // deletes with keepalive requests so they aren't lost. No
+                // reload_server here: the next reload from any source
+                // regenerates from disk and prunes via tombstones.
+                window.addEventListener('pagehide', () => {
+                    if (!this.pendingDelete) return;
+                    for (const s of this.pendingDelete.sites) {
+                        fetch('api.php', {
                             method: 'POST',
                             headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({ action, ...payload }),
-                            ...(ctrl ? { signal: ctrl.signal } : {})
-                        }).then(r => r.json());
-                        if (!res.success && !quiet) this.showSnack(res.message || 'An error occurred.', true);
-                        return res;
-                    } catch (e) {
-                        // transport marks network-level failures (connection
-                        // dropped, timeout) as distinct from server-reported
-                        // errors — only these are worth retrying.
-                        if (!quiet) this.showSnack('Network error.', true);
-                        return { success: false, transport: true };
-                    } finally {
-                        if (timer) clearTimeout(timer);
+                            body: JSON.stringify({ action: 'delete_site', site_name: s.name }),
+                            keepalive: true
+                        }).catch(() => {});
                     }
-                },
+                    this.pendingDelete = null;
+                });
 
-                async apiPostRetry(action, payload = {}, attempts = 3, timeoutMs = 30000) {
-                    // The Caddy/FrankenPHP reload the dashboard triggers after
-                    // add/delete can momentarily drop or hang requests to the
-                    // dashboard itself. Retry transport failures a few times so
-                    // an action that lands mid-reload isn't silently lost.
-                    let res;
-                    for (let i = 1; i <= attempts; i++) {
-                        res = await this.apiPost(action, payload, { timeoutMs, quiet: i < attempts });
-                        if (res.success || !res.transport) return res;
-                        if (i < attempts) await new Promise(r => setTimeout(r, 3000));
+                // `/` focuses the filter (GitHub-style). Ignored when typing
+                // in a form field or holding a modifier key.
+                window.addEventListener('keydown', (e) => {
+                    const el = document.activeElement;
+                    const tag = el && el.tagName;
+                    const typing = tag === 'INPUT' || tag === 'TEXTAREA' || (el && el.isContentEditable);
+
+                    // Cmd/Ctrl+K opens the palette from anywhere, including
+                    // from inside the filter box — it's the one shortcut that
+                    // should never be swallowed by a focused field.
+                    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
+                        e.preventDefault();
+                        this.palette.open ? this.closePalette() : this.openPalette();
+                        return;
                     }
-                    return res;
-                },
+                    if (this.palette.open) {
+                        // Palette owns its own keys via its input's listeners;
+                        // catch Esc here too in case the input lost focus.
+                        if (e.key === 'Escape') this.closePalette();
+                        return;
+                    }
 
-                async getSites() {
-                    this.isLoading = true;
+                    // Arrows work while filtering (type to narrow, arrow to pick).
+                    // j/k only outside a text field, or they'd eat typed letters.
+                    const isDown = e.key === 'ArrowDown' || (!typing && e.key === 'j');
+                    const isUp   = e.key === 'ArrowUp'   || (!typing && e.key === 'k');
+                    if ((isDown || isUp) && !e.metaKey && !e.ctrlKey && !e.altKey) {
+                        e.preventDefault();
+                        this.moveSelection(isDown ? 1 : -1);
+                        return;
+                    }
+
+                    if (e.key === 'Enter' && this.selectedName && !this.adding) {
+                        const site = this.selectedSite();
+                        if (!site) return;
+                        e.preventDefault();
+                        if ((e.metaKey || e.ctrlKey) && site.type === 'WordPress') {
+                            this.getLoginLink(site.name);
+                        } else {
+                            this.openSite(site);
+                        }
+                        return;
+                    }
+
+                    if ((e.metaKey || e.ctrlKey) && (e.key === 'Backspace' || e.key === 'Delete') && this.selectedName) {
+                        e.preventDefault();
+                        this.deleteSite(this.selectedName);
+                        return;
+                    }
+
+                    if (e.key === 'Escape') {
+                        if (this.ctxMenu.open) { this.closeRowMenu(); return; }
+                        if (this.phpModal.open) { this.closePhpModal(); return; }
+                        if (this.rename.open) { this.closeRename(); return; }
+                        if (this.logView.open) { this.closeLog(); return; }
+                        if (this.showDbModal) { this.setDbModal(false); return; }
+                        if (this.selectedName && !typing) { this.selectedName = null; this.render(); return; }
+                    }
+
+                    if (e.key === '/' && !e.ctrlKey && !e.metaKey && !e.altKey) {
+                        if (typing) return;
+                        e.preventDefault();
+                        $id('filterInput').focus();
+                    }
+                });
+
+                // A scroll or resize would leave the menu floating away from
+                // the row it belongs to, so dismiss rather than reposition.
+                window.addEventListener('scroll', () => { if (this.ctxMenu.open) this.closeRowMenu(); }, { passive: true });
+                window.addEventListener('resize', () => { if (this.ctxMenu.open) this.closeRowMenu(); });
+
+                // Click anywhere outside the context menu dismisses it. The
+                // click that opened the menu also bubbles here, so skip it.
+                document.addEventListener('click', (e) => {
+                    if (!this.ctxMenu.open || e.timeStamp === this.ctxMenu.openedAt) return;
+                    if (!$id('ctxMenu').contains(e.target)) this.closeRowMenu();
+                });
+
+                // Non-blocking: the context menu's "php X.Y" meta and the
+                // platform-support check want this early, but nothing waits on it.
+                this.loadPhpInfo();
+
+                this.getSites().then(() => {
+                    // If the size cache is empty (fresh install or just deleted),
+                    // kick off a background refresh so sizes populate without
+                    // making the user hunt for the ↻ button.
+                    if (this.sites.length > 0 && this.sites.every(s => s.size_bytes === null)) {
+                        this.refreshSizes();
+                    }
+                });
+            },
+
+            // One-time listeners on elements that are never re-created. Row,
+            // alert, palette and menu clicks are delegated from their fixed
+            // containers, so rebuilding children never orphans a handler.
+            bindStaticEvents() {
+                $id('btnTheme').addEventListener('click', () => this.toggleTheme());
+                $id('btnDbDot').addEventListener('click', () => this.setDbModal(true));
+                $id('btnToggleAdd').addEventListener('click', () => this.toggleAdd());
+                $id('btnRefreshSizes').addEventListener('click', () => this.refreshSizes());
+                $id('btnDbClose').addEventListener('click', () => this.setDbModal(false));
+                $id('dbModal').addEventListener('click', (e) => { if (e.target === $id('dbModal')) this.setDbModal(false); });
+
+                // Filter row
+                const filterInput = $id('filterInput');
+                filterInput.addEventListener('input', () => {
+                    this.filter = filterInput.value;
+                    this.bulkArmed = false;
+                    this.render();
+                });
+                filterInput.addEventListener('keydown', (e) => {
+                    if (e.key === 'Escape') {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        this.filter = '';
+                        filterInput.value = '';
+                        this.bulkArmed = false;
+                        filterInput.blur();
+                        this.render();
+                    }
+                });
+                $id('typeChipClear').addEventListener('click', () => { this.setTypeFilter(null); filterInput.focus(); });
+                $id('btnFilterClear').addEventListener('click', () => { this.clearAllFilters(); filterInput.focus(); });
+                $id('btnBulkDelete').addEventListener('click', () => this.bulkDelete());
+
+                // Add-site form
+                const nameInput = $id('newSiteName');
+                nameInput.addEventListener('input', () => {
+                    const clean = nameInput.value.toLowerCase().replace(/[^a-z0-9-]/g, '');
+                    if (clean !== nameInput.value) nameInput.value = clean;
+                    this.newSite.name = clean;
+                    this.render();
+                });
+                $id('newSitePlain').addEventListener('change', (e) => {
+                    this.newSite.isPlain = e.target.checked;
+                    this.render();
+                });
+                $id('wpVersionSelect').addEventListener('change', (e) => { this.newSite.wpVersion = e.target.value; });
+                $id('addForm').addEventListener('submit', (e) => { e.preventDefault(); this.addSite(); });
+
+                // Sort headers
+                document.querySelectorAll('.site-head-btn[data-sort]').forEach(btn => {
+                    btn.addEventListener('click', () => this.setSort(btn.dataset.sort));
+                });
+
+                // Site rows: one delegated listener instead of per-row handlers.
+                // The ↗ icon is the only thing that opens the site; the type
+                // pill filters and the login button logs in; a click anywhere
+                // else on the row opens the context menu.
+                const list = $id('siteList');
+                list.addEventListener('click', (e) => {
+                    const row = e.target.closest('.site-row');
+                    if (!row) return;
+                    const site = this.sites.find(s => s.name === row.dataset.name);
+                    if (!site) return;
+                    if (e.target.closest('.site-open-link')) return; // plain link — let it navigate
+                    if (e.target.closest('.site-type')) { this.setTypeFilter(site.type); return; }
+                    if (e.target.closest('.site-login-btn')) { this.getLoginLink(site.name); return; }
+                    // Don't pop the menu when the click ends a drag-to-select —
+                    // users still grab the domain/size text to copy it.
+                    if (window.getSelection && window.getSelection().toString()) return;
+                    this.openRowMenu(site, e);
+                });
+                list.addEventListener('contextmenu', (e) => {
+                    const row = e.target.closest('.site-row');
+                    if (!row) return;
+                    const site = this.sites.find(s => s.name === row.dataset.name);
+                    if (!site) return;
+                    e.preventDefault();
+                    this.openRowMenu(site, e);
+                });
+
+                // New-site alerts (delegated)
+                $id('alerts').addEventListener('click', (e) => {
+                    const box = e.target.closest('.new-site-alert');
+                    if (!box) return;
+                    const alert = this.alerts.find(a => String(a.id) === box.dataset.id);
+                    if (!alert) return;
+                    if (e.target.closest('.alert-login')) { this.loginToNewSite(alert); return; }
+                    if (e.target.closest('.alert-open')) { this.dismissAlert(alert.id); return; } // link navigates itself
+                    if (e.target.closest('.new-site-alert-close')) this.dismissAlert(alert.id);
+                });
+
+                // Context menu items act on whichever site the menu was opened for.
+                const withCtxSite = (fn) => () => {
+                    const site = this.ctxMenu.site;
+                    this.closeRowMenu();
+                    if (site) fn(site);
+                };
+                $id('ctxOpen').addEventListener('click', withCtxSite(s => this.openSite(s)));
+                $id('ctxLogin').addEventListener('click', withCtxSite(s => this.getLoginLink(s.name)));
+                $id('ctxRename').addEventListener('click', withCtxSite(s => this.promptRename(s)));
+                $id('ctxReveal').addEventListener('click', withCtxSite(s => this.revealSite(s.name)));
+                $id('ctxDb').addEventListener('click', withCtxSite(s => this.openSiteDb(s)));
+                $id('ctxPhp').addEventListener('click', withCtxSite(s => this.openPhpModal(s)));
+                $id('ctxLog').addEventListener('click', withCtxSite(s => this.viewLog(s)));
+
+                // PHP version picker
+                $id('btnPhpClose').addEventListener('click', () => this.closePhpModal());
+                $id('phpModal').addEventListener('click', (e) => { if (e.target === $id('phpModal')) this.closePhpModal(); });
+                $id('phpOptions').addEventListener('click', (e) => {
+                    const btn = e.target.closest('.php-option');
+                    if (btn && !btn.disabled) this.choosePhp(btn.dataset.version);
+                });
+                $id('ctxCopy').addEventListener('click', withCtxSite(s => this.copyPath(s.full_path)));
+                $id('ctxPin').addEventListener('click', withCtxSite(s => this.togglePin(s.name)));
+                $id('ctxDelete').addEventListener('click', withCtxSite(s => this.deleteSite(s.name)));
+
+                // Command palette
+                const paletteInput = $id('paletteInput');
+                paletteInput.addEventListener('input', () => {
+                    this.palette.query = paletteInput.value;
+                    this.palette.index = 0;
+                    this.renderPalette();
+                });
+                paletteInput.addEventListener('keydown', (e) => {
+                    if (e.key === 'ArrowDown') { e.preventDefault(); this.paletteMove(1); }
+                    else if (e.key === 'ArrowUp') { e.preventDefault(); this.paletteMove(-1); }
+                    else if (e.key === 'Enter') { e.preventDefault(); this.paletteRun(e); }
+                    else if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); this.closePalette(); }
+                });
+                $id('paletteBackdrop').addEventListener('click', (e) => { if (e.target === $id('paletteBackdrop')) this.closePalette(); });
+                const paletteList = $id('paletteList');
+                paletteList.addEventListener('click', (e) => {
+                    const li = e.target.closest('.palette-item');
+                    if (li) this.paletteRunItem(this._paletteItems[Number(li.dataset.index)]);
+                });
+                paletteList.addEventListener('mouseover', (e) => {
+                    const li = e.target.closest('.palette-item');
+                    if (!li || Number(li.dataset.index) === this.palette.index) return;
+                    this.palette.index = Number(li.dataset.index);
+                    // Just move the highlight — a full re-render mid-hover would
+                    // reset scroll position in the list.
+                    paletteList.querySelectorAll('.palette-item').forEach(n =>
+                        n.classList.toggle('active', Number(n.dataset.index) === this.palette.index));
+                });
+
+                // Rename modal
+                const renameInput = $id('renameInput');
+                renameInput.addEventListener('input', () => {
+                    this.rename.value = renameInput.value;
+                    this.renderRename();
+                });
+                renameInput.addEventListener('keydown', (e) => {
+                    if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); this.closeRename(); }
+                });
+                $id('renameForm').addEventListener('submit', (e) => { e.preventDefault(); this.submitRename(); });
+                $id('btnRenameCancel').addEventListener('click', () => this.closeRename());
+                $id('renameModal').addEventListener('click', (e) => { if (e.target === $id('renameModal')) this.closeRename(); });
+
+                // Log modal
+                $id('btnLogRaw').addEventListener('click', () => { this.logView.raw = !this.logView.raw; this.renderLog(); });
+                $id('btnLogRefresh').addEventListener('click', () => this.viewLog({ name: this.logView.site }, true));
+                $id('btnLogClose').addEventListener('click', () => this.closeLog());
+                $id('logModal').addEventListener('click', (e) => { if (e.target === $id('logModal')) this.closeLog(); });
+
+                // Snackbar action (undo etc.)
+                $id('snackAction').addEventListener('click', () => { if (this.snackbar.action) this.snackbar.action(); });
+            },
+
+            // --- Rendering -------------------------------------------------
+            // Everything below reads state and writes DOM. Cheap enough to run
+            // wholesale after any state change: a few hundred rows rebuild in
+            // low single-digit milliseconds.
+            render() {
+                this.renderChrome();
+                this.renderAlerts();
+                this.renderList();
+                this.renderFooter();
+                this.renderCtxMenu();
+                this.renderModals();
+                if (this.palette.open) this.renderPalette();
+            },
+
+            renderChrome() {
+                $id('btnToggleAdd').textContent = this.adding ? 'cancel' : '+ add site';
+
+                // Filter row
+                const chip = $id('typeChip');
+                show(chip, !!this.typeFilter);
+                if (this.typeFilter) $id('typeChipLabel').textContent = this.typeFilterLabel;
+                const bulk = $id('btnBulkDelete');
+                const visible = this.filteredSites.length;
+                show(bulk, (this.filter || this.typeFilter) && visible > 0 && visible < this.sites.length);
+                bulk.classList.toggle('armed', this.bulkArmed);
+                bulk.textContent = this.bulkArmed ? ('sure? delete ' + visible) : ('delete ' + visible + ' shown');
+                show($id('filterKbd'), !this.filter && !this.typeFilter);
+                show($id('btnFilterClear'), this.filter || this.typeFilter);
+
+                // Add row
+                const addRow = $id('addRow');
+                show(addRow, this.adding);
+                addRow.classList.toggle('is-creating', this.newSite.isLoading);
+                $id('newSiteName').disabled = this.newSite.isLoading;
+                $id('newSitePlain').disabled = this.newSite.isLoading;
+                const sel = $id('wpVersionSelect');
+                show(sel, !this.newSite.isPlain);
+                sel.disabled = this.newSite.isLoading || this.newSite.isPlain;
+                $id('btnCreate').disabled = !this.newSite.name || this.newSite.isLoading;
+                show($id('createSpinner'), this.newSite.isLoading);
+                $id('createLabel').textContent = this.newSite.isLoading ? 'creating…' : 'create';
+
+                // Theme button tooltip tracks the mode it would switch to.
+                $id('btnTheme').title = this.theme === 'light' ? 'Switch to dark mode' : 'Switch to light mode';
+            },
+
+            renderAlerts() {
+                const wrap = $id('alerts');
+                wrap.querySelectorAll('.new-site-alert').forEach(n => n.remove());
+                const tpl = $id('tpl-alert');
+                for (const alert of this.alerts) {
+                    const node = tpl.content.firstElementChild.cloneNode(true);
+                    node.dataset.id = String(alert.id);
+                    node.querySelector('strong').textContent = alert.name + '.localhost';
+                    const login = node.querySelector('.alert-login');
+                    const open = node.querySelector('.alert-open');
+                    if (alert.isPlain) {
+                        login.remove();
+                        open.href = 'https://' + alert.name + '.localhost' + PORT_SUFFIX;
+                    } else {
+                        open.remove();
+                        login.disabled = alert.isLoggingIn;
+                        login.textContent = alert.isLoggingIn ? 'opening…' : 'log in to admin';
+                    }
+                    wrap.appendChild(node);
+                }
+            },
+
+            renderList() {
+                const list = $id('siteList');
+                const rows = this.filteredSites;
+                list.querySelectorAll('.site-row').forEach(n => n.remove());
+
+                show($id('siteHead'), !this.isLoading && rows.length > 0);
+                document.querySelectorAll('.site-head-btn[data-sort]').forEach(btn => {
+                    btn.classList.toggle('active', this.sort === btn.dataset.sort);
+                    btn.querySelector('.sort-arrow').textContent =
+                        this.sort === btn.dataset.sort ? (this.sortDir === 'asc' ? '↑' : '↓') : '';
+                });
+
+                show($id('siteLoading'), this.isLoading);
+                show($id('emptyNone'), !this.isLoading && this.sites.length === 0);
+                const emptyFilter = !this.isLoading && this.sites.length > 0 && rows.length === 0;
+                show($id('emptyFilter'), emptyFilter);
+                if (emptyFilter) $id('emptyFilterQuery').textContent = this.filter || this.typeFilterLabel;
+
+                const tpl = $id('tpl-site-row');
+                const anchor = $id('siteLoading'); // rows insert before the loading li to keep list order
+                for (const site of rows) {
+                    const row = tpl.content.firstElementChild.cloneNode(true);
+                    row.dataset.name = site.name;
+                    row.classList.toggle('is-selected', this.selectedName === site.name);
+                    row.classList.toggle('has-menu', this.ctxMenu.open && this.ctxMenu.site && this.ctxMenu.site.name === site.name);
+                    row.classList.toggle('is-pinned', this.isPinned(site.name));
+
+                    row.querySelector('.site-domain').innerHTML = this.highlightedDomain(site.domain, this.filter);
+                    const openLink = row.querySelector('.site-open-link');
+                    openLink.href = site.domain;
+                    openLink.title = 'Open ' + site.domain.replace('https://', '');
+
+                    const isWp = site.type === 'WordPress';
+                    const type = row.querySelector('.site-type');
+                    type.classList.add(isWp ? 'wp' : 'static');
+                    type.textContent = isWp ? 'WP' : 'STATIC';
+                    type.title = 'Filter to ' + (isWp ? 'WordPress' : 'static') + ' sites';
+
+                    const ver = row.querySelector('.site-wp-version');
+                    if (site.wp_version) {
+                        ver.textContent = site.wp_version;
+                        if (site.wp_status) ver.classList.add(site.wp_status);
+                        ver.title = site.wp_status === 'insecure'
+                            ? 'WordPress ' + site.wp_version + ' — wp.org marks this release insecure. Update with: cove core update ' + site.name
+                            : 'WordPress ' + site.wp_version;
+                    } else {
+                        ver.remove();
+                    }
+
+                    const php = row.querySelector('.site-php-version');
+                    const applying = this.phpApplying[site.name];
+                    if (applying) {
+                        php.classList.add('applying');
+                        php.textContent = applying === 'default' ? 'php default…' : 'php ' + applying + '…';
+                        php.title = 'Switching PHP version…';
+                    } else if (site.php_version) {
+                        php.textContent = 'php ' + site.php_version;
+                        php.title = 'Pinned to PHP ' + site.php_version + ' (native php-fpm). Change via the row menu.';
+                    } else {
+                        php.remove();
+                    }
+
+                    const mod = row.querySelector('.site-modified');
+                    mod.textContent = this.formatRelative(site.modified_at);
+                    mod.title = site.modified_at ? new Date(site.modified_at * 1000).toLocaleString() : '';
+                    row.querySelector('.site-size').textContent = this.formatSize(site.size_bytes);
+
+                    const login = row.querySelector('.site-login-btn');
+                    if (isWp) {
+                        login.classList.toggle('loading', !!site.isLoggingIn);
+                        login.disabled = !!site.isLoggingIn;
+                        login.title = 'One-time admin login for ' + site.name;
+                    } else {
+                        login.remove();
+                    }
+                    list.insertBefore(row, anchor);
+                }
+            },
+
+            renderFooter() {
+                $id('siteCount').textContent = this.siteCountLabel;
+                const totalEl = $id('totalSize');
+                show(totalEl, this.totalBytes > 0);
+                totalEl.textContent = '· ' + this.formatSize(this.totalBytes);
+                $id('btnRefreshSizes').classList.toggle('spinning', this.isRefreshingSizes);
+                $id('btnRefreshSizes').disabled = this.isRefreshingSizes;
+                $id('btnRefreshSizes').title = this.isRefreshingSizes ? 'Refreshing…' : 'Refresh disk sizes';
+            },
+
+            renderCtxMenu() {
+                const menu = $id('ctxMenu');
+                show(menu, this.ctxMenu.open);
+                const site = this.ctxMenu.site;
+                if (!this.ctxMenu.open || !site) return;
+                menu.style.left = this.ctxMenu.x + 'px';
+                menu.style.top = this.ctxMenu.y + 'px';
+                $id('ctxTitle').textContent = site.domain.replace('https://', '');
+                const isWp = site.type === 'WordPress';
+                show($id('ctxLogin'), isWp);
+                show($id('ctxDb'), isWp);
+                $id('ctxReveal').querySelector('span').textContent = this.revealLabel;
+                $id('ctxPin').querySelector('span').textContent = this.isPinned(site.name) ? 'Unpin from top' : 'Pin to top';
+                // Effective PHP as the item's meta; hide the item entirely on
+                // platforms where per-site pins aren't supported.
+                show($id('ctxPhp'), !this.phpInfo || this.phpInfo.supported !== false);
+                const effPhp = site.php_version || (this.phpInfo && this.phpInfo.default) || '';
+                $id('ctxPhpMeta').textContent = effPhp ? 'php ' + effPhp : '';
+            },
+
+            renderPhpModal() {
+                show($id('phpModal'), this.phpModal.open);
+                if (!this.phpModal.open) return;
+                const site = this.phpModal.site;
+                $id('phpModalSite').textContent = site.name + '.localhost';
+                const wrap = $id('phpOptions');
+                wrap.textContent = '';
+                const info = this.phpInfo;
+                if (!info) {
+                    const loading = document.createElement('div');
+                    loading.className = 'modal-hint';
+                    loading.textContent = 'Loading…';
+                    wrap.appendChild(loading);
+                    return;
+                }
+                // The pin may have changed since the menu opened — read the
+                // live site entry rather than the captured one.
+                const live = this.sites.find(s => s.name === site.name) || site;
+                const pin = live.php_version || null;
+                const tpl = $id('tpl-php-option');
+                const options = [{
+                    version: 'default',
+                    label: 'default — PHP ' + info.default,
+                    meta: pin ? 'FrankenPHP' : 'current · FrankenPHP',
+                    installed: true,
+                    current: !pin,
+                }];
+                for (const v of info.versions) {
+                    options.push({
+                        version: v.version,
+                        label: 'PHP ' + v.version,
+                        meta: pin === v.version ? 'current · php-fpm'
+                            : (v.installed ? 'installed' : 'not installed — click to install'),
+                        installed: v.installed,
+                        current: pin === v.version,
+                    });
+                }
+                const applying = this.phpApplying[site.name];
+                for (const o of options) {
+                    const btn = tpl.content.firstElementChild.cloneNode(true);
+                    btn.dataset.version = o.version;
+                    btn.classList.toggle('current', o.current);
+                    btn.classList.toggle('uninstalled', !o.installed);
+                    btn.disabled = !!applying || o.current;
+                    btn.querySelector('.php-option-name').textContent = o.label;
+                    btn.querySelector('.php-option-meta').textContent = o.meta;
+                    wrap.appendChild(btn);
+                }
+                // Only populated when the modal is reopened while a change is
+                // still in flight — the normal path closes the modal instantly
+                // and shows progress on the row chip instead.
+                $id('phpModalHint').textContent = applying
+                    ? 'Switching to ' + (applying === 'default' ? 'the default PHP' : 'PHP ' + applying) + '…'
+                    : '';
+            },
+
+            renderModals() {
+                show($id('dbModal'), this.showDbModal);
+                show($id('renameModal'), this.rename.open);
+                this.renderRename();
+                show($id('logModal'), this.logView.open);
+                this.renderLog();
+                this.renderPhpModal();
+            },
+
+            renderRename() {
+                if (!this.rename.open) return;
+                $id('renameInput').disabled = this.rename.busy;
+                $id('renameHint').textContent = this.rename.value ? this.rename.value + '.localhost' : ' ';
+                $id('btnRenameCancel').disabled = this.rename.busy;
+                const submit = $id('btnRenameSubmit');
+                submit.disabled = this.rename.busy || !this.rename.value;
+                submit.textContent = this.rename.busy ? 'renaming…' : 'rename';
+            },
+
+            renderLog() {
+                if (!this.logView.open) return;
+                $id('logTitle').textContent = this.logView.site;
+                show($id('logTruncated'), this.logView.truncated);
+                $id('logPane').textContent = this.logDisplay;
+                $id('btnLogRaw').textContent = this.logView.raw ? 'formatted' : 'raw';
+                $id('btnLogRefresh').disabled = this.logView.busy;
+            },
+
+            renderPalette() {
+                const backdrop = $id('paletteBackdrop');
+                show(backdrop, this.palette.open);
+                if (!this.palette.open) return;
+                const items = this.paletteResults;
+                this._paletteItems = items;
+                const list = $id('paletteList');
+                list.innerHTML = '';
+                const tpl = $id('tpl-palette-item');
+                items.forEach((item, i) => {
+                    const li = tpl.content.firstElementChild.cloneNode(true);
+                    li.dataset.index = String(i);
+                    li.classList.toggle('active', i === this.palette.index);
+                    li.querySelector('.pi-kind').textContent = item.kind;
+                    li.querySelector('.pi-name').textContent = item.label;
+                    li.querySelector('.pi-meta').textContent = item.meta;
+                    list.appendChild(li);
+                });
+                if (!items.length) {
+                    const empty = document.createElement('li');
+                    empty.className = 'palette-empty';
+                    empty.textContent = 'No matches.';
+                    list.appendChild(empty);
+                }
+            },
+
+            renderSnackbar() {
+                const bar = $id('snackbar');
+                show(bar, this.snackbar.visible);
+                bar.classList.toggle('error', this.snackbar.isError);
+                $id('snackMsg').textContent = this.snackbar.message;
+                const action = $id('snackAction');
+                show(action, !!this.snackbar.action);
+                action.textContent = this.snackbar.actionLabel;
+            },
+
+            // --- Behavior --------------------------------------------------
+            applyTheme() {
+                document.documentElement.dataset.theme = this.theme;
+            },
+
+            toggleTheme() {
+                this.theme = this.theme === 'light' ? 'dark' : 'light';
+                this.applyTheme();
+                localStorage.setItem('theme', this.theme);
+                this.renderChrome();
+            },
+
+            toggleAdd() {
+                this.adding = !this.adding;
+                this.render();
+                if (this.adding) {
+                    this.loadWpVersions();
+                    $id('newSiteName').focus();
+                }
+            },
+
+            // Fetched once per page load, and cached server-side for a day.
+            // Deliberately silent on failure: an offline machine should
+            // still be able to create a site, it just won't be offered a
+            // pinned version alongside 'latest' and 'nightly'.
+            async loadWpVersions() {
+                if (this.wpVersionsLoaded) return;
+                this.wpVersionsLoaded = true;
+                try {
+                    const res = await fetch('api.php?action=wp_versions');
+                    const data = await res.json();
+                    if (Array.isArray(data)) {
+                        this.wpVersions = data;
+                        // 'latest' and 'nightly' are hard-coded first options;
+                        // real versions append after them.
+                        const sel = $id('wpVersionSelect');
+                        for (const v of data) {
+                            const opt = document.createElement('option');
+                            opt.value = v.version;
+                            opt.textContent = v.version + (v.status === 'insecure' ? ' — insecure' : '');
+                            sel.appendChild(opt);
+                        }
+                    }
+                } catch (e) { /* offline — 'latest' still works */ }
+            },
+
+            formatSize(bytes) {
+                if (bytes === null || bytes === undefined) return '—';
+                if (bytes === 0) return '0 B';
+                const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+                const i = Math.min(units.length - 1, Math.floor(Math.log(bytes) / Math.log(1024)));
+                const v = bytes / Math.pow(1024, i);
+                return (v >= 10 || i === 0 ? Math.round(v) : v.toFixed(1)) + ' ' + units[i];
+            },
+
+            formatRelative(ts) {
+                if (!ts) return '—';
+                const s = Math.max(0, Date.now() / 1000 - ts);
+                if (s < 60) return 'now';
+                if (s < 3600) return Math.floor(s / 60) + 'm';
+                if (s < 86400) return Math.floor(s / 3600) + 'h';
+                if (s < 86400 * 30) return Math.floor(s / 86400) + 'd';
+                if (s < 86400 * 365) return Math.floor(s / 86400 / 30) + 'mo';
+                return Math.floor(s / 86400 / 365) + 'y';
+            },
+
+            escapeHtml(s) {
+                return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+            },
+
+            // Wrap every case-insensitive occurrence of `query` in <mark> while
+            // escaping every other substring. Safe for innerHTML use because the
+            // inner text comes from the trusted domain, not from query (query
+            // only controls WHERE to split).
+            highlightMatch(text, query) {
+                const q = (query || '').trim();
+                if (!q) return this.escapeHtml(text);
+                const lower = text.toLowerCase();
+                const lowerQ = q.toLowerCase();
+                let out = '';
+                let i = 0;
+                while (i < text.length) {
+                    const idx = lower.indexOf(lowerQ, i);
+                    if (idx === -1) { out += this.escapeHtml(text.slice(i)); break; }
+                    out += this.escapeHtml(text.slice(i, idx));
+                    out += '<mark>' + this.escapeHtml(text.slice(idx, idx + q.length)) + '</mark>';
+                    i = idx + q.length;
+                }
+                return out;
+            },
+
+            // Wrap the site name in <span class="host-accent"> so it reads
+            // teal while the .localhost suffix stays dim — matches the
+            // landing-page dashboard mock. Split at the first dot; if
+            // there's none, the whole string is treated as the name.
+            highlightedDomain(domain, query) {
+                const stripped = String(domain).replace(/^https?:\/\//, '');
+                const dotIdx = stripped.indexOf('.');
+                if (dotIdx === -1) return '<span class="host-accent">' + this.highlightMatch(stripped, query) + '</span>';
+                const name = stripped.slice(0, dotIdx);
+                const suffix = stripped.slice(dotIdx);
+                return '<span class="host-accent">' + this.highlightMatch(name, query) + '</span>' + this.highlightMatch(suffix, query);
+            },
+
+            // --- Command palette -------------------------------------------
+            // Results mix matching sites with global commands. Sites are ranked
+            // by match position so a prefix hit beats a mid-string one.
+            get paletteResults() {
+                const q = this.palette.query.trim().toLowerCase();
+                const out = [];
+                const commands = [
+                    { key: 'cmd:add',     kind: 'cmd', label: 'Add site',            meta: '',  run: () => { this.closePalette(); this.toggleAdd(); } },
+                    { key: 'cmd:reload',  kind: 'cmd', label: 'Reload server',       meta: '',  run: () => { this.closePalette(); this.reloadServer(); } },
+                    { key: 'cmd:sizes',   kind: 'cmd', label: 'Refresh disk sizes',  meta: '',  run: () => { this.closePalette(); this.refreshSizes(); } },
+                    { key: 'cmd:db',      kind: 'cmd', label: 'Open database',       meta: '',  run: () => { this.closePalette(); window.open('https://db.cove.localhost' + PORT_SUFFIX, '_blank', 'noopener'); } },
+                    { key: 'cmd:mail',    kind: 'cmd', label: 'Open Mailpit',        meta: '',  run: () => { this.closePalette(); window.open(this.mailpitUrl, '_blank', 'noopener'); } },
+                    { key: 'cmd:creds',   kind: 'cmd', label: 'Database credentials',meta: '',  run: () => { this.closePalette(); this.setDbModal(true); } },
+                    { key: 'cmd:theme',   kind: 'cmd', label: 'Toggle theme',        meta: '',  run: () => { this.closePalette(); this.toggleTheme(); } },
+                ];
+                let sites = this.sites;
+                if (q) {
+                    sites = sites
+                        .map(s => ({ s, i: s.name.toLowerCase().indexOf(q) }))
+                        .filter(x => x.i !== -1)
+                        .sort((a, b) => a.i - b.i || a.s.name.localeCompare(b.s.name))
+                        .map(x => x.s);
+                } else {
+                    // No query: show pinned first, then whatever the list is
+                    // sorted by, capped so the palette stays a menu not a dump.
+                    sites = this.filteredSites;
+                }
+                for (const site of sites.slice(0, 40)) {
+                    out.push({
+                        key: 'site:' + site.name,
+                        kind: site.type === 'WordPress' ? 'wp' : 'static',
+                        label: site.name + '.localhost',
+                        meta: this.formatSize(site.size_bytes),
+                        site,
+                        run: () => { this.closePalette(); this.openSite(site); }
+                    });
+                }
+                for (const c of commands) {
+                    if (!q || c.label.toLowerCase().includes(q)) out.push(c);
+                }
+                return out;
+            },
+
+            async reloadServer() {
+                this.showSnack('Reloading server…');
+                const res = await this.apiPostRetry('reload_server', {}, 3, 10000);
+                if (res.success) this.showSnack('Server reloaded.');
+            },
+
+            // --- Row actions -----------------------------------------------
+            // macOS says "Finder"; everywhere else the file manager has no
+            // one name, so stay generic rather than lie about it.
+            get revealLabel() {
+                return navigator.platform && navigator.platform.startsWith('Mac')
+                    ? 'Reveal in Finder' : 'Open folder';
+            },
+
+            setDbModal(on) {
+                this.showDbModal = on;
+                show($id('dbModal'), on);
+            },
+
+            promptRename(site) {
+                this.rename = { open: true, site, value: site.name, busy: false };
+                show($id('renameModal'), true);
+                this.renderRename();
+                const el = $id('renameInput');
+                el.value = site.name;
+                el.focus();
+                el.select();
+            },
+
+            closeRename() {
+                this.rename.open = false;
+                show($id('renameModal'), false);
+            },
+
+            async submitRename() {
+                const site = this.rename.site;
+                const next = (this.rename.value || '').trim();
+                if (!site || !next || next === site.name) { this.closeRename(); return; }
+                if (!/^[a-zA-Z0-9-]+$/.test(next)) {
+                    this.showSnack('Use letters, numbers and hyphens only.', true);
+                    return;
+                }
+                this.rename.busy = true;
+                this.renderRename();
+                // Renaming rewrites the Caddyfile, so the response can land
+                // mid-reload exactly like a delete does — same retry policy.
+                const res = await this.apiPostRetry('rename_site', { site_name: site.name, new_name: next });
+                this.rename.busy = false;
+                this.renderRename();
+                if (!res.success) return;   // apiPost surfaced the reason
+                this.closeRename();
+                // Carry over UI state that is keyed by name, or a pinned site
+                // would silently unpin itself on rename.
+                if (this.isPinned(site.name)) {
+                    this.pinned = this.pinned.map(n => (n === site.name ? next : n));
+                    localStorage.setItem('pinned', JSON.stringify(this.pinned));
+                }
+                if (this.selectedName === site.name) this.selectedName = next;
+                this.showSnack(res.message || 'Renamed.');
+                await this.getSites();
+            },
+
+            async revealSite(name) {
+                const res = await this.apiPost('reveal_site', { site_name: name });
+                if (res.success) this.showSnack(res.message || 'Opened in the file manager.');
+            },
+
+            openSiteDb(site) {
+                // Adminer takes the schema in the query string, so this lands
+                // on the site's own tables instead of the server root.
+                const url = this.adminerUrl + '/?username=' + encodeURIComponent(DB_USER) +
+                            '&db=' + encodeURIComponent(site.db_name || ('cove_' + site.name).replace(/[^a-zA-Z0-9_]/g, '_'));
+                window.open(url, '_blank', 'noopener');
+            },
+
+            // --- Per-site PHP version ---------------------------------------
+            loadPhpInfo(force = false) {
+                if (this.phpInfo && !force) return Promise.resolve(this.phpInfo);
+                return fetch('api.php?action=php_info')
+                    .then(r => r.json())
+                    .then(d => { this.phpInfo = d; return d; })
+                    .catch(() => null); // offline/mid-reload — the modal shows Loading… until retried
+            },
+
+            openPhpModal(site) {
+                this.phpModal = { open: true, site };
+                this.renderPhpModal();
+                // Refresh every open: an install may have finished since the
+                // last fetch, flipping a greyed row to clickable.
+                this.loadPhpInfo(true).then(() => this.renderPhpModal());
+            },
+
+            closePhpModal() {
+                this.phpModal.open = false;
+                show($id('phpModal'), false);
+            },
+
+            async choosePhp(version) {
+                const site = this.phpModal.site;
+                if (!site || !version || this.phpApplying[site.name]) return;
+                // Close immediately and show progress on the row itself — the
+                // pulsing chip is the status, not a modal spinner.
+                this.closePhpModal();
+                this.phpApplying[site.name] = version;
+                this.renderList();
+                // The server backgrounds the whole change (it reloads the very
+                // Caddy serving this dashboard), so this returns immediately
+                // and the poll below watches for the pin state to flip.
+                const res = await this.apiPostRetry('set_php', { site_name: site.name, php_version: version });
+                if (!res.success) {
+                    delete this.phpApplying[site.name];
+                    this.renderList();
+                    return; // apiPost surfaced the reason
+                }
+                if (!res.applying) {
+                    // Idempotent no-op: the site was already on the requested
+                    // version (e.g. a retried request that had already landed).
+                    delete this.phpApplying[site.name];
+                    this.renderList();
+                    return;
+                }
+                if (res.installing) {
+                    this.showSnack('Installing PHP ' + version + ' via Homebrew — this can take a few minutes…', false, { duration: 300000 });
+                }
+                this.startPhpPoll(site.name, version, res.installing ? 15 * 60 * 1000 : 90 * 1000);
+            },
+
+            startPhpPoll(name, version, timeoutMs) {
+                // The change runs detached server-side; the pin state flipping
+                // in list_sites is the completion signal. Polled with a raw
+                // fetch, not getSites(), so the visible list does not flash
+                // "Loading…" every few seconds — and a fetch that dies against
+                // the mid-reload server just polls again.
+                if (this.phpInstallPoll) clearInterval(this.phpInstallPoll);
+                const started = Date.now();
+                const wantPin = version === 'default' ? null : version;
+                this.phpInstallPoll = setInterval(async () => {
                     try {
                         const r = await fetch('api.php?action=list_sites');
                         const data = await r.json();
-                        // Sites staged for deletion are still on disk (nothing
-                        // is sent to the backend until the undo window closes),
-                        // so a refresh landing mid-window would re-add the rows
-                        // the user just deleted — and undo would then push a
-                        // second copy, duplicating the :key and breaking x-for.
-                        const staged = new Set(this.pendingDelete ? this.pendingDelete.sites.map(s => s.name) : []);
-                        this.sites = data
-                            .map(s => ({ ...s, isLoggingIn: false }))
-                            .filter(s => !staged.has(s.name));
-                    } catch (e) {
-                        this.showSnack('Could not fetch sites.', true);
-                    } finally {
-                        this.isLoading = false;
-                    }
-                },
-
-                async addSite() {
-                    if (!this.newSite.name) return;
-                    this.newSite.isLoading = true;
-                    const name = this.newSite.name;
-                    const isPlain = this.newSite.isPlain;
-
-                    const add = await this.apiPost('add_site', { site_name: name, is_plain: isPlain });
-                    if (add.success) {
-                        // Optimistic insert: we already know every field the row
-                        // template uses. No auto-refresh — the Caddy reload that
-                        // follows can take tens of seconds on fleets with lots of
-                        // sites and would either hang the fetch or drop the UI
-                        // into an ERR_CONNECTION_REFUSED during the config swap.
-                        this.sites.push({
-                            name,
-                            domain: 'https://' + name + '.localhost' + PORT_SUFFIX,
-                            type: isPlain ? 'Plain' : 'WordPress',
-                            display_path: '~/Cove/Sites/' + name + '.localhost',
-                            full_path: SITES_DIR + '/' + name + '.localhost',
-                            // Server calculates size in add_site and returns it
-                            // alongside success. Fall back to null so the row
-                            // shows "—" until the next refresh if anything failed.
-                            size_bytes: (typeof add.size_bytes === 'number') ? add.size_bytes : null,
-                            modified_at: Math.floor(Date.now() / 1000),
-                            isLoggingIn: false,
-                        });
-                        this.showSnack('Site created.');
-                        this.newSite.name = '';
-                        this.adding = false;
-                        this.apiPost('reload_server'); // fire and forget — Caddy reloads in the background
-
-                        // Surface a persistent alert so the user can jump
-                        // straight into the new site without hunting for the
-                        // row. WP sites get a one-time admin login; plain
-                        // sites get a simple "open site" link.
-                        this.alerts.push({
-                            id: Date.now() + Math.random(),
-                            name,
-                            isPlain,
-                            isLoggingIn: false,
-                        });
-                    }
-                    this.newSite.isLoading = false;
-                },
-
-                async loginToNewSite(alert) {
-                    alert.isLoggingIn = true;
-                    const res = await this.apiPost('get_login_link', { site_name: alert.name });
-                    if (res.success && res.url) {
-                        window.open(res.url, '_blank');
-                        // Acted on — banner's job is done. The new tab has the
-                        // one-time URL; dashboard can drop the prompt.
-                        this.dismissAlert(alert.id);
-                    }
-                    alert.isLoggingIn = false;
-                },
-
-                dismissAlert(id) {
-                    this.alerts = this.alerts.filter(a => a.id !== id);
-                },
-
-                deleteSite(name) {
-                    const site = this.sites.find(s => s.name === name);
-                    if (!site) return;
-                    this.stageDeletes([site]);
-                },
-
-                bulkDelete() {
-                    // Two-step inline confirm: first click arms the button for a
-                    // few seconds, second click stages every filtered site. The
-                    // undo snackbar is the safety net after that.
-                    if (!this.bulkArmed) {
-                        this.bulkArmed = true;
-                        this.bulkArmTimer = setTimeout(() => { this.bulkArmed = false; }, 3500);
-                        return;
-                    }
-                    clearTimeout(this.bulkArmTimer);
-                    this.bulkArmed = false;
-                    this.stageDeletes([...this.filteredSites]);
-                },
-
-                stageDeletes(sitesToDelete) {
-                    // Pull the rows from the list immediately (the UI feels
-                    // instant) but hold the backend work for an undo window.
-                    // Nothing is deleted server-side until the window passes.
-                    if (this.pendingDelete) clearTimeout(this.pendingDelete.timer);
-                    const staged = this.pendingDelete ? this.pendingDelete.sites : [];
-                    for (const site of sitesToDelete) {
-                        const idx = this.sites.findIndex(s => s.name === site.name);
-                        if (idx !== -1) { this.sites.splice(idx, 1); staged.push(site); }
-                    }
-                    if (!staged.length) { this.pendingDelete = null; return; }
-                    this.pendingDelete = {
-                        sites: staged,
-                        timer: setTimeout(() => this.commitPendingDeletes(), 5000)
-                    };
-                    const label = staged.length === 1
-                        ? 'Deleted ' + staged[0].name + '.'
-                        : 'Deleted ' + staged.length + ' sites.';
-                    this.showSnack(label, false, {
-                        actionLabel: 'undo',
-                        action: () => this.undoPendingDeletes(),
-                        duration: 5000
-                    });
-                },
-
-                commitPendingDeletes() {
-                    if (!this.pendingDelete) return;
-                    const names = this.pendingDelete.sites.map(s => s.name);
-                    this.pendingDelete = null;
-                    // processDeleteQueue drains the queue single-file so
-                    // concurrent deletes don't race on shared state (Caddyfile
-                    // regeneration, /etc/hosts edits).
-                    this.deleteQueue.push(...names);
-                    this.processDeleteQueue();
-                },
-
-                undoPendingDeletes() {
-                    if (!this.pendingDelete) return;
-                    clearTimeout(this.pendingDelete.timer);
-                    // filteredSites re-sorts on render, so push order is fine.
-                    this.sites.push(...this.pendingDelete.sites);
-                    this.pendingDelete = null;
-                    if (this.snackbar.timer) clearTimeout(this.snackbar.timer);
-                    this.snackbar.visible = false;
-                },
-
-                async processDeleteQueue() {
-                    // Single-flight runner: whichever call picks up the lock drains the
-                    // full queue. Concurrent deleteSite() calls just enqueue and return.
-                    if (this.isProcessingQueue) return;
-                    this.isProcessingQueue = true;
-
-                    let anyFailed = false;
-                    try {
-                        // Outer loop catches deletes queued while we were awaiting the
-                        // reload below — otherwise they'd sit forever because the next
-                        // deleteSite() call short-circuits on isProcessingQueue.
-                        while (this.deleteQueue.length > 0) {
-                            while (this.deleteQueue.length > 0) {
-                                const target = this.deleteQueue.shift();
-                                const del = await this.apiPostRetry('delete_site', { site_name: target });
-                                if (del.success) {
-                                    // Don't stomp a newer batch's undo snackbar
-                                    // with a routine confirmation.
-                                    if (!this.pendingDelete) this.showSnack('Site deleted.');
-                                } else {
-                                    anyFailed = true; // apiPost already surfaced the error
-                                }
-                            }
-                            // Kick a reload at the end of the batch. Race-safety
-                            // lives server-side: cove_reload() uses a mkdir lock
-                            // with a pending marker to coalesce concurrent calls,
-                            // since reload_server itself backgrounds the shell
-                            // command (shell_exec '...&') and returns instantly.
-                            // Two unsynchronized frankenphp reload calls otherwise
-                            // deadlock Caddy's admin server (10s shutdown timeout).
-                            await this.apiPostRetry('reload_server', {}, 3, 10000);
+                        const site = data.find(s => s.name === name);
+                        if (site && (site.php_version || null) === wantPin) {
+                            clearInterval(this.phpInstallPoll);
+                            this.phpInstallPoll = null;
+                            delete this.phpApplying[name];
+                            this.loadPhpInfo(true);
+                            await this.getSites();
+                            this.showSnack(wantPin
+                                ? name + '.localhost is now running PHP ' + version + '.'
+                                : name + '.localhost is back on Cove\'s default PHP.');
+                        } else if (Date.now() - started > timeoutMs) {
+                            clearInterval(this.phpInstallPoll);
+                            this.phpInstallPoll = null;
+                            delete this.phpApplying[name];
+                            this.renderList();
+                            this.showSnack('PHP change hasn\'t finished — check ~/Cove/cache/php-apply-' + name + '.log.', true, { duration: 8000 });
                         }
-                    } finally {
-                        this.isProcessingQueue = false;
-                    }
+                    } catch (e) { /* mid-reload — keep polling */ }
+                }, 3000);
+            },
 
-                    // If anything failed mid-queue the optimistic UI is now out of sync
-                    // with the backend (e.g. a survivor is missing from our list).
-                    // Cheapest correct fix: re-fetch the authoritative list.
-                    if (anyFailed) await this.getSites();
-                },
-
-                async getLoginLink(name) {
-                    const site = this.sites.find(s => s.name === name);
-                    if (!site) return;
-                    site.isLoggingIn = true;
-                    const res = await this.apiPost('get_login_link', { site_name: name });
-                    if (res.success && res.url) {
-                        window.open(res.url, '_blank');
-                        this.showSnack('Login link opened in a new tab.');
-                    }
-                    site.isLoggingIn = false;
-                },
-
-                async copyPath(path) {
-                    try {
-                        await navigator.clipboard.writeText(path);
-                        this.showSnack('Path copied to clipboard.');
-                    } catch (e) {
-                        this.showSnack('Could not copy path.', true);
-                    }
-                },
-
-                async refreshSizes() {
-                    this.isRefreshingSizes = true;
-                    const res = await this.apiPost('refresh_sizes');
-                    if (res.success) {
-                        await this.getSites();
-                        this.showSnack('Disk sizes updated.');
-                    }
-                    this.isRefreshingSizes = false;
+            // Caddy writes one JSON object per line, which is unreadable as a
+            // wall of text. Fold each request down to the fields you'd
+            // actually scan for — time, status, method, path, duration —
+            // and leave anything that isn't a request line untouched.
+            get logDisplay() {
+                if (this.logView.busy) return 'Loading…';
+                const raw = this.logView.text || '';
+                if (!raw) return 'No log entries yet.';
+                if (this.logView.raw) return raw;
+                const out = [];
+                for (const line of raw.split('\n')) {
+                    const t = line.trim();
+                    if (!t) continue;
+                    if (t[0] !== '{') { out.push(t); continue; }
+                    let o;
+                    try { o = JSON.parse(t); } catch (e) { out.push(t); continue; }
+                    const req = o.request || {};
+                    if (!req.method) { out.push(o.msg ? (o.level || '') + ' ' + o.msg : t); continue; }
+                    const time = o.ts ? new Date(o.ts * 1000).toLocaleTimeString() : '';
+                    const status = o.status !== undefined ? String(o.status) : '';
+                    const dur = typeof o.duration === 'number' ? (o.duration * 1000).toFixed(0) + 'ms' : '';
+                    out.push([
+                        time,
+                        status.padEnd(3),
+                        (req.method || '').padEnd(6),
+                        req.uri || '',
+                        dur
+                    ].filter(Boolean).join('  '));
                 }
-            }));
-        });
+                return out.join('\n') || 'No log entries yet.';
+            },
+
+            async viewLog(site, refresh = false) {
+                this.logView = { open: true, site: site.name, text: refresh ? this.logView.text : '', truncated: false, busy: true, raw: this.logView.raw };
+                show($id('logModal'), true);
+                this.renderLog();
+                const res = await this.apiPost('site_log', { site_name: site.name });
+                this.logView.busy = false;
+                if (!res.success) { this.closeLog(); return; }
+                this.logView.text = res.log || '';
+                this.logView.truncated = !!res.truncated;
+                this.renderLog();
+                // Logs are read tail-first; jump to the newest lines.
+                const el = $id('logPane');
+                el.scrollTop = el.scrollHeight;
+            },
+
+            closeLog() {
+                this.logView.open = false;
+                show($id('logModal'), false);
+            },
+
+            openPalette() {
+                this.palette.open = true;
+                this.palette.query = '';
+                this.palette.index = 0;
+                this.closeRowMenu();
+                $id('paletteInput').value = '';
+                this.renderPalette();
+                $id('paletteInput').focus();
+            },
+
+            closePalette() {
+                this.palette.open = false;
+                show($id('paletteBackdrop'), false);
+            },
+
+            paletteMove(delta) {
+                const n = this._paletteItems.length;
+                if (!n) return;
+                this.palette.index = (this.palette.index + delta + n) % n;
+                const list = $id('paletteList');
+                list.querySelectorAll('.palette-item').forEach(el =>
+                    el.classList.toggle('active', Number(el.dataset.index) === this.palette.index));
+                const el = list.children[this.palette.index];
+                if (el && el.scrollIntoView) el.scrollIntoView({ block: 'nearest' });
+            },
+
+            paletteRun(event) {
+                const item = this._paletteItems[this.palette.index];
+                if (!item) return;
+                // Cmd/Ctrl+Enter logs into a WordPress site instead of opening it.
+                if (event && (event.metaKey || event.ctrlKey) && item.site && item.site.type === 'WordPress') {
+                    this.closePalette();
+                    this.getLoginLink(item.site.name);
+                    return;
+                }
+                item.run();
+            },
+
+            paletteRunItem(item) { if (item) item.run(); },
+
+            // --- Row context menu ------------------------------------------
+            openRowMenu(site, event) {
+                // Show first, then clamp using the menu's real size — the item
+                // set varies by site type, so a guessed height either wastes
+                // margin or lets the bottom items land off-screen.
+                this.ctxMenu = { open: true, site, x: event.clientX, y: event.clientY, openedAt: event.timeStamp };
+                this.renderCtxMenu();
+                const rect = $id('ctxMenu').getBoundingClientRect();
+                this.ctxMenu.x = Math.max(8, Math.min(event.clientX, window.innerWidth - rect.width - 8));
+                this.ctxMenu.y = Math.max(8, Math.min(event.clientY, window.innerHeight - rect.height - 8));
+                this.renderCtxMenu();
+                this.renderList(); // row highlight
+            },
+
+            closeRowMenu() {
+                if (!this.ctxMenu.open) return;
+                this.ctxMenu.open = false;
+                show($id('ctxMenu'), false);
+                this.renderList();
+            },
+
+            // --- Pinning ---------------------------------------------------
+            isPinned(name) { return this.pinned.includes(name); },
+
+            togglePin(name) {
+                if (this.isPinned(name)) {
+                    this.pinned = this.pinned.filter(n => n !== name);
+                } else {
+                    this.pinned = [...this.pinned, name];
+                }
+                localStorage.setItem('pinned', JSON.stringify(this.pinned));
+                this.render();
+            },
+
+            // --- Keyboard list navigation ----------------------------------
+            moveSelection(delta) {
+                const list = this.filteredSites;
+                if (!list.length) return;
+                const cur = list.findIndex(s => s.name === this.selectedName);
+                let next = cur === -1 ? (delta > 0 ? 0 : list.length - 1) : cur + delta;
+                next = Math.max(0, Math.min(list.length - 1, next));
+                this.selectedName = list[next].name;
+                this.renderList();
+                const el = document.querySelectorAll('.site-row')[next];
+                if (el && el.scrollIntoView) el.scrollIntoView({ block: 'nearest' });
+            },
+
+            selectedSite() {
+                return this.filteredSites.find(s => s.name === this.selectedName) || null;
+            },
+
+            setSort(key) {
+                // Click the active header to flip direction; a new key
+                // starts at its natural default (a→z for name, biggest /
+                // most recent first for size and modified).
+                if (this.sort === key) {
+                    this.sortDir = this.sortDir === 'asc' ? 'desc' : 'asc';
+                } else {
+                    this.sort = key;
+                    this.sortDir = key === 'name' ? 'asc' : 'desc';
+                }
+                localStorage.setItem('sort', this.sort);
+                localStorage.setItem('sortDir', this.sortDir);
+                this.render();
+            },
+
+            openSite(site) {
+                // Don't navigate when the click was part of a drag-to-select,
+                // so users can still grab the domain/size text to copy.
+                if (window.getSelection && window.getSelection().toString()) return;
+                window.open(site.domain, '_blank', 'noopener');
+            },
+
+            showSnack(msg, isError = false, opts = {}) {
+                if (this.snackbar.timer) clearTimeout(this.snackbar.timer);
+                this.snackbar = {
+                    visible: true, message: msg, isError, timer: null,
+                    action: opts.action || null,
+                    actionLabel: opts.actionLabel || ''
+                };
+                this.snackbar.timer = setTimeout(() => { this.snackbar.visible = false; this.renderSnackbar(); }, opts.duration || 3500);
+                this.renderSnackbar();
+            },
+
+            async apiPost(action, payload = {}, opts = {}) {
+                const { timeoutMs = 0, quiet = false } = opts;
+                const ctrl = timeoutMs ? new AbortController() : null;
+                const timer = ctrl ? setTimeout(() => ctrl.abort(), timeoutMs) : null;
+                try {
+                    const res = await fetch('api.php', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ action, ...payload }),
+                        ...(ctrl ? { signal: ctrl.signal } : {})
+                    }).then(r => r.json());
+                    if (!res.success && !quiet) this.showSnack(res.message || 'An error occurred.', true);
+                    return res;
+                } catch (e) {
+                    // transport marks network-level failures (connection
+                    // dropped, timeout) as distinct from server-reported
+                    // errors — only these are worth retrying.
+                    if (!quiet) this.showSnack('Network error.', true);
+                    return { success: false, transport: true };
+                } finally {
+                    if (timer) clearTimeout(timer);
+                }
+            },
+
+            async apiPostRetry(action, payload = {}, attempts = 3, timeoutMs = 30000) {
+                // The Caddy/FrankenPHP reload the dashboard triggers after
+                // add/delete can momentarily drop or hang requests to the
+                // dashboard itself. Retry transport failures a few times so
+                // an action that lands mid-reload isn't silently lost.
+                let res;
+                for (let i = 1; i <= attempts; i++) {
+                    res = await this.apiPost(action, payload, { timeoutMs, quiet: i < attempts });
+                    if (res.success || !res.transport) return res;
+                    if (i < attempts) await new Promise(r => setTimeout(r, 3000));
+                }
+                return res;
+            },
+
+            async getSites() {
+                this.isLoading = true;
+                this.render();
+                try {
+                    const r = await fetch('api.php?action=list_sites');
+                    const data = await r.json();
+                    // Sites staged for deletion are still on disk (nothing
+                    // is sent to the backend until the undo window closes),
+                    // so a refresh landing mid-window would re-add the rows
+                    // the user just deleted — and undo would then push a
+                    // second copy of the same row.
+                    const staged = new Set(this.pendingDelete ? this.pendingDelete.sites.map(s => s.name) : []);
+                    this.sites = data
+                        .map(s => ({ ...s, isLoggingIn: false }))
+                        .filter(s => !staged.has(s.name));
+                } catch (e) {
+                    this.showSnack('Could not fetch sites.', true);
+                } finally {
+                    this.isLoading = false;
+                    this.render();
+                }
+            },
+
+            async addSite() {
+                if (!this.newSite.name) return;
+                this.newSite.isLoading = true;
+                this.render();
+                const name = this.newSite.name;
+                const isPlain = this.newSite.isPlain;
+                // 'latest' is the server's default, so it's sent as nothing
+                // at all — keeps the generated command identical to what a
+                // plain `cove add <name>` produces.
+                const wpVersion = isPlain ? '' : this.newSite.wpVersion;
+
+                const add = await this.apiPost('add_site', { site_name: name, is_plain: isPlain, wp_version: (wpVersion && wpVersion !== 'latest') ? wpVersion : undefined });
+                if (add.success) {
+                    // Optimistic insert: we already know every field the row
+                    // template uses. No auto-refresh — the Caddy reload that
+                    // follows can take tens of seconds on fleets with lots of
+                    // sites and would either hang the fetch or drop the UI
+                    // into an ERR_CONNECTION_REFUSED during the config swap.
+                    this.sites.push({
+                        name,
+                        domain: 'https://' + name + '.localhost' + PORT_SUFFIX,
+                        type: isPlain ? 'Plain' : 'WordPress',
+                        display_path: '~/Cove/Sites/' + name + '.localhost',
+                        full_path: SITES_DIR + '/' + name + '.localhost',
+                        // Server calculates size in add_site and returns it
+                        // alongside success. Fall back to null so the row
+                        // shows "—" until the next refresh if anything failed.
+                        size_bytes: (typeof add.size_bytes === 'number') ? add.size_bytes : null,
+                        modified_at: Math.floor(Date.now() / 1000),
+                        isLoggingIn: false,
+                    });
+                    this.showSnack('Site created.');
+                    this.newSite.name = '';
+                    $id('newSiteName').value = '';
+                    this.newSite.wpVersion = 'latest';
+                    $id('wpVersionSelect').value = 'latest';
+                    this.adding = false;
+                    this.apiPost('reload_server'); // fire and forget — Caddy reloads in the background
+
+                    // Surface a persistent alert so the user can jump
+                    // straight into the new site without hunting for the
+                    // row. WP sites get a one-time admin login; plain
+                    // sites get a simple "open site" link.
+                    this.alerts.push({
+                        id: Date.now() + Math.random(),
+                        name,
+                        isPlain,
+                        isLoggingIn: false,
+                    });
+                }
+                this.newSite.isLoading = false;
+                this.render();
+            },
+
+            async loginToNewSite(alert) {
+                alert.isLoggingIn = true;
+                this.renderAlerts();
+                const res = await this.apiPost('get_login_link', { site_name: alert.name });
+                if (res.success && res.url) {
+                    window.open(res.url, '_blank');
+                    // Acted on — banner's job is done. The new tab has the
+                    // one-time URL; dashboard can drop the prompt.
+                    this.dismissAlert(alert.id);
+                }
+                alert.isLoggingIn = false;
+                this.renderAlerts();
+            },
+
+            dismissAlert(id) {
+                this.alerts = this.alerts.filter(a => a.id !== id);
+                this.renderAlerts();
+            },
+
+            deleteSite(name) {
+                const site = this.sites.find(s => s.name === name);
+                if (!site) return;
+                this.stageDeletes([site]);
+            },
+
+            bulkDelete() {
+                // Two-step inline confirm: first click arms the button for a
+                // few seconds, second click stages every filtered site. The
+                // undo snackbar is the safety net after that.
+                if (!this.bulkArmed) {
+                    this.bulkArmed = true;
+                    this.bulkArmTimer = setTimeout(() => { this.bulkArmed = false; this.renderChrome(); }, 3500);
+                    this.renderChrome();
+                    return;
+                }
+                clearTimeout(this.bulkArmTimer);
+                this.bulkArmed = false;
+                this.stageDeletes([...this.filteredSites]);
+            },
+
+            stageDeletes(sitesToDelete) {
+                // Pull the rows from the list immediately (the UI feels
+                // instant) but hold the backend work for an undo window.
+                // Nothing is deleted server-side until the window passes.
+                if (this.pendingDelete) clearTimeout(this.pendingDelete.timer);
+                const staged = this.pendingDelete ? this.pendingDelete.sites : [];
+                for (const site of sitesToDelete) {
+                    const idx = this.sites.findIndex(s => s.name === site.name);
+                    if (idx !== -1) { this.sites.splice(idx, 1); staged.push(site); }
+                }
+                if (!staged.length) { this.pendingDelete = null; this.render(); return; }
+                this.pendingDelete = {
+                    sites: staged,
+                    timer: setTimeout(() => this.commitPendingDeletes(), 5000)
+                };
+                this.render();
+                const label = staged.length === 1
+                    ? 'Deleted ' + staged[0].name + '.'
+                    : 'Deleted ' + staged.length + ' sites.';
+                this.showSnack(label, false, {
+                    actionLabel: 'undo',
+                    action: () => this.undoPendingDeletes(),
+                    duration: 5000
+                });
+            },
+
+            commitPendingDeletes() {
+                if (!this.pendingDelete) return;
+                const names = this.pendingDelete.sites.map(s => s.name);
+                this.pendingDelete = null;
+                // processDeleteQueue drains the queue single-file so
+                // concurrent deletes don't race on shared state (Caddyfile
+                // regeneration, /etc/hosts edits).
+                this.deleteQueue.push(...names);
+                this.processDeleteQueue();
+            },
+
+            undoPendingDeletes() {
+                if (!this.pendingDelete) return;
+                clearTimeout(this.pendingDelete.timer);
+                // renderList re-sorts, so push order is fine.
+                this.sites.push(...this.pendingDelete.sites);
+                this.pendingDelete = null;
+                if (this.snackbar.timer) clearTimeout(this.snackbar.timer);
+                this.snackbar.visible = false;
+                this.render();
+                this.renderSnackbar();
+            },
+
+            async processDeleteQueue() {
+                // Single-flight runner: whichever call picks up the lock drains the
+                // full queue. Concurrent deleteSite() calls just enqueue and return.
+                if (this.isProcessingQueue) return;
+                this.isProcessingQueue = true;
+
+                let anyFailed = false;
+                try {
+                    // Outer loop catches deletes queued while we were awaiting the
+                    // reload below — otherwise they'd sit forever because the next
+                    // deleteSite() call short-circuits on isProcessingQueue.
+                    while (this.deleteQueue.length > 0) {
+                        while (this.deleteQueue.length > 0) {
+                            const target = this.deleteQueue.shift();
+                            const del = await this.apiPostRetry('delete_site', { site_name: target });
+                            if (del.success) {
+                                // Don't stomp a newer batch's undo snackbar
+                                // with a routine confirmation.
+                                if (!this.pendingDelete) this.showSnack('Site deleted.');
+                            } else {
+                                anyFailed = true; // apiPost already surfaced the error
+                            }
+                        }
+                        // Kick a reload at the end of the batch. Race-safety
+                        // lives server-side: cove_reload() uses a mkdir lock
+                        // with a pending marker to coalesce concurrent calls,
+                        // since reload_server itself backgrounds the shell
+                        // command (shell_exec '...&') and returns instantly.
+                        // Two unsynchronized frankenphp reload calls otherwise
+                        // deadlock Caddy's admin server (10s shutdown timeout).
+                        await this.apiPostRetry('reload_server', {}, 3, 10000);
+                    }
+                } finally {
+                    this.isProcessingQueue = false;
+                }
+
+                // If anything failed mid-queue the optimistic UI is now out of sync
+                // with the backend (e.g. a survivor is missing from our list).
+                // Cheapest correct fix: re-fetch the authoritative list.
+                if (anyFailed) await this.getSites();
+            },
+
+            async getLoginLink(name) {
+                const site = this.sites.find(s => s.name === name);
+                if (!site) return;
+                site.isLoggingIn = true;
+                this.renderList();
+                const res = await this.apiPost('get_login_link', { site_name: name });
+                if (res.success && res.url) {
+                    window.open(res.url, '_blank');
+                    this.showSnack('Login link opened in a new tab.');
+                }
+                site.isLoggingIn = false;
+                this.renderList();
+            },
+
+            async copyPath(path) {
+                try {
+                    await navigator.clipboard.writeText(path);
+                    this.showSnack('Path copied to clipboard.');
+                } catch (e) {
+                    this.showSnack('Could not copy path.', true);
+                }
+            },
+
+            async refreshSizes() {
+                this.isRefreshingSizes = true;
+                this.renderFooter();
+                const res = await this.apiPost('refresh_sizes');
+                if (res.success) {
+                    await this.getSites();
+                    this.showSnack('Disk sizes updated.');
+                }
+                this.isRefreshingSizes = false;
+                this.renderFooter();
+            }
+        };
+
+        // The script sits at the end of <body>, so the DOM is already parsed.
+        app.init();
     </script>
 </body>
 </html>
@@ -3955,6 +5101,8 @@ show_general_help() {
     echo "  trust            Install Cove's local CA into browser + system trust stores."
     echo "  list             Lists all sites currently managed by Cove."
     echo "  add              Creates a new WordPress or plain static site."
+    echo "  clone            Copies an existing site, database and all, under a new name."
+    echo "  core             Report or update the WordPress version of your sites."
     echo "  delete           Deletes a site's directory and associated database."
     echo "  login            Generates a one-time login link for a WordPress site."
     echo "  rename           Renames a site, its directory, and database."
@@ -3968,6 +5116,7 @@ show_general_help() {
     echo "  lan              Enable LAN access to sites for mobile app sync."
     echo "  ports            Reconfigure HTTP/HTTPS ports + update site URLs."
     echo "  memory           Show or raise PHP memory_limit across Cove + Homebrew PHPs."
+    echo "  php              Pin a site to an older PHP (native php-fpm behind FrankenPHP)."
     echo "  log              View logs for a site or the global error log."
     echo "  share            Create a temporary public tunnel to share a site."
     if [ "$IS_WSL" = true ]; then
@@ -4053,15 +5202,71 @@ display_command_help() {
             echo "  --totals       Calculates and displays the size of each site's public directory."
             ;;
         add)
-            echo "Usage: cove add <name> [--plain]"
+            echo "Usage: cove add <name> [flavor]"
             echo ""
             echo "Creates a new local site accessible at 'https://<name>.localhost'."
             echo ""
             echo "Arguments:"
             echo "  <name>         The name for the new site. Becomes the subdomain."
+            echo "  [flavor]       What goes inside the site. Defaults to the latest WordPress."
+            echo "                   <version>  A WordPress version: 6.4, 6.4.3, or 6.9-RC1."
+            echo "                   nightly    WordPress trunk, rebuilt daily."
+            echo "                   latest     The newest WordPress release (the default)."
+            echo "                   plain      A static HTML site with no database."
             echo ""
             echo "Flags:"
-            echo "  --plain        Creates a new static HTML site without a database."
+            echo "  --plain        Alias for the 'plain' flavor."
+            echo ""
+            echo "Examples:"
+            echo "  cove add mysite              Latest WordPress."
+            echo "  cove add mysite 6.4.3        WordPress pinned to 6.4.3."
+            echo "  cove add mysite nightly      WordPress trunk."
+            echo "  cove add mysite plain        Static site, no database."
+            ;;
+        clone)
+            echo "Usage: cove clone <source> <new-name>"
+            echo ""
+            echo "Copies an existing site to a new one — files, database, and custom"
+            echo "Caddy directives — rewriting the site URL to the new hostname."
+            echo ""
+            echo "Seed a site once (WooCommerce, users, sample content) and stamp copies"
+            echo "of it instead of building the same fixture over and over."
+            echo ""
+            echo "Arguments:"
+            echo "  <source>       The existing site to copy."
+            echo "  <new-name>     Name for the copy. Becomes the subdomain."
+            echo ""
+            echo "Notes:"
+            echo "  Admin credentials are inherited from the source site."
+            echo "  On APFS and btrfs the file copy is copy-on-write, so it is fast and"
+            echo "  the two copies share disk until one is written to."
+            echo ""
+            echo "Example:"
+            echo "  cove clone woo-template poc-acme"
+            ;;
+        core)
+            echo "Usage: cove core <check|update> [options]"
+            echo ""
+            echo "Reports and updates the WordPress version installed on your sites."
+            echo "Distinct from 'cove upgrade', which upgrades Cove itself."
+            echo ""
+            echo "Subcommands:"
+            echo "  check                        Show every site's WordPress version, flagging"
+            echo "                               releases wp.org marks outdated or insecure."
+            echo "  update <site> [version]      Update one site to the latest release, or to a"
+            echo "                               specific version (which may be a downgrade)."
+            echo "  update --all                 Update every site that is behind."
+            echo ""
+            echo "Flags:"
+            echo "  --all          Apply to every WordPress site."
+            echo "  --dry-run      List what would change without touching anything."
+            echo "  --yes, -y      Skip the confirmation prompt."
+            echo ""
+            echo "Examples:"
+            echo "  cove core check"
+            echo "  cove core update mysite"
+            echo "  cove core update mysite 6.4.3"
+            echo "  cove core update --all --dry-run"
             ;;
         delete)
             echo "Usage: cove delete <name> [--force]"
@@ -4239,6 +5444,24 @@ display_command_help() {
             echo "  cove memory set 2G --yes Bump Cove + every writable ini (non-interactive)"
             echo "  cove memory set -1       Unlimited (use sparingly)"
             ;;
+        php)
+            echo "Usage: cove php [<site>] [<version>|default]"
+            echo ""
+            echo "Per-site PHP version switching. FrankenPHP (bundling the latest PHP)"
+            echo "serves every site by default; pinning a site routes its PHP through a"
+            echo "native Homebrew php-fpm (php@<version>) behind Caddy via php_fastcgi."
+            echo "TLS, logs, mappings, and custom directives are unaffected."
+            echo ""
+            echo "Commands:"
+            echo "  cove php                 Overview: every site's effective PHP + services."
+            echo "  cove php <site>          Show the site's effective PHP version."
+            echo "  cove php <site> 8.2      Pin the site to PHP 8.2 (installs php@8.2 if needed)."
+            echo "  cove php <site> default  Unpin — back to FrankenPHP's bundled PHP."
+            echo ""
+            echo "The pin is stored in the site's 'php_version' file and travels with the"
+            echo "site through clone and rename. wp-cli commands for a pinned site run"
+            echo "under the same native PHP. Requires Homebrew on macOS."
+            ;;
         log)
             echo "Usage: cove log [site] [--follow]"
             echo ""
@@ -4411,6 +5634,14 @@ main() {
             check_dependencies
             cove_add "$@"
             ;;
+        clone)
+            check_dependencies
+            cove_clone "$@"
+            ;;
+        core)
+            check_dependencies
+            cove_core "$@"
+            ;;
         delete)
             check_dependencies
             cove_delete "$@"
@@ -4468,6 +5699,10 @@ main() {
             # Orphan-clearing mailpit runner + throttled KeepAlive. Safe to
             # re-run: rewrites the unit and restarts mailpit once.
             install_mailpit_service
+            # Regenerate per-version php-fpm configs/units so pinned sites pick
+            # up pool-template changes. Restart-shy: unchanged configs with a
+            # live master are left alone.
+            sync_php_fpm_services
             ;;
         status)
             check_dependencies
@@ -4547,6 +5782,10 @@ main() {
             check_dependencies
             cove_memory "$@"
             ;;
+        php)
+            check_dependencies
+            cove_php "$@"
+            ;;
         log)
             cove_log "$@"
             ;;
@@ -4583,10 +5822,11 @@ cove_add() {
     local site_name="$1"
     local site_type="wordpress"
     local no_reload_flag=false
+    local wp_version=""
 
     if [ -z "$site_name" ]; then
         gum style --foreground red "❌ Error: A site name is required."
-        echo "Usage: cove add <name> [--plain]"
+        echo "Usage: cove add <name> [flavor] [--plain] [--php=8.2]"
         exit 1
     fi
 
@@ -4602,15 +5842,78 @@ cove_add() {
         exit 1
     fi
 
-    # Check all arguments passed to the function for our flags
+    # Everything after the site name is parsed here. Cove's grammar is that
+    # flags modify *behaviour* (--force, --totals, --no-reload) while positional
+    # arguments name *things* — so what goes inside the site is a positional
+    # "flavor" rather than a flag: `cove add mysite 6.4.3`, `cove add mysite
+    # plain`, `cove add mysite nightly`. One slot answers "what do you want in
+    # it?", which keeps the version and the plain/WordPress choice from being
+    # two unrelated-looking knobs. --plain and --wp-version= stay accepted
+    # forever so existing scripts and the dashboard never break.
+    local flavor=""
+    local plain_flag=false
+    local php_pin=""
+    shift
     for arg in "$@"; do
-        if [ "$arg" == "--plain" ]; then
-            site_type="plain"
-        fi
-        if [ "$arg" == "--no-reload" ]; then
-            no_reload_flag=true
-        fi
+        case "$arg" in
+            --plain)        plain_flag=true ;;
+            --no-reload)    no_reload_flag=true ;;
+            --wp-version=*) flavor="${arg#*=}" ;;
+            --php=*)        php_pin="${arg#*=}" ;;
+            -*)             ;;  # unknown flags ignored, as before
+            *)              [ -z "$flavor" ] && flavor="$arg" ;;
+        esac
     done
+
+    # --php pins the site to an older PHP served by native php-fpm (see
+    # `cove php`). A flag rather than a second positional: the flavor slot
+    # names what goes IN the site; the PHP version modifies how it runs.
+    if [ -n "$php_pin" ]; then
+        local php_pin_norm
+        php_pin_norm=$(normalize_php_version "$php_pin")
+        if [ -z "$php_pin_norm" ]; then
+            gum style --foreground red "❌ Error: Invalid PHP version '$php_pin'." "Use a version like 8.2 or php@8.3."
+            exit 1
+        fi
+        php_pin="$php_pin_norm"
+        # Pinning to FrankenPHP's own version is a no-op, matching `cove php`.
+        if [ "$php_pin" == "$(normalize_php_version "$(frankenphp_php_version)")" ]; then
+            php_pin=""
+        fi
+    fi
+
+    # Resolve the flavor into a site type + an optional pinned version.
+    case "$flavor" in
+        ""|latest)
+            ;;                                  # newest WordPress — the default
+        plain)
+            site_type="plain" ;;
+        nightly|trunk)
+            wp_version="nightly" ;;
+        [0-9]*)
+            # Handed to wp-cli verbatim, so accept everything wp.org actually
+            # ships: 6.4, 6.4.3, and prerelease builds like 6.9-RC1 or
+            # 6.8-beta2. Pinning a prerelease is a large part of why you'd want
+            # a throwaway local site in the first place.
+            if ! [[ "$flavor" =~ ^[0-9]+(\.[0-9]+){1,2}(-[A-Za-z0-9.]+)?$ ]]; then
+                gum style --foreground red "❌ Error: Invalid WordPress version '$flavor'." "Use a version like 6.4, 6.4.3, or 6.9-RC1."
+                exit 1
+            fi
+            wp_version="$flavor" ;;
+        *)
+            gum style --foreground red "❌ Error: Unknown option '$flavor'." "Expected a WordPress version (6.4.3), 'nightly', 'latest', or 'plain'."
+            exit 1 ;;
+    esac
+
+    if [ "$plain_flag" = true ]; then
+        # --plain alongside a version is a contradiction rather than a harmless
+        # combination: there is no WordPress in a plain site to pin.
+        if [ -n "$wp_version" ]; then
+            gum style --foreground red "❌ Error: Cannot combine a WordPress version with a plain site." "A plain site has no WordPress to version."
+            exit 1
+        fi
+        site_type="plain"
+    fi
 
     for protected_name in $PROTECTED_NAMES; do
         if [ "$site_name" == "$protected_name" ]; then
@@ -4628,8 +5931,19 @@ cove_add() {
         exit 1
     fi
 
+    # Resolve the PHP pin before creating anything so a failed brew install
+    # leaves no half-made site behind.
+    if [ -n "$php_pin" ] && ! ensure_php_formula "$php_pin"; then
+        exit 1
+    fi
+
     echo "➕ Creating $site_type site: $full_hostname"
     mkdir -p "$site_dir/public" "$site_dir/logs"
+    if [ -n "$php_pin" ]; then
+        # Written before the WordPress install so get_wp_cmd runs wp-cli under
+        # the pinned PHP from the very first `core download`.
+        echo "$php_pin" > "$site_dir/php_version"
+    fi
 
     if [ "$site_type" == "plain" ]; then
         write_plain_site_landing "$site_dir/public"
@@ -4643,7 +5957,24 @@ cove_add() {
         source_config
         local db_name
         db_name=$(echo "cove_$site_name" | tr -c '[:alnum:]_' '_')
-        
+
+        if [ -n "$wp_version" ]; then
+            # Show the pairing rather than just the pinned version. Cove runs a
+            # current PHP, and an older WordPress predates it — deprecation
+            # notices in the site's debug.log are expected rather than a fault,
+            # and seeing both numbers together makes that obvious up front.
+            local php_ver
+            if [ -n "$php_pin" ]; then
+                php_ver="$php_pin"
+            else
+                php_ver=$(frankenphp_php_version)
+            fi
+            if [ -n "$php_ver" ]; then
+                echo "📌 Installing WordPress $wp_version on PHP $php_ver"
+            else
+                echo "📌 Installing WordPress $wp_version"
+            fi
+        fi
         echo "🗄️ Creating database: $db_name"
         mysql -u "$DB_USER" -p"$DB_PASSWORD" -e "CREATE DATABASE IF NOT EXISTS \`$db_name\`;"
         echo "Installing WordPress..."
@@ -4659,14 +5990,16 @@ cove_add() {
         # leaked Deprecated lines while still passing through real wp-cli
         # error output (which doesn't carry the "Deprecated:" prefix).
         local wp_cmd
-        wp_cmd=$(get_wp_cmd)
+        wp_cmd=$(get_wp_cmd "$site_dir")
 
         (
             cd "$site_dir/public" || exit 1
 
-            # 1. Download WordPress with a higher memory limit
-            if ! $wp_cmd core download --quiet; then
-                echo "❌ Error: Failed to download WordPress core. This might be a network issue or a permissions problem."
+            # 1. Download WordPress with a higher memory limit. ${x:+...}
+            # expands to nothing at all when no version is pinned, so the
+            # default path is byte-identical to the unpinned command.
+            if ! $wp_cmd core download --quiet ${wp_version:+--version="$wp_version"}; then
+                echo "❌ Error: Failed to download WordPress core. This might be a network issue, a permissions problem, or a WordPress version that does not exist."
                 exit 1 # Exit the subshell with an error
             fi
 
@@ -4731,6 +6064,492 @@ PHP
         gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "✅ WordPress Installed" "URL: $(url_for "$full_hostname")/wp-admin" "User: $admin_user" "Pass: $admin_pass" "One-time login URL: $one_time_login_url"
     fi
 }
+# Copy a directory tree, preferring a copy-on-write clone where the filesystem
+# supports one. On APFS this is roughly 3x faster than a byte copy and the two
+# copies share blocks until one of them is written to, which matters when the
+# whole point is stamping throwaway copies of a seeded site.
+cove_copy_tree() {
+    local src="$1"
+    local dst="$2"
+
+    # macOS / APFS.
+    if cp -c -R "$src" "$dst" 2>/dev/null; then
+        return 0
+    fi
+    rm -rf "$dst"
+
+    # Linux with btrfs/xfs reflink support.
+    if cp -R --reflink=auto "$src" "$dst" 2>/dev/null; then
+        return 0
+    fi
+    rm -rf "$dst"
+
+    # Plain byte copy — always correct, just slower.
+    cp -R "$src" "$dst"
+}
+
+cove_clone() {
+    cd ~/
+    local source_name="$1"
+    local new_name="$2"
+    local no_reload_flag=false
+
+    for arg in "$@"; do
+        [ "$arg" == "--no-reload" ] && no_reload_flag=true
+    done
+
+    # --- Validation ---
+    if [ -z "$source_name" ] || [ -z "$new_name" ]; then
+        gum style --foreground red "❌ Error: Both a source site and a new name are required."
+        echo "Usage: cove clone <source> <new-name>"
+        exit 1
+    fi
+
+    if [ "$source_name" == "$new_name" ]; then
+        gum style --foreground red "❌ Error: The new name must be different from the source."
+        exit 1
+    fi
+
+    local source_dir="$SITES_DIR/$source_name.localhost"
+    if [ ! -d "$source_dir" ]; then
+        gum style --foreground red "❌ Error: Site '$source_name.localhost' not found."
+        exit 1
+    fi
+
+    # Same name rules as cove_add — a clone must produce a site add could have.
+    if [[ "$new_name" =~ [^a-z0-9-] ]]; then
+        gum style --foreground red "❌ Error: Invalid site name '$new_name'." "Site names can only contain lowercase letters, numbers, and hyphens."
+        exit 1
+    fi
+    if [[ "$new_name" == -* || "$new_name" == *- ]]; then
+        gum style --foreground red "❌ Error: Invalid site name '$new_name'." "Site names cannot begin or end with a hyphen."
+        exit 1
+    fi
+    for protected_name in $PROTECTED_NAMES; do
+        if [ "$new_name" == "$protected_name" ]; then
+            gum style --foreground red "❌ Error: '$new_name' is a reserved name. Choose another."
+            exit 1
+        fi
+    done
+
+    local new_dir="$SITES_DIR/$new_name.localhost"
+    if [ -d "$new_dir" ]; then
+        gum style --foreground red "❌ Error: A site named '$new_name.localhost' already exists."
+        exit 1
+    fi
+
+    local is_wordpress=false
+    [ -f "$source_dir/public/wp-config.php" ] && is_wordpress=true
+
+    echo "🧬 Cloning $source_name.localhost → $new_name.localhost"
+
+    # --- Files ---
+    # Only public/ is cloned. logs/ is the source's own request history and
+    # would be actively misleading under a new hostname, so the clone starts
+    # with an empty one.
+    mkdir -p "$new_dir"
+    echo "   - Copying files..."
+    if ! cove_copy_tree "$source_dir/public" "$new_dir/public"; then
+        gum style --foreground red "❌ Error: Failed to copy site files."
+        rm -rf "$new_dir"
+        exit 1
+    fi
+    mkdir -p "$new_dir/logs"
+
+    # Carry the PHP pin over before any wp-cli runs, so the clone's database
+    # work happens under the same PHP as its source (and the clone serves
+    # like its source after the reload below).
+    if [ -f "$source_dir/php_version" ]; then
+        cp "$source_dir/php_version" "$new_dir/php_version"
+    fi
+
+    # --- Database ---
+    if [ "$is_wordpress" = true ]; then
+        source_config
+        local wp_cmd
+        wp_cmd=$(get_wp_cmd "$new_dir")
+
+        local source_db new_db
+        source_db=$(echo "cove_$source_name" | tr -c '[:alnum:]_' '_')
+        new_db=$(echo "cove_$new_name" | tr -c '[:alnum:]_' '_')
+
+        local temp_sql
+        temp_sql=$(mktemp) || {
+            gum style --foreground red "❌ Error: Could not create a temporary file for the database dump."
+            rm -rf "$new_dir"
+            exit 1
+        }
+        # Cleans up on every exit path below, including the error returns.
+        trap 'rm -f "$temp_sql"' EXIT
+
+        echo "   - Dumping database '$source_db'..."
+        if ! mysqldump -u "$DB_USER" -p"$DB_PASSWORD" "$source_db" > "$temp_sql" 2>/dev/null; then
+            gum style --foreground red "❌ Error: Failed to dump the source database '$source_db'."
+            rm -rf "$new_dir"
+            exit 1
+        fi
+
+        echo "   - Creating database '$new_db'..."
+        mysql -u "$DB_USER" -p"$DB_PASSWORD" -e "CREATE DATABASE IF NOT EXISTS \`$new_db\`;"
+        if ! mysql -u "$DB_USER" -p"$DB_PASSWORD" "$new_db" < "$temp_sql" 2>/dev/null; then
+            gum style --foreground red "❌ Error: Failed to import into '$new_db'."
+            mysql -u "$DB_USER" -p"$DB_PASSWORD" -e "DROP DATABASE IF EXISTS \`$new_db\`;"
+            rm -rf "$new_dir"
+            exit 1
+        fi
+
+        echo "   - Pointing wp-config.php at '$new_db'..."
+        if ! (cd "$new_dir/public" && $wp_cmd config set DB_NAME "$new_db" --quiet </dev/null); then
+            gum style --foreground red "❌ Error: Failed to update wp-config.php."
+            mysql -u "$DB_USER" -p"$DB_PASSWORD" -e "DROP DATABASE IF EXISTS \`$new_db\`;"
+            rm -rf "$new_dir"
+            exit 1
+        fi
+
+        echo "   - Rewriting site URLs..."
+        # Non-fatal, matching cove_rename: the clone already exists and points at
+        # its own database, so a search-replace hiccup is a thing to warn about
+        # rather than a reason to destroy the copy.
+        if ! (cd "$new_dir/public" && $wp_cmd search-replace "$(url_for "$source_name.localhost")" "$(url_for "$new_name.localhost")" --all-tables --skip-plugins --skip-themes --quiet </dev/null); then
+            gum style --foreground yellow "⚠️  search-replace did not complete cleanly; verify the cloned site's URLs."
+        fi
+
+        inject_mu_plugin "$new_dir/public"
+    fi
+
+    # --- Custom Caddy directives ---
+    # Carried over so the clone behaves like its source. Directives can hardcode
+    # the old hostname, so say so rather than letting it fail mysteriously.
+    local source_conf="$CUSTOM_CADDY_DIR/$source_name.localhost"
+    if [ -f "$source_conf" ]; then
+        cp "$source_conf" "$CUSTOM_CADDY_DIR/$new_name.localhost"
+        echo "   - Copied custom Caddy directives (check them for hardcoded hostnames)."
+    fi
+
+    if [ "$no_reload_flag" = false ]; then
+        regenerate_caddyfile
+        local warm_url
+        warm_url=$(url_for "$new_name.localhost")
+        for _ in 1 2 3 4 5 6 7 8 9 10; do
+            if curl -ks --max-time 1 -o /dev/null "$warm_url/" 2>/dev/null; then
+                break
+            fi
+            sleep 0.2
+        done
+    fi
+
+    if [ "$is_wordpress" = true ]; then
+        local wp_cmd_final admin_login one_time_login_url
+        wp_cmd_final=$(get_wp_cmd "$new_dir")
+        # Unlike a fresh install there is no known admin username here, so pick
+        # the first administrator out of the cloned database.
+        admin_login=$($wp_cmd_final user list --role=administrator --field=user_login --number=1 --path="$new_dir/public/" 2>/dev/null </dev/null | head -1)
+        # Credentials come from the source site, so they are deliberately not
+        # printed here — a one-time link is the useful thing to hand back.
+        if [ -n "$admin_login" ]; then
+            one_time_login_url=$($wp_cmd_final user login "$admin_login" --path="$new_dir/public/" 2>/dev/null </dev/null | head -1)
+        fi
+        [ -n "$one_time_login_url" ] || one_time_login_url="(no administrator found — log in as you would on '$source_name')"
+        gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 \
+            "✅ Cloned '$source_name' → '$new_name'" \
+            "URL: $(url_for "$new_name.localhost")" \
+            "Logins are the same as '$source_name'." \
+            "One-time login URL: $one_time_login_url"
+    else
+        gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 \
+            "✅ Cloned '$source_name' → '$new_name'" \
+            "URL: $(url_for "$new_name.localhost")"
+    fi
+}
+
+# Refresh the wp.org stable-check cache the dashboard also reads. Best-effort:
+# every failure leaves whatever cache already exists and returns non-zero, so
+# callers degrade to "no status information" rather than aborting.
+cove_wpver_refresh() {
+    local max_age="${1:-86400}"
+
+    if [ -f "$COVE_WPVER_CACHE" ]; then
+        local age
+        age=$(( $(date +%s) - $(cove_file_mtime "$COVE_WPVER_CACHE") ))
+        [ "$age" -lt "$max_age" ] && return 0
+    fi
+
+    local tmp
+    tmp=$(mktemp "${TMPDIR:-/tmp}/cove-wpver-XXXXXX") || return 1
+    if ! curl -fsSL --max-time 8 "https://api.wordpress.org/core/stable-check/1.0/" -o "$tmp" 2>/dev/null; then
+        rm -f "$tmp"
+        return 1
+    fi
+
+    mkdir -p "$(dirname "$COVE_WPVER_CACHE")"
+    # Normalised to the same {version,status} shape the dashboard writes, so one
+    # cache file serves both and either side can refresh it.
+    if ! SRC="$tmp" DEST="$COVE_WPVER_CACHE" frankenphp php-cli -r '
+        $all = json_decode(@file_get_contents(getenv("SRC")), true);
+        if (!is_array($all) || empty($all)) { exit(1); }
+        $versions = array_keys($all);
+        usort($versions, fn($a, $b) => version_compare($b, $a));
+        $out = [];
+        foreach (array_slice($versions, 0, 40) as $v) {
+            $out[] = ["version" => $v, "status" => $all[$v]];
+        }
+        file_put_contents(getenv("DEST"), json_encode($out));
+    ' 2>/dev/null; then
+        rm -f "$tmp"
+        return 1
+    fi
+    rm -f "$tmp"
+    return 0
+}
+
+# Portable stat -- BSD and GNU disagree on the flag for mtime.
+cove_file_mtime() {
+    stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null || echo 0
+}
+
+# Emit "name<TAB>version<TAB>status" for every WordPress site, in one PHP
+# process. Doing this per-site from bash would mean 250+ interpreter starts.
+cove_core_scan() {
+    SITES_DIR="$SITES_DIR" WPVER_CACHE="$COVE_WPVER_CACHE" frankenphp php-cli -r '
+        $sites_dir = getenv("SITES_DIR");
+        if (!is_dir($sites_dir)) exit;
+
+        $status_map = [];
+        $cache = getenv("WPVER_CACHE");
+        if ($cache && is_file($cache)) {
+            $cached = @json_decode(@file_get_contents($cache), true);
+            if (is_array($cached)) {
+                foreach ($cached as $e) {
+                    if (isset($e["version"], $e["status"])) $status_map[$e["version"]] = $e["status"];
+                }
+            }
+        }
+
+        $q = chr(39);
+        $pattern = "/\\\$wp_version\\s*=\\s*" . $q . "([^" . $q . "]+)" . $q . "/";
+
+        foreach (scandir($sites_dir) as $item) {
+            if ($item === "." || $item === "..") continue;
+            $public = $sites_dir . "/" . $item . "/public";
+            if (!is_file($public . "/wp-config.php")) continue;
+            $file = $public . "/wp-includes/version.php";
+            if (!is_file($file)) continue;
+            $head = @file_get_contents($file, false, null, 0, 4096);
+            if ($head === false || !preg_match($pattern, $head, $m)) continue;
+            $v = $m[1];
+            echo str_replace(".localhost", "", $item) . "\t" . $v . "\t" . ($status_map[$v] ?? "unknown") . "\n";
+        }
+    ' 2>/dev/null
+}
+
+# Update a single site in place. Echoes a one-line result; never exits, so a
+# fleet run keeps going past a broken site.
+cove_core_update_one() {
+    local name="$1"
+    local target="$2"
+    local public_dir="$SITES_DIR/$name.localhost/public"
+    local wp_cmd
+    wp_cmd=$(get_wp_cmd "$SITES_DIR/$name.localhost")
+
+    local before
+    before=$(cove_wp_version "$public_dir" 2>/dev/null || echo "unknown")
+
+    # --force lets an explicit target move in either direction; reinstalling the
+    # same version to repair core files is a legitimate reason to run this too.
+    local args="core update"
+    [ -n "$target" ] && args="core update --version=$target --force"
+
+    # Capture the status of wp-cli itself, not of the filter. Piping straight
+    # into grep would report a silent success as a failure, because grep exits
+    # non-zero when it filters every line away.
+    # stdin is closed for both wp-cli calls. The fleet loop feeds candidates in
+    # on stdin via a here-string, and any child that reads stdin would swallow
+    # the remaining lines -- silently updating one site and reporting success
+    # for the whole run.
+    local output status
+    output=$( (cd "$public_dir" && $wp_cmd $args --quiet) 2>&1 </dev/null )
+    status=$?
+    output=$(printf '%s\n' "$output" | grep -v -E '^(PHP )?Deprecated:' || true)
+    if [ "$status" -ne 0 ]; then
+        local reason
+        reason=$(printf '%s\n' "$output" | grep -v '^$' | tail -1)
+        echo "   ❌ $name — ${reason:-wp core update failed}"
+        return 1
+    fi
+
+    # Schema migrations are a separate step in WP-CLI, and skipping it leaves
+    # the site showing the database-update screen on first admin load.
+    (cd "$public_dir" && $wp_cmd core update-db --quiet) >/dev/null 2>&1 </dev/null || true
+
+    local after
+    after=$(cove_wp_version "$public_dir" 2>/dev/null || echo "unknown")
+    if [ "$before" == "$after" ]; then
+        echo "   • $name — already on $after"
+    else
+        echo "   ✅ $name — $before → $after"
+    fi
+    return 0
+}
+
+cove_core() {
+    local sub="${1:-}"
+    shift 2>/dev/null || true
+
+    case "$sub" in
+        check)
+            cove_wpver_refresh || true
+            local scan
+            scan=$(cove_core_scan)
+            if [ -z "$scan" ]; then
+                gum style --padding "1 2" "No WordPress sites found."
+                return 0
+            fi
+            local latest
+            latest=$(echo "$scan" | awk -F'\t' '$3=="latest"{print $2; exit}')
+            local total insecure outdated
+            total=$(echo "$scan" | wc -l | tr -d ' ')
+            insecure=$(echo "$scan" | awk -F'\t' '$3=="insecure"' | wc -l | tr -d ' ')
+            outdated=$(echo "$scan" | awk -F'\t' '$3=="outdated"' | wc -l | tr -d ' ')
+
+            echo ""
+            echo "🔎 WordPress core across $total site(s)"
+            [ -n "$latest" ] && echo "   latest release: $latest"
+            echo ""
+            echo "$scan" | awk -F'\t' '$3!="latest"' | sort -t'	' -k3,3 -k1,1 | while IFS=$'\t' read -r n v s; do
+                case "$s" in
+                    insecure) echo "   ❗ $n — $v (insecure)" ;;
+                    outdated) echo "   ⚠️  $n — $v (outdated)" ;;
+                    *)        echo "   ?  $n — $v" ;;
+                esac
+            done
+            echo ""
+            echo "   $insecure insecure, $outdated outdated, $((total - insecure - outdated)) current"
+            [ $((insecure + outdated)) -gt 0 ] && echo "   Update them all with: cove core update --all"
+            echo ""
+            ;;
+        update)
+            local all=false dry_run=false assume_yes=false site="" target=""
+            for arg in "$@"; do
+                case "$arg" in
+                    --all)              all=true ;;
+                    --dry-run)          dry_run=true ;;
+                    --yes|-y|--force)   assume_yes=true ;;
+                    -*)                 ;;
+                    *)
+                        # Same grammar as `cove add`: a bare token that starts
+                        # with a digit is a version, anything else is a site.
+                        if [[ "$arg" == [0-9]* ]]; then target="$arg"; else site="$arg"; fi ;;
+                esac
+            done
+
+            if [ -n "$target" ] && ! [[ "$target" =~ ^[0-9]+(\.[0-9]+){1,2}(-[A-Za-z0-9.]+)?$ ]]; then
+                gum style --foreground red "❌ Error: Invalid WordPress version '$target'." "Use a version like 6.4, 6.4.3, or 6.9-RC1."
+                exit 1
+            fi
+
+            if [ "$all" = false ] && [ -z "$site" ]; then
+                gum style --foreground red "❌ Error: Name a site or pass --all."
+                echo "Usage: cove core update <site> [version]"
+                echo "       cove core update --all [--dry-run] [--yes]"
+                exit 1
+            fi
+
+            # --- Single site ---
+            if [ "$all" = false ]; then
+                local public_dir="$SITES_DIR/$site.localhost/public"
+                if [ ! -d "$SITES_DIR/$site.localhost" ]; then
+                    gum style --foreground red "❌ Error: Site '$site.localhost' not found."
+                    exit 1
+                fi
+                if [ ! -f "$public_dir/wp-config.php" ]; then
+                    gum style --foreground red "❌ Error: '$site.localhost' is not a WordPress site."
+                    exit 1
+                fi
+                source_config
+                echo "🔄 Updating WordPress core on $site.localhost..."
+                cove_core_update_one "$site" "$target"
+                return $?
+            fi
+
+            # --- Fleet ---
+            cove_wpver_refresh || true
+            local scan
+            scan=$(cove_core_scan)
+            if [ -z "$scan" ]; then
+                gum style --padding "1 2" "No WordPress sites found."
+                return 0
+            fi
+
+            # With an explicit target every site is a candidate; otherwise only
+            # the ones wp.org says are behind.
+            local candidates
+            if [ -n "$target" ]; then
+                candidates=$(echo "$scan" | awk -F'\t' -v t="$target" '$2!=t{print $1"\t"$2"\t"$3}')
+            else
+                candidates=$(echo "$scan" | awk -F'\t' '$3!="latest"')
+            fi
+
+            if [ -z "$candidates" ]; then
+                gum style --padding "1 2" "✅ Every WordPress site is already up to date."
+                return 0
+            fi
+
+            local count
+            count=$(echo "$candidates" | wc -l | tr -d ' ')
+
+            echo ""
+            echo "$candidates" | while IFS=$'\t' read -r n v s; do
+                echo "   $n — $v${target:+ → $target}${s:+ ($s)}"
+            done
+            echo ""
+
+            if [ "$dry_run" = true ]; then
+                echo "🔎 Dry run — $count site(s) would be updated. Nothing changed."
+                return 0
+            fi
+
+            if [ "$assume_yes" = false ]; then
+                if ! gum confirm "Update $count site(s)?"; then
+                    echo "Aborted."
+                    return 1
+                fi
+            fi
+
+            source_config
+            local ok=0 failed=0
+            # Sequential on purpose: parallel wp-cli runs would contend on the
+            # same MariaDB and make a failure impossible to attribute.
+            while IFS=$'\t' read -r n v s; do
+                [ -z "$n" ] && continue
+                if cove_core_update_one "$n" "$target" </dev/null; then
+                    ok=$((ok + 1))
+                else
+                    failed=$((failed + 1))
+                fi
+            done <<< "$candidates"
+
+            echo ""
+            if [ "$failed" -gt 0 ]; then
+                gum style --foreground yellow "⚠️  $ok updated, $failed failed."
+            else
+                gum style --foreground green "✅ $ok site(s) updated."
+            fi
+            ;;
+        *)
+            echo "Usage: cove core <check|update>"
+            echo ""
+            echo "  cove core check                    Report the WordPress version of every site."
+            echo "  cove core update <site> [version]  Update one site to the latest, or to a version."
+            echo "  cove core update --all             Update every site that is behind."
+            echo ""
+            echo "Flags:"
+            echo "  --all          Apply to every WordPress site."
+            echo "  --dry-run      List what would change without touching anything."
+            echo "  --yes, -y      Skip the confirmation prompt."
+            ;;
+    esac
+}
+
 cove_db_backup() {
     echo "🚀 Starting database backup for all WordPress sites..."
 
@@ -4766,9 +6585,10 @@ cove_db_backup() {
             (
                 cd "$public_dir" || return 1
                 
-                # Get WP-CLI command (adds --allow-root if running as root)
+                # Get WP-CLI command (adds --allow-root if running as root;
+                # uses the site's pinned PHP when one is set)
                 local wp_cmd
-                wp_cmd=$(get_wp_cmd)
+                wp_cmd=$(get_wp_cmd "$site_path")
                 
                 # Check if wp-cli can connect
                 if ! $wp_cmd core is-installed --skip-plugins --skip-themes &> /dev/null; then
@@ -4986,7 +6806,7 @@ cove_delete() {
     echo "🔥 Deleting site: $site_name.localhost"
     if [ -f "$site_dir/public/wp-config.php" ]; then
         local db_name wp_cmd
-        wp_cmd=$(get_wp_cmd)
+        wp_cmd=$(get_wp_cmd "$site_dir")
         # Prefer the DB actually named in wp-config.php. Deriving cove_<name>
         # blindly (as before) would orphan the real database for any site whose
         # DB_NAME was changed — and could drop an unrelated database that
@@ -5241,6 +7061,18 @@ cove_disable() {
         # and thrash KeepAlive on the next enable (see install_mailpit_service).
         # -x matches basename only — never a random path containing "mailpit".
         pkill -x mailpit &>/dev/null || true
+        # Per-site php-fpm units. Unload only — the plists stay on disk so the
+        # next enable's sync_php_fpm_services restores them from the sites'
+        # php_version files. The -f pattern matches the master's process title
+        # ("php-fpm: master process (~/Cove/php-fpm/<ver>/php-fpm.conf)"),
+        # which takes its workers down with it.
+        local fpm_plist
+        for fpm_plist in "$COVE_DIR"/com.cove.php-fpm-*.plist; do
+            [ -f "$fpm_plist" ] || continue
+            echo "   - Stopping PHP-FPM ($(basename "$fpm_plist" .plist | sed 's/com\.cove\.php-fpm-//'))..."
+            launchctl unload "$fpm_plist" &>/dev/null
+        done
+        pkill -f "Cove/php-fpm/.*/php-fpm\.conf" &>/dev/null || true
     fi
 
     # Stop services on Linux
@@ -5294,6 +7126,9 @@ cove_enable() {
         # otherwise thrash KeepAlive on a bind failure). Shared helper so
         # post-upgrade can refresh it without a full re-enable.
         install_mailpit_service
+
+        # Native php-fpm units for any sites pinned to an older PHP.
+        sync_php_fpm_services
     fi
     
     if [ "$OS" == "linux" ]; then
@@ -6170,8 +8005,8 @@ memory_limit = 1G
 display_errors = 0
 error_reporting = 6143
 INI
-    echo "🗃️ Downloading Adminer 5.4.2..."
-    curl -sL "https://github.com/vrana/adminer/releases/download/v5.4.2/adminer-5.4.2.php" -o "$ADMINER_DIR/adminer-core.php"
+    echo "🗃️ Downloading Adminer 6.0.0..."
+    curl -sL "https://github.com/vrana/adminer/releases/download/v6.0.0/adminer-6.0.0.php" -o "$ADMINER_DIR/adminer-core.php"
     # Entry point + theme assets. Keep in sync with cove_upgrade so upgraders
     # pick up index.php/head() and CSS/JS changes without a full reinstall.
     deploy_adminer_theme
@@ -6681,7 +8516,7 @@ cove_list() {
 
     # PHP script to find, sort, and format the site list with box-drawing characters
     local php_output
-    php_output=$(SITES_DIR="$SITES_DIR" SHOW_TOTALS="$show_totals" HTTPS_PORT_SUFFIX="$(https_port_suffix)" frankenphp php-cli -r '
+    php_output=$(SITES_DIR="$SITES_DIR" SHOW_TOTALS="$show_totals" HTTPS_PORT_SUFFIX="$(https_port_suffix)" WPVER_CACHE="$COVE_WPVER_CACHE" frankenphp php-cli -r '
         function getDirectorySize(string $path): int {
             if (!is_dir($path)) return 0;
             $total_size = 0;
@@ -6701,9 +8536,41 @@ cove_list() {
             return round($bytes / (1024 ** $i), 2) . " " . $units[$i];
         }
 
+        // Parsed rather than bootstrapped — see cove_wp_version in main for why.
+        function wpVersion(string $public_path): ?string {
+            $file = $public_path . "/wp-includes/version.php";
+            if (!is_file($file)) return null;
+            // The constant sits in the first few hundred bytes; no reason to
+            // read the whole file 250 times.
+            $head = @file_get_contents($file, false, null, 0, 4096);
+            if ($head === false) return null;
+            // This whole block is inside a single-quoted shell string, so the
+            // apostrophe wrapping the version literal has to be built rather
+            // than typed.
+            $q = chr(39);
+            $pattern = "/\\\$wp_version\\s*=\\s*" . $q . "([^" . $q . "]+)" . $q . "/";
+            return preg_match($pattern, $head, $m) ? $m[1] : null;
+        }
+
         $sites_dir = getenv("SITES_DIR");
         $show_totals = getenv("SHOW_TOTALS") === "true";
         $port_suffix = getenv("HTTPS_PORT_SUFFIX") ?: "";
+
+        // wp.org marks every release latest / outdated / insecure. The dashboard
+        // caches that map; reuse it when present so the list can flag a site
+        // worth updating, and silently skip flagging when it is not.
+        $status_map = [];
+        $wpver_cache = getenv("WPVER_CACHE");
+        if ($wpver_cache && is_file($wpver_cache)) {
+            $cached = @json_decode(@file_get_contents($wpver_cache), true);
+            if (is_array($cached)) {
+                foreach ($cached as $entry) {
+                    if (isset($entry["version"], $entry["status"])) {
+                        $status_map[$entry["version"]] = $entry["status"];
+                    }
+                }
+            }
+        }
 
         if (!is_dir($sites_dir)) {
             exit;
@@ -6718,11 +8585,20 @@ cove_list() {
             if (is_dir($site_path)) {
                 $public_path = $site_path . "/public";
                 $size = $show_totals && is_dir($public_path) ? formatSize(getDirectorySize($public_path)) : null;
+                $version = wpVersion($public_path);
+                $status = $version !== null ? ($status_map[$version] ?? null) : null;
                 $sites[] = [
                     "name" => str_replace(".localhost", "", $item),
                     "domain" => "https://" . $item . $port_suffix,
                     "type" => file_exists($site_path . "/public/wp-config.php") ? "WordPress" : "Plain",
                     "size" => $size,
+                    // "!" marks a release wp.org considers insecure. Local sites
+                    // are not exposed, so this is a nudge rather than an alarm.
+                    // ASCII only: str_pad counts bytes, so a multibyte dash here
+                    // would under-pad the column and skew the box border.
+                    "wp" => $version === null ? "-" : $version . ($status === "insecure" ? " !" : ""),
+                    // Per-site PHP pin (`cove php`); "-" = Cove default PHP.
+                    "php" => is_file($site_path . "/php_version") ? trim((string) @file_get_contents($site_path . "/php_version")) : "-",
                 ];
             }
         }
@@ -6748,8 +8624,15 @@ cove_list() {
         $domain_width = max(array_map(fn($s) => strlen($s["domain"]), $sites));
         $domain_width = max($domain_width, 6) + $gap;
         
-        $type_width = $show_totals ? 9 + $gap : 10; // "WordPress" + gap or padding
-        
+        $type_width = 9 + $gap; // "WordPress" + gap
+
+        // Sized from the content: versions run from "6.4" to "7.0-RC4 !".
+        $wp_width = max(array_map(fn($s) => strlen($s["wp"]), $sites));
+        $wp_width = max($wp_width, 2) + $gap;
+
+        $php_width = max(array_map(fn($s) => strlen($s["php"]), $sites));
+        $php_width = max($php_width, 3) + $gap;
+
         $size_width = $show_totals ? 11 : 0;
 
         // ANSI colors
@@ -6762,7 +8645,7 @@ cove_list() {
         $h = "─"; $v = "│";
 
         // Calculate total width
-        $inner_width = $name_width + $domain_width + $type_width;
+        $inner_width = $name_width + $domain_width + $type_width + $wp_width + $php_width;
         if ($show_totals) {
             $inner_width += $size_width;
         }
@@ -6773,7 +8656,7 @@ cove_list() {
         $bot_line = $pink . $bl . str_repeat($h, $inner_width) . $br . $reset;
 
         // Header row (white text)
-        $header = $pink . $v . $reset . " " . str_pad("Name", $name_width - 1) . str_pad("Domain", $domain_width) . str_pad("Type", $type_width);
+        $header = $pink . $v . $reset . " " . str_pad("Name", $name_width - 1) . str_pad("Domain", $domain_width) . str_pad("Type", $type_width) . str_pad("WP", $wp_width) . str_pad("PHP", $php_width);
         if ($show_totals) {
             $header .= str_pad("Size", $size_width);
         }
@@ -6788,6 +8671,8 @@ cove_list() {
             $row = $pink . $v . $reset . " " . str_pad($site["name"], $name_width - 1);
             $row .= str_pad($site["domain"], $domain_width);
             $row .= str_pad($site["type"], $type_width);
+            $row .= str_pad($site["wp"], $wp_width);
+            $row .= str_pad($site["php"], $php_width);
             if ($show_totals) {
                 $row .= str_pad($site["size"] ?? "N/A", $size_width);
             }
@@ -6913,9 +8798,10 @@ cove_login() {
     local site_dir="$SITES_DIR/$site_name.localhost"
     local public_dir="$site_dir/public"
     
-    # Get WP-CLI command (adds --allow-root if running as root)
+    # Get WP-CLI command (adds --allow-root if running as root; uses the
+    # site's pinned PHP when one is set)
     local wp_cmd
-    wp_cmd=$(get_wp_cmd)
+    wp_cmd=$(get_wp_cmd "$site_dir")
 
     # 2. Check if the site exists and is a WordPress installation.
     if [ ! -d "$site_dir" ] || [ ! -f "$public_dir/wp-config.php" ]; then
@@ -7331,6 +9217,179 @@ cove_path() {
     fi
 
     echo "$site_dir"
+}
+
+# cove php — per-site PHP version switching.
+#
+# FrankenPHP (bundling the latest PHP) stays the front door for every site.
+# Pinning a site to an older version swaps its Caddyfile handler from
+# php_server to php_fastcgi against a Cove-managed Homebrew php-fpm on a unix
+# socket. Service lifecycle + pool config live in main (write_php_fpm_config,
+# sync_php_fpm_services, emit_site_php_handler); this file is the CLI.
+
+# Make sure php@<ver>'s php-fpm is available, offering a brew install when
+# the formula exists but isn't installed. Auto-confirms without a TTY so the
+# dashboard and scripts can pin non-interactively. Returns non-zero when the
+# binary still can't be resolved — callers must not write a php_version file
+# in that case.
+ensure_php_formula() {
+    local ver="$1"
+    if [ -n "$(php_fpm_prefix_for "$ver")" ]; then
+        return 0
+    fi
+    if [ "$OS" != "macos" ] || [ "$MAC_BREW" != "brew" ]; then
+        gum style --foreground red "❌ Per-site PHP versions currently require Homebrew on macOS." \
+            "Cove serves everything with FrankenPHP's bundled PHP on this platform."
+        return 1
+    fi
+    if ! brew info "php@$ver" &>/dev/null; then
+        gum style --foreground red "❌ Error: Homebrew has no formula 'php@$ver'."
+        return 1
+    fi
+    echo "📦 PHP $ver is not installed."
+    if [ -t 0 ]; then
+        if ! gum confirm "Install php@$ver via Homebrew now?"; then
+            echo "Aborted."
+            return 1
+        fi
+    else
+        echo "   Installing php@$ver via Homebrew..."
+    fi
+    if ! brew install "php@$ver"; then
+        gum style --foreground red "❌ Error: 'brew install php@$ver' failed."
+        return 1
+    fi
+    if [ -z "$(php_fpm_prefix_for "$ver")" ]; then
+        gum style --foreground red "❌ Error: php-fpm for PHP $ver still not found after install."
+        return 1
+    fi
+    return 0
+}
+
+# The no-argument overview: every site's effective PHP, plus the state of the
+# native php-fpm services backing the pins.
+cove_php_overview() {
+    local default_ver
+    default_ver=$(frankenphp_php_version)
+    echo "🐘 PHP versions (Cove default: ${default_ver:-unknown} via FrankenPHP)"
+    echo ""
+    if [ -d "$SITES_DIR" ]; then
+        local site_path site_name ver
+        for site_path in "$SITES_DIR"/*; do
+            [ -d "$site_path/public" ] || continue
+            site_name=$(basename "$site_path")
+            ver=$(site_php_version "$site_path")
+            if [ -n "$ver" ]; then
+                printf "  %-42s %s\n" "$site_name" "$ver (php-fpm)"
+            else
+                printf "  %-42s %s\n" "$site_name" "default"
+            fi
+        done
+    fi
+    if [ "$OS" == "macos" ] && [ "$MAC_BREW" == "brew" ]; then
+        echo ""
+        local plist ver state found=false
+        for plist in "$COVE_DIR"/com.cove.php-fpm-*.plist; do
+            [ -f "$plist" ] || continue
+            ver=$(basename "$plist" .plist)
+            ver="${ver#com.cove.php-fpm-}"
+            state="stopped"
+            pgrep -f "php-fpm/$ver/php-fpm.conf" &>/dev/null && state="running"
+            echo "  php-fpm $ver: $state ($RUN_DIR/php-$ver.sock)"
+            found=true
+        done
+        if [ "$found" = false ]; then
+            echo "  No native php-fpm services active. Pin one with: cove php <site> 8.2"
+        fi
+    fi
+}
+
+cove_php() {
+    local site_name="$1"
+    local requested="$2"
+
+    if [ -z "$site_name" ]; then
+        cove_php_overview
+        return 0
+    fi
+
+    site_name="${site_name%.localhost}"
+    local site_dir="$SITES_DIR/$site_name.localhost"
+    if [ ! -d "$site_dir" ]; then
+        gum style --foreground red "❌ Error: Site '$site_name.localhost' not found."
+        exit 1
+    fi
+
+    # Show mode: no version argument.
+    if [ -z "$requested" ]; then
+        local pinned
+        pinned=$(site_php_version "$site_dir")
+        if [ -n "$pinned" ]; then
+            echo "$site_name.localhost is pinned to PHP $pinned (native php-fpm)."
+        else
+            echo "$site_name.localhost uses Cove's default PHP $(frankenphp_php_version) (FrankenPHP)."
+        fi
+        return 0
+    fi
+
+    # Unpin: back to FrankenPHP.
+    if [ "$requested" == "default" ]; then
+        if [ ! -f "$site_dir/php_version" ]; then
+            echo "ℹ️  $site_name.localhost already uses Cove's default PHP."
+            return 0
+        fi
+        rm -f "$site_dir/php_version"
+        regenerate_caddyfile
+        gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 \
+            "✅ $site_name.localhost back on Cove's default PHP $(frankenphp_php_version)" \
+            "URL: $(url_for "$site_name.localhost")"
+        return 0
+    fi
+
+    local ver
+    ver=$(normalize_php_version "$requested")
+    if [ -z "$ver" ]; then
+        gum style --foreground red "❌ Error: Invalid PHP version '$requested'." \
+            "Use a version like 8.2, php@8.3, or 'default'."
+        exit 1
+    fi
+
+    # Pinning to FrankenPHP's own version means no pin at all — only OLDER
+    # versions run on native FPM, per the feature's design.
+    local default_mm
+    default_mm=$(normalize_php_version "$(frankenphp_php_version)")
+    if [ -n "$default_mm" ] && [ "$ver" == "$default_mm" ]; then
+        echo "ℹ️  PHP $ver is Cove's default (FrankenPHP); nothing to pin."
+        if [ -f "$site_dir/php_version" ]; then
+            rm -f "$site_dir/php_version"
+            regenerate_caddyfile
+            echo "   Removed the existing pin."
+        fi
+        return 0
+    fi
+
+    if ! ensure_php_formula "$ver"; then
+        exit 1
+    fi
+
+    echo "📌 Pinning $site_name.localhost to PHP $ver (native php-fpm behind FrankenPHP)..."
+    echo "$ver" > "$site_dir/php_version"
+    regenerate_caddyfile
+
+    # Same warm-poll as cove add: the reload is synchronous, but give the new
+    # fastcgi upstream a beat to accept its first connection.
+    local warm_url
+    warm_url=$(url_for "$site_name.localhost")
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        if curl -ks --max-time 1 -o /dev/null "$warm_url/" 2>/dev/null; then
+            break
+        fi
+        sleep 0.2
+    done
+
+    gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 \
+        "✅ $site_name.localhost is now running PHP $ver" \
+        "URL: $warm_url"
 }
 
 cove_ports() {
@@ -8441,9 +10500,10 @@ cove_rename() {
     if [ -f "$new_site_dir/public/wp-config.php" ]; then
         source_config
         
-        # Get WP-CLI command (adds --allow-root if running as root)
+        # Get WP-CLI command (adds --allow-root if running as root; uses the
+        # site's pinned PHP when one is set)
         local wp_cmd
-        wp_cmd=$(get_wp_cmd)
+        wp_cmd=$(get_wp_cmd "$new_site_dir")
         
         local old_db_name
         old_db_name=$(echo "cove_$old_name" | tr -c '[:alnum:]_' '_')
@@ -8906,10 +10966,31 @@ cove_status() {
         fi
     fi
     
+    # Native php-fpm units for sites pinned to an older PHP (`cove php`).
+    # One row per version with an installed unit; nothing pinned = no rows.
+    local fpm_lines=""
+    if [ "$OS" == "macos" ]; then
+        local fpm_plist fpm_ver fpm_state
+        for fpm_plist in "$COVE_DIR"/com.cove.php-fpm-*.plist; do
+            [ -f "$fpm_plist" ] || continue
+            fpm_ver=$(basename "$fpm_plist" .plist)
+            fpm_ver="${fpm_ver#com.cove.php-fpm-}"
+            fpm_state="❌ Stopped"
+            # Same reasoning as the mailpit pgrep above: probe the process,
+            # not the launchd label. The master's title carries the config
+            # path, which pins the match to this exact version.
+            if pgrep -f "php-fpm/$fpm_ver/php-fpm.conf" &>/dev/null; then
+                fpm_state="✅ Running"
+            fi
+            fpm_lines+="  PHP-FPM $fpm_ver:  $fpm_state"$'\n'
+        done
+    fi
+
     echo ""
     echo "  Caddy Server: $caddy_status"
     echo "  MariaDB:      $mariadb_status"
     echo "  Mailpit:      $mailpit_status"
+    [ -n "$fpm_lines" ] && printf '%s' "$fpm_lines"
     echo ""
 
     if [[ "$caddy_status" == "✅ Running" && "$mariadb_status" == "✅ Running" && "$mailpit_status" == "✅ Running" ]]; then

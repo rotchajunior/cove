@@ -1,6 +1,8 @@
 # Changelog
 
-## [Unreleased]
+## [1.13] - 2026-08-07
+
+Cove learns versions. Pin any site to an older PHP with `cove php` — a native Homebrew php-fpm running behind FrankenPHP, switchable from the dashboard with one click — choose the WordPress release at creation with `cove add mysite 6.4.3`, and audit or update every site's core at once with the new `cove core`. `cove clone` stamps out copies of a seeded site — files, database, URLs — in seconds via copy-on-write. The dashboard dropped its last external dependency so it loads without internet, clicking a row now opens its action menu, and the bundled Adminer jumped to 6.0.
 
 ### 🛠️ Improvements & Changes
 

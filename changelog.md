@@ -1,6 +1,8 @@
 # Changelog
 
-## [Unreleased]
+## [1.14] - 2026-08-08
+
+Cove gets a face: an official macOS menu bar companion — created by Robby McCullough and folded into the project with his blessing — shows the stack's health at a glance, starts and stops services, opens or creates sites, and keeps itself current, all compiled locally in seconds from source that ships inside `cove.sh` itself. A new `cove status --porcelain` gives it (and any tooling you write) a stable machine-readable contract. Under the hood, a security-audit pass now validates every hostname that reaches the Caddyfile and `/etc/hosts`, and first-time installs were fixed on fresh Macs, containers, and minimal RHEL images.
 
 ### ✨ New Features
 

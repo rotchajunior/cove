@@ -146,6 +146,7 @@ static const NSInteger kServiceRowStartIndex = 2;
 
     __weak typeof(self) weakSelf = self;
     [self runCoveWithArguments:@[@"status", @"--porcelain"]
+                       timeout:20.0
                     completion:^(int status, NSString *output, NSError *error) {
         AppDelegate *strongSelf = weakSelf;
         if (!strongSelf) {
@@ -153,8 +154,10 @@ static const NSInteger kServiceRowStartIndex = 2;
         }
 
         if (status == 0) {
-            [strongSelf applyPorcelainOutput:output];
+            // Clear the prior error FIRST — applyPorcelainOutput may set a new
+            // one (unparseable output), and it must survive this call.
             strongSelf.lastError = nil;
+            [strongSelf applyPorcelainOutput:output];
         } else {
             strongSelf.lastError = error.localizedDescription ?: @"Unable to read Cove status.";
         }
@@ -350,8 +353,12 @@ static const NSInteger kServiceRowStartIndex = 2;
     self.lastUserActionTime = CFAbsoluteTimeGetCurrent();
     [self updateMenu];
 
+    // enable/disable/reload can legitimately take a while on a big install
+    // (cert issuance, service restarts), so give them generous headroom.
     __weak typeof(self) weakSelf = self;
-    [self runCoveWithArguments:arguments completion:^(int status, NSString *output, NSError *error) {
+    [self runCoveWithArguments:arguments
+                       timeout:120.0
+                    completion:^(int status, NSString *output, NSError *error) {
         (void)output;
         AppDelegate *strongSelf = weakSelf;
         if (!strongSelf) {
@@ -373,7 +380,25 @@ static const NSInteger kServiceRowStartIndex = 2;
 }
 
 - (void)runCoveWithArguments:(NSArray<NSString *> *)arguments
+                     timeout:(NSTimeInterval)timeout
                   completion:(CoveCommandCompletion)completion {
+    // Fire the completion at most once, on the main queue. The reader thread
+    // and the watchdog both call this; whichever wins, the loser is a no-op.
+    // This is what guarantees the app recovers: even if the blocking read
+    // below never returns (a subprocess inherited the pipe and outlived cove),
+    // the watchdog still fires completion and clears `busy`.
+    NSLock *lock = [[NSLock alloc] init];
+    __block BOOL finished = NO;
+    CoveCommandCompletion finishOnce = ^(int status, NSString *output, NSError *error) {
+        [lock lock];
+        if (finished) { [lock unlock]; return; }
+        finished = YES;
+        [lock unlock];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            completion(status, output, error);
+        });
+    };
+
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         NSString *executable = [self coveExecutablePath];
         NSArray<NSString *> *actualArguments = arguments;
@@ -397,11 +422,27 @@ static const NSInteger kServiceRowStartIndex = 2;
         NSError *launchError = nil;
         BOOL launched = [task launchAndReturnError:&launchError];
         if (!launched) {
-            dispatch_async(dispatch_get_main_queue(), ^{
-                completion(-1, @"", launchError);
-            });
+            finishOnce(-1, @"", launchError);
             return;
         }
+
+        // Watchdog: a command that outlives its timeout is wedged. Terminate it
+        // (which lets the read below unblock in the common case) and report a
+        // timeout now regardless — so a stuck subprocess can't leave the app
+        // disabled forever. In the worst case one reader thread lingers on the
+        // dead pipe; the app itself stays responsive.
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(timeout * NSEC_PER_SEC)),
+                       dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            if (task.isRunning) {
+                [task terminate];
+            }
+            NSError *timeoutError =
+                [NSError errorWithDomain:@"CoveMenuBar"
+                                    code:-2
+                                userInfo:@{NSLocalizedDescriptionKey:
+                                    [NSString stringWithFormat:@"Timed out after %.0f seconds.", timeout]}];
+            finishOnce(-2, @"", timeoutError);
+        });
 
         NSData *data = [[outputPipe fileHandleForReading] readDataToEndOfFile];
         [task waitUntilExit];
@@ -420,9 +461,7 @@ static const NSInteger kServiceRowStartIndex = 2;
                                             userInfo:@{NSLocalizedDescriptionKey: message}];
         }
 
-        dispatch_async(dispatch_get_main_queue(), ^{
-            completion(terminationStatus, output, commandError);
-        });
+        finishOnce(terminationStatus, output, commandError);
     });
 }
 
@@ -760,8 +799,11 @@ static const NSInteger kServiceRowStartIndex = 2;
     self.lastUserActionTime = CFAbsoluteTimeGetCurrent();
     [self updateMenu];
 
+    // A full WordPress install (core download + DB + install + reload) runs a
+    // minute or more; allow four before treating it as wedged.
     __weak typeof(self) weakSelf = self;
     [self runCoveWithArguments:@[@"add", name]
+                       timeout:240.0
                     completion:^(int status, NSString *output, NSError *error) {
         AppDelegate *strongSelf = weakSelf;
         if (!strongSelf) {
@@ -799,8 +841,7 @@ static const NSInteger kServiceRowStartIndex = 2;
         return;
     }
     // `cove login` takes the site name without the .localhost suffix and
-    // prints a one-time login URL (inside a decorative box) — extract the
-    // first URL from the output and open it.
+    // prints a one-time login URL inside a decorative gum box.
     NSString *siteName = [host stringByReplacingOccurrencesOfString:@".localhost"
                                                          withString:@""
                                                             options:NSAnchoredSearch | NSBackwardsSearch
@@ -808,6 +849,7 @@ static const NSInteger kServiceRowStartIndex = 2;
 
     __weak typeof(self) weakSelf = self;
     [self runCoveWithArguments:@[@"login", siteName]
+                       timeout:45.0
                     completion:^(int status, NSString *output, NSError *error) {
         AppDelegate *strongSelf = weakSelf;
         if (!strongSelf) {
@@ -816,16 +858,21 @@ static const NSInteger kServiceRowStartIndex = 2;
 
         NSString *loginURL = nil;
         if (status == 0) {
+            // stdout and stderr are merged, so wp-cli/PHP notices (which often
+            // print their own https:// URLs) can appear before the real login
+            // line. Don't take the first URL — take the one that actually
+            // points at THIS site's login endpoint. Charset widened so a token
+            // containing ~ # + ! @ isn't truncated mid-URL.
             NSRegularExpression *regex =
-                [NSRegularExpression regularExpressionWithPattern:@"https://[A-Za-z0-9.:/_?=&%-]+"
+                [NSRegularExpression regularExpressionWithPattern:@"https://[A-Za-z0-9.:/_?=&%~#+!@-]+"
                                                           options:0
                                                             error:nil];
-            NSTextCheckingResult *match =
-                [regex firstMatchInString:output
-                                  options:0
-                                    range:NSMakeRange(0, output.length)];
-            if (match) {
-                loginURL = [output substringWithRange:match.range];
+            for (NSTextCheckingResult *match in
+                 [regex matchesInString:output options:0 range:NSMakeRange(0, output.length)]) {
+                NSString *candidate = [output substringWithRange:match.range];
+                if ([candidate containsString:host] && [candidate containsString:@"wp-login"]) {
+                    loginURL = candidate;   // keep scanning; last match wins
+                }
             }
         }
 

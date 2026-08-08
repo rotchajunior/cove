@@ -10,8 +10,21 @@ The menu bar icon shows Cove at a glance:
 - **Light grayscale** — some services are running
 - **Dark grayscale** — all services are stopped
 
+PHP-FPM pools for version-pinned sites (`cove php`) are monitored alongside the
+three core services.
+
 The menu can start/stop Cove, refresh status, open the Dashboard / Adminer /
-Mailpit, open the logs folder, and register itself to launch at login.
+Mailpit, open the logs and Sites folders, and register itself to launch at
+login. A Sites submenu lists every site for one-click open — hold Option on a
+WordPress site to generate a one-time admin login via `cove login` instead.
+The app posts a macOS notification when a service dies while the rest of the
+stack is still running (it stays quiet when everything stops at once — that's
+usually a deliberate `cove disable`), and checks GitHub daily for new Cove
+releases, offering an "Update Cove" item that runs `cove upgrade` in Terminal.
+
+Status is read via `cove status --porcelain` — a stable machine-readable
+contract defined in `commands/status`. Reword the human status output freely;
+never change the porcelain keys without updating `Sources/main.m` alongside.
 
 ## How it ships
 

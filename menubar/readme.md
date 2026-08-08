@@ -13,10 +13,13 @@ The menu bar icon shows Cove at a glance:
 PHP-FPM pools for version-pinned sites (`cove php`) are monitored alongside the
 three core services.
 
-The menu can start/stop Cove, refresh status, open the Dashboard / Adminer /
-Mailpit, open the logs and Sites folders, and register itself to launch at
-login. A Sites submenu lists every site for one-click open — hold Option on a
-WordPress site to generate a one-time admin login via `cove login` instead.
+The menu can start/stop Cove, refresh status, reload Caddy, open the
+Dashboard / Adminer / Mailpit, open the logs and Sites folders, and register
+itself to launch at login. A Sites submenu lists every site for one-click
+open — hold Option on a WordPress site to generate a one-time admin login via
+`cove login` instead. Long lists get a "Recent" section (top 5 by the same
+modified signal the dashboard sorts on), and "New Site…" prompts for a name
+and runs `cove add`, opening the site when it lands.
 The app posts a macOS notification when a service dies while the rest of the
 stack is still running (it stays quiet when everything stops at once — that's
 usually a deliberate `cove disable`), and checks GitHub daily for new Cove

@@ -40,6 +40,8 @@ static const NSInteger kServiceRowStartIndex = 2;
 @property(nonatomic, strong) NSDictionary<NSString *, NSNumber *> *serviceStates;
 @property(nonatomic, assign) BOOL statesKnown;
 @property(nonatomic, assign) BOOL busy;
+// What the summary row says while busy ("Starting Cove…", "Creating x…").
+@property(nonatomic, copy) NSString *busyText;
 @property(nonatomic, copy) NSString *lastError;
 @property(nonatomic, copy) NSString *coveVersion;
 @property(nonatomic, copy) NSString *latestVersion;
@@ -55,6 +57,7 @@ static const NSInteger kServiceRowStartIndex = 2;
 @property(nonatomic, strong) NSMenuItem *errorItem;
 @property(nonatomic, strong) NSMenuItem *actionItem;
 @property(nonatomic, strong) NSMenuItem *refreshItem;
+@property(nonatomic, strong) NSMenuItem *reloadItem;
 @property(nonatomic, strong) NSMenuItem *sitesItem;
 @property(nonatomic, strong) NSMenuItem *dashboardItem;
 @property(nonatomic, strong) NSMenuItem *adminerItem;
@@ -270,19 +273,29 @@ static const NSInteger kServiceRowStartIndex = 2;
 #pragma mark - Actions
 
 - (void)startCove {
-    [self runActionWithArguments:@[@"enable"] actionName:@"start"];
+    [self runActionWithArguments:@[@"enable"] actionName:@"start" busyText:@"Starting Cove…"];
 }
 
 - (void)stopCove {
-    [self runActionWithArguments:@[@"disable"] actionName:@"stop"];
+    [self runActionWithArguments:@[@"disable"] actionName:@"stop" busyText:@"Stopping Cove…"];
 }
 
-- (void)runActionWithArguments:(NSArray<NSString *> *)arguments actionName:(NSString *)actionName {
+// Regenerates the Caddyfile and reloads Caddy — the thing you want after
+// hand-editing a directive. (Its /etc/hosts sudo step fails silently in a
+// non-interactive shell; that's expected and harmless.)
+- (void)reloadCaddy {
+    [self runActionWithArguments:@[@"reload"] actionName:@"reload" busyText:@"Reloading Caddy…"];
+}
+
+- (void)runActionWithArguments:(NSArray<NSString *> *)arguments
+                    actionName:(NSString *)actionName
+                      busyText:(NSString *)busyText {
     if (self.busy) {
         return;
     }
 
     self.busy = YES;
+    self.busyText = busyText;
     self.lastError = nil;
     self.lastUserActionTime = CFAbsoluteTimeGetCurrent();
     [self updateMenu];
@@ -296,6 +309,7 @@ static const NSInteger kServiceRowStartIndex = 2;
         }
 
         strongSelf.busy = NO;
+        strongSelf.busyText = nil;
         strongSelf.lastUserActionTime = CFAbsoluteTimeGetCurrent();
         if (status != 0) {
             strongSelf.lastError = error.localizedDescription ?: @"The Cove command failed.";
@@ -406,6 +420,12 @@ static const NSInteger kServiceRowStartIndex = 2;
     self.refreshItem.target = self;
     [self.menu addItem:self.refreshItem];
 
+    self.reloadItem = [[NSMenuItem alloc] initWithTitle:@"Reload Caddy"
+                                                 action:@selector(reloadCaddy)
+                                          keyEquivalent:@""];
+    self.reloadItem.target = self;
+    [self.menu addItem:self.reloadItem];
+
     [self.menu addItem:[NSMenuItem separatorItem]];
 
     self.sitesItem = [[NSMenuItem alloc] initWithTitle:@"Sites" action:nil keyEquivalent:@""];
@@ -475,6 +495,7 @@ static const NSInteger kServiceRowStartIndex = 2;
     self.actionItem.action = allRunning ? @selector(stopCove) : @selector(startCove);
     self.actionItem.enabled = !self.busy;
     self.refreshItem.enabled = !self.busy;
+    self.reloadItem.enabled = !self.busy && [self serviceRunning:@"caddy"];
 
     self.dashboardItem.enabled = [self serviceRunning:@"caddy"];
     self.adminerItem.enabled = [self serviceRunning:@"caddy"];
@@ -545,6 +566,9 @@ static const NSInteger kServiceRowStartIndex = 2;
 // ~/Cove/Sites. The directory also collects loose files (logs, scripts), so
 // filter strictly. A cheap readdir on the main thread — sites lists are small.
 // Called from menuWillOpen, before the menu is on screen.
+//
+// Long lists get a "Recent" section: top 5 by the same signal the dashboard's
+// modified column uses — mtime of <site>/public, falling back to the site dir.
 - (void)rebuildSitesSubmenu {
     NSMenu *submenu = self.sitesItem.submenu;
     [submenu removeAllItems];
@@ -555,7 +579,7 @@ static const NSInteger kServiceRowStartIndex = 2;
         [[fileManager contentsOfDirectoryAtPath:sitesDir error:nil]
             sortedArrayUsingSelector:@selector(localizedCaseInsensitiveCompare:)];
 
-    NSUInteger siteCount = 0;
+    NSMutableArray<NSDictionary *> *sites = [NSMutableArray array];
     for (NSString *entry in entries) {
         if (![entry hasSuffix:@".localhost"]) {
             continue;
@@ -565,41 +589,145 @@ static const NSInteger kServiceRowStartIndex = 2;
         if (![fileManager fileExistsAtPath:sitePath isDirectory:&isDirectory] || !isDirectory) {
             continue;
         }
-        siteCount++;
 
-        NSMenuItem *siteItem = [[NSMenuItem alloc] initWithTitle:entry
-                                                          action:@selector(openSite:)
-                                                   keyEquivalent:@""];
-        siteItem.target = self;
-        siteItem.representedObject = entry;
-        [submenu addItem:siteItem];
+        NSString *publicPath = [sitePath stringByAppendingPathComponent:@"public"];
+        NSDate *modified = [fileManager attributesOfItemAtPath:publicPath error:nil].fileModificationDate
+            ?: [fileManager attributesOfItemAtPath:sitePath error:nil].fileModificationDate
+            ?: [NSDate distantPast];
+        BOOL isWordPress = [fileManager fileExistsAtPath:
+                            [publicPath stringByAppendingPathComponent:@"wp-config.php"]];
+        [sites addObject:@{ @"name": entry, @"modified": modified, @"wp": @(isWordPress) }];
+    }
 
-        // WordPress sites get an option-key alternate that generates a
-        // one-time admin login via `cove login`.
-        NSString *wpConfig = [sitePath stringByAppendingPathComponent:@"public/wp-config.php"];
-        if ([fileManager fileExistsAtPath:wpConfig]) {
-            NSMenuItem *loginItem =
-                [[NSMenuItem alloc] initWithTitle:[NSString stringWithFormat:@"Log in to %@", entry]
-                                          action:@selector(loginToSite:)
-                                   keyEquivalent:@""];
-            loginItem.target = self;
-            loginItem.representedObject = entry;
-            loginItem.keyEquivalentModifierMask = NSEventModifierFlagOption;
-            loginItem.alternate = YES;
-            [submenu addItem:loginItem];
+    if (sites.count >= 8) {
+        NSArray<NSDictionary *> *recent =
+            [[sites sortedArrayUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+                return [b[@"modified"] compare:a[@"modified"]];
+            }] subarrayWithRange:NSMakeRange(0, 5)];
+
+        NSMenuItem *recentHeader = [[NSMenuItem alloc] initWithTitle:@"Recent"
+                                                              action:nil
+                                                       keyEquivalent:@""];
+        recentHeader.enabled = NO;
+        [submenu addItem:recentHeader];
+        for (NSDictionary *site in recent) {
+            [self addItemsForSite:site[@"name"] isWordPress:[site[@"wp"] boolValue] toMenu:submenu];
         }
+        [submenu addItem:[NSMenuItem separatorItem]];
     }
 
-    if (siteCount == 0) {
-        NSMenuItem *emptyItem = [[NSMenuItem alloc] initWithTitle:@"No sites yet"
-                                                           action:nil
-                                                    keyEquivalent:@""];
-        emptyItem.enabled = NO;
-        [submenu addItem:emptyItem];
-        self.sitesItem.title = @"Sites";
-    } else {
-        self.sitesItem.title = [NSString stringWithFormat:@"Sites (%lu)", (unsigned long)siteCount];
+    for (NSDictionary *site in sites) {
+        [self addItemsForSite:site[@"name"] isWordPress:[site[@"wp"] boolValue] toMenu:submenu];
     }
+
+    if (sites.count > 0) {
+        [submenu addItem:[NSMenuItem separatorItem]];
+        self.sitesItem.title = [NSString stringWithFormat:@"Sites (%lu)", (unsigned long)sites.count];
+    } else {
+        self.sitesItem.title = @"Sites";
+    }
+
+    NSMenuItem *newSiteItem = [[NSMenuItem alloc] initWithTitle:@"New Site…"
+                                                         action:@selector(promptForNewSite)
+                                                  keyEquivalent:@""];
+    newSiteItem.target = self;
+    newSiteItem.enabled = !self.busy;
+    [submenu addItem:newSiteItem];
+}
+
+- (void)addItemsForSite:(NSString *)entry isWordPress:(BOOL)isWordPress toMenu:(NSMenu *)submenu {
+    NSMenuItem *siteItem = [[NSMenuItem alloc] initWithTitle:entry
+                                                      action:@selector(openSite:)
+                                               keyEquivalent:@""];
+    siteItem.target = self;
+    siteItem.representedObject = entry;
+    [submenu addItem:siteItem];
+
+    // WordPress sites get an option-key alternate that generates a
+    // one-time admin login via `cove login`.
+    if (isWordPress) {
+        NSMenuItem *loginItem =
+            [[NSMenuItem alloc] initWithTitle:[NSString stringWithFormat:@"Log in to %@", entry]
+                                      action:@selector(loginToSite:)
+                               keyEquivalent:@""];
+        loginItem.target = self;
+        loginItem.representedObject = entry;
+        loginItem.keyEquivalentModifierMask = NSEventModifierFlagOption;
+        loginItem.alternate = YES;
+        [submenu addItem:loginItem];
+    }
+}
+
+#pragma mark - New site
+
+- (void)promptForNewSite {
+    [NSApp activateIgnoringOtherApps:YES];
+    NSAlert *alert = [[NSAlert alloc] init];
+    alert.messageText = @"New Cove Site";
+    alert.informativeText = @"Creates a WordPress site at <name>.localhost.\n"
+                             "Lowercase letters, numbers, and hyphens only.";
+    [alert addButtonWithTitle:@"Create"];
+    [alert addButtonWithTitle:@"Cancel"];
+
+    NSTextField *field = [[NSTextField alloc] initWithFrame:NSMakeRect(0, 0, 230, 24)];
+    field.placeholderString = @"my-new-site";
+    alert.accessoryView = field;
+    alert.window.initialFirstResponder = field;
+
+    if ([alert runModal] != NSAlertFirstButtonReturn) {
+        return;
+    }
+
+    NSString *name = [[field.stringValue lowercaseString] stringByTrimmingCharactersInSet:
+                      [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (name.length == 0) {
+        return;
+    }
+
+    // Mirror cove add's own validation so obvious typos fail fast with a
+    // clear message instead of a shell error.
+    NSRegularExpression *valid =
+        [NSRegularExpression regularExpressionWithPattern:@"^[a-z0-9]([a-z0-9-]*[a-z0-9])?$"
+                                                  options:0
+                                                    error:nil];
+    if (![valid firstMatchInString:name options:0 range:NSMakeRange(0, name.length)]) {
+        [self showErrorWithTitle:@"Invalid site name"
+                         message:@"Site names can only contain lowercase letters, numbers, and "
+                                  "hyphens, and cannot begin or end with a hyphen."];
+        return;
+    }
+
+    if (self.busy) {
+        return;
+    }
+    self.busy = YES;
+    self.busyText = [NSString stringWithFormat:@"Creating %@.localhost…", name];
+    self.lastUserActionTime = CFAbsoluteTimeGetCurrent();
+    [self updateMenu];
+
+    __weak typeof(self) weakSelf = self;
+    [self runCoveWithArguments:@[@"add", name]
+                    completion:^(int status, NSString *output, NSError *error) {
+        (void)output;
+        AppDelegate *strongSelf = weakSelf;
+        if (!strongSelf) {
+            return;
+        }
+
+        strongSelf.busy = NO;
+        strongSelf.busyText = nil;
+        strongSelf.lastUserActionTime = CFAbsoluteTimeGetCurrent();
+        if (status != 0) {
+            [strongSelf showErrorWithTitle:[NSString stringWithFormat:@"Could not create %@", name]
+                                   message:error.localizedDescription
+                                           ?: @"cove add exited with an error."];
+            [strongSelf updateMenu];
+            return;
+        }
+
+        [strongSelf refreshStatus];
+        [strongSelf openCoveHost:[name stringByAppendingString:@".localhost"]];
+    }];
 }
 
 - (void)openSite:(NSMenuItem *)sender {
@@ -809,7 +937,7 @@ static const NSInteger kServiceRowStartIndex = 2;
 
 - (NSString *)summaryText {
     if (self.busy) {
-        return @"Cove is updating...";
+        return self.busyText.length > 0 ? self.busyText : @"Cove is updating…";
     }
     if (self.lastError.length > 0) {
         return @"Cove status unavailable";

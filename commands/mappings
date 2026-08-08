@@ -39,6 +39,13 @@ cove_mappings() {
             exit 1
         fi
 
+        # Reject anything that isn't a bare hostname before it reaches the
+        # Caddyfile and /etc/hosts (both generated from this file).
+        if ! validate_hostname "$domain"; then
+            gum style --foreground red "❌ Error: Invalid domain '$domain'." "Domains may contain only letters, numbers, dots, and hyphens."
+            exit 1
+        fi
+
         # Simple validation: prevent duplicates
         if [ -f "$mappings_file" ] && grep -Fxq "$domain" "$mappings_file"; then
             gum style --foreground yellow "⚠️  Domain '$domain' is already mapped to this site."

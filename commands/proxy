@@ -85,6 +85,13 @@ cove_proxy_add() {
         exit 1
     fi
 
+    # Reject anything but a bare hostname before it becomes a Caddyfile domain
+    # label — otherwise the value can inject an arbitrary server block.
+    if ! validate_hostname "$domain"; then
+        gum style --foreground red "❌ Error: Invalid domain '$domain'." "Domains may contain only letters, numbers, dots, and hyphens."
+        exit 1
+    fi
+
     if [ -z "$target" ]; then
         require_interactive "The proxy target" "it positionally: cove proxy add <name> <domain> <target>"
         target=$(gum input --width 0 --placeholder "Target to proxy to (e.g., 127.0.0.1:4096)")
@@ -92,6 +99,12 @@ cove_proxy_add() {
 
     if [ -z "$target" ]; then
         gum style --foreground red "❌ Error: Target is required."
+        exit 1
+    fi
+
+    # Constrain to host[:port] so it can't break out of the reverse_proxy line.
+    if ! validate_proxy_target "$target"; then
+        gum style --foreground red "❌ Error: Invalid proxy target '$target'." "Targets may contain only letters, numbers, dots, hyphens, underscores, and a port colon (e.g. 127.0.0.1:4096)."
         exit 1
     fi
 

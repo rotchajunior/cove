@@ -186,7 +186,7 @@ RUN_DIR="$COVE_DIR/run"          # unix sockets: php-<ver>.sock
 PHP_FPM_DIR="$COVE_DIR/php-fpm"  # generated php-fpm configs: <ver>/php-fpm.conf
 
 PROTECTED_NAMES="cove"
-COVE_VERSION="1.13"
+COVE_VERSION="1.14"
 # Bundled Whoops release. Pinned here so cove install and cove upgrade deploy
 # the same version. 2.15.3 fatally broke under FrankenPHP's PHP 8.5 (web SAPI),
 # 500-ing every site via the auto_prepend bootstrap; 2.18.0 is compatible.
@@ -196,6 +196,11 @@ WHOOPS_VERSION="2.18.0"
 # compares the two to decide which sites need the plugin re-pushed on upgrade.
 # Bump whenever the mu-plugin code changes so existing sites pick it up.
 MU_PLUGIN_VERSION="0.5.0"
+# Version of the macOS menu bar companion app (menubar/, embedded at compile
+# time). Bump whenever anything under menubar/ changes — post-upgrade compares
+# this against the installed bundle's CFBundleShortVersionString to decide
+# whether an enabled menu bar needs a rebuild. Opt-in: never auto-installed.
+MENUBAR_VERSION="1.0"
 CADDY_CMD="frankenphp"
 
 # Note: BIN_DIR is set in setup_environment() based on OS and architecture
@@ -1152,13 +1157,10 @@ update_etc_hosts() {
 
     if [ ${#missing_hosts[@]} -gt 0 ]; then
         echo "   - Adding missing entries to /etc/hosts (requires sudo)..."
-        local entries_to_add=""
-        for host in "${missing_hosts[@]}"; do
-            entries_to_add+="127.0.0.1 $host\n"
-        done
-
-        # Use sudo tee to append all missing entries at once
-        echo -e "$entries_to_add" | sudo tee -a /etc/hosts > /dev/null
+        # printf '%s\n' (not echo -e) so a backslash sequence in a host value
+        # can never expand into an extra root-written line. Defense-in-depth
+        # behind validate_hostname at the mapping/proxy write sites.
+        printf '127.0.0.1 %s\n' "${missing_hosts[@]}" | sudo tee -a /etc/hosts > /dev/null
         echo "   - ✅ Done."
     else
         echo "   - ✅ All entries are present."
@@ -1764,6 +1766,33 @@ validate_site_name() {
     [ -n "$name" ] || return 1
     [[ "$name" =~ [^a-z0-9-] ]] && return 1
     [[ "$name" == -* || "$name" == *- ]] && return 1
+    return 0
+}
+
+# Validate a hostname/domain label before it is written into the Caddyfile and
+# /etc/hosts (site mappings, proxy domains, the Tailscale hostname). Accepts a
+# bare hostname or IP — underscores included (dev hostnames, _domainkey-style
+# labels) and an optional leading "*." wildcard label (valid as a Caddy site
+# address) — but no whitespace, no Caddy metacharacters ({ } newlines), no
+# slashes. Without this the value could inject a Caddy server block, or (once
+# read back into update_etc_hosts) a second root-written /etc/hosts line.
+validate_hostname() {
+    local host="$1"
+    [ -n "$host" ] || return 1
+    [ "${#host}" -le 253 ] || return 1
+    host="${host#\*.}"
+    [[ "$host" =~ ^[A-Za-z0-9_]([A-Za-z0-9._-]*[A-Za-z0-9_])?$ ]] || return 1
+    return 0
+}
+
+# Validate a reverse-proxy target (host or host:port). Same safe charset the
+# Tailscale proxy path already enforces on its target — letters, numbers, dots,
+# hyphens, underscores, and the port colon — which forbids the whitespace and
+# braces needed to break out of the `reverse_proxy <target>` line.
+validate_proxy_target() {
+    local target="$1"
+    [ -n "$target" ] || return 1
+    [[ "$target" =~ ^[A-Za-z0-9._:-]+$ ]] || return 1
     return 0
 }
 
@@ -3349,6 +3378,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                     autocapitalize="off"
                     autocorrect="off"
                     aria-label="Filter sites"
+                    autofocus
                 >
                 <button
                     type="button"
@@ -5112,6 +5142,9 @@ show_general_help() {
     echo "  directive        Add or remove custom Caddyfile rules for a site."
     echo "  proxy            Manage standalone reverse proxy entries."
     echo "  tailscale        Expose all sites to your Tailscale network."
+    if [ "$OS" == "macos" ]; then
+        echo "  menubar          Manage the macOS menu bar companion app."
+    fi
     echo "  db               Manage databases (e.g., 'cove db backup')."
     echo "  lan              Enable LAN access to sites for mobile app sync."
     echo "  ports            Reconfigure HTTP/HTTPS ports + update site URLs."
@@ -5159,9 +5192,13 @@ display_command_help() {
             echo "Stops all background services managed by Cove."
             ;;
         status)
-            echo "Usage: cove status"
+            echo "Usage: cove status [--porcelain]"
             echo ""
             echo "Checks the status of all background services."
+            echo ""
+            echo "Options:"
+            echo "  --porcelain    Stable machine-readable output (key=value per line),"
+            echo "                 as consumed by the menu bar app."
             ;;
         health)
             echo "Usage: cove health"
@@ -5352,6 +5389,24 @@ display_command_help() {
             echo "  cove tailscale enable"
             echo "  cove tailscale enable mycomputer.tail1234.ts.net"
             echo "  cove tailscale status"
+            ;;
+        menubar)
+            echo "Usage: cove menubar <subcommand>"
+            echo ""
+            echo "Manage the native macOS menu bar companion app."
+            echo "The menu bar icon shows Cove's status at a glance and can start/stop"
+            echo "services and open the Dashboard, Adminer, Mailpit, and logs."
+            echo ""
+            echo "Subcommands:"
+            echo "  enable     Build, install, and launch the menu bar app (also updates it)"
+            echo "  disable    Quit and remove the menu bar app"
+            echo ""
+            echo "The app is built locally (requires Apple Command Line Tools) and is"
+            echo "strictly opt-in — once enabled, 'cove upgrade' keeps it up to date."
+            echo ""
+            echo "Examples:"
+            echo "  cove menubar enable"
+            echo "  cove menubar disable"
             ;;
         db)
             echo "Usage: cove db <subcommand>"
@@ -5703,10 +5758,14 @@ main() {
             # up pool-template changes. Restart-shy: unchanged configs with a
             # live master are left alone.
             sync_php_fpm_services
+            # Rebuild the macOS menu bar app ONLY if the user opted in by
+            # enabling it, and only when MENUBAR_VERSION changed. No-op on
+            # Linux and for users without the app installed.
+            menubar_refresh_if_enabled
             ;;
         status)
             check_dependencies
-            cove_status
+            cove_status "$@"
             ;;
         health)
             check_dependencies
@@ -5765,6 +5824,10 @@ main() {
         tailscale)
             check_dependencies
             cove_tailscale "$@"
+            ;;
+        menubar)
+            check_dependencies
+            cove_menubar "$@"
             ;;
         mappings)
             check_dependencies
@@ -7588,8 +7651,18 @@ install_dependency() {
             
             # Check if URL is a tarball or direct binary
             if [[ "$binary_url" == *.tar.gz ]] || [[ "$binary_url" == *.tgz ]]; then
+                # Minimal RHEL-family images (containers, cloud) ship without tar,
+                # which makes the extraction below fail with no useful error.
+                if ! command -v tar &>/dev/null; then
+                    echo "   - Installing tar (required to extract)..."
+                    if [ "$PKG_MANAGER" == "apt" ]; then
+                        $SUDO_CMD apt-get install -y tar >/dev/null 2>&1
+                    else
+                        $SUDO_CMD dnf install -y tar >/dev/null 2>&1
+                    fi
+                fi
                 echo "   - Downloading and extracting tarball..."
-                if curl -sL "$binary_url" | tar -xz -C "$temp_dir" 2>/dev/null; then
+                if curl -sL "$binary_url" | tar -xz -C "$temp_dir"; then
                     # Find the binary in extracted contents
                     local binary_file
                     binary_file=$(find "$temp_dir" -name "$cmd_name" -type f -executable 2>/dev/null | head -1)
@@ -8898,6 +8971,13 @@ cove_mappings() {
             exit 1
         fi
 
+        # Reject anything that isn't a bare hostname before it reaches the
+        # Caddyfile and /etc/hosts (both generated from this file).
+        if ! validate_hostname "$domain"; then
+            gum style --foreground red "❌ Error: Invalid domain '$domain'." "Domains may contain only letters, numbers, dots, hyphens, and underscores (plus an optional leading '*.' wildcard)."
+            exit 1
+        fi
+
         # Simple validation: prevent duplicates
         if [ -f "$mappings_file" ] && grep -Fxq "$domain" "$mappings_file"; then
             gum style --foreground yellow "⚠️  Domain '$domain' is already mapped to this site."
@@ -9198,6 +9278,201 @@ cove_memory_set() {
 
     echo ""
     gum style --foreground green "✅ Done. Run 'cove memory' to verify."
+}
+
+# --- macOS Menu Bar App ---
+# Native menu bar companion (menubar/ in the repo), embedded into cove.sh at
+# compile time and built locally with clang. Originally by Robby McCullough
+# (github.com/RobbyMcCullough/cove-menubar, MIT), folded in with his blessing.
+MENUBAR_APP_PATH="$HOME/Applications/Cove Menu Bar.app"
+
+# Prints the CFBundleShortVersionString of the installed app, or nothing if the
+# app is missing or the plist is unreadable (e.g. a pre-official install).
+menubar_installed_version() {
+    /usr/libexec/PlistBuddy -c "Print CFBundleShortVersionString" \
+        "$MENUBAR_APP_PATH/Contents/Info.plist" 2>/dev/null
+}
+
+cove_menubar_enable() {
+    local quiet="$1"
+
+    if [ "$OS" != "macos" ]; then
+        gum style --foreground red "❌ The menu bar app is only available on macOS."
+        exit 1
+    fi
+
+    # clang ships with the Command Line Tools, which Homebrew already requires.
+    if ! command -v clang &>/dev/null || ! xcode-select -p &>/dev/null; then
+        gum style --foreground red "❌ Apple Command Line Tools are required to build the menu bar app."
+        echo "   Install them with: xcode-select --install"
+        exit 1
+    fi
+
+    local build_dir
+    build_dir=$(mktemp -d)
+
+    echo "🛠️  Building Cove Menu Bar v${MENUBAR_VERSION}..."
+
+    # Write out the embedded sources. The Info.plist carries a version
+    # placeholder so the installed bundle reports MENUBAR_VERSION — that is
+    # what post-upgrade compares against to decide whether a rebuild is due.
+    emit_menubar_main_m > "$build_dir/main.m"
+    emit_menubar_info_plist | sed "s/__MENUBAR_VERSION__/${MENUBAR_VERSION}/g" > "$build_dir/Info.plist"
+    emit_menubar_icon_svg > "$build_dir/cove-logo.svg"
+
+    if ! clang \
+        -fobjc-arc \
+        -O2 \
+        -Wall \
+        -Wextra \
+        -mmacosx-version-min=13.0 \
+        -framework Cocoa \
+        -framework CoreImage \
+        -framework ServiceManagement \
+        -framework UserNotifications \
+        "$build_dir/main.m" \
+        -o "$build_dir/CoveMenuBar"; then
+        rm -rf "$build_dir"
+        gum style --foreground red "❌ Failed to compile the menu bar app."
+        exit 1
+    fi
+
+    # Generate the .icns from the bundled vector logo — every slot renders
+    # crisp from the SVG, including the 1024px one. sips decoding SVG is
+    # undocumented Apple behavior (CoreSVG, observed working since macOS 11),
+    # so probe one conversion first and fail loudly rather than assemble a
+    # bundle around a corrupt icon.
+    local iconset_dir="$build_dir/CoveMenuBar.iconset"
+    mkdir -p "$iconset_dir"
+    if ! sips -s format png -z 16 16 "$build_dir/cove-logo.svg" \
+            --out "$build_dir/icon-probe.png" >/dev/null 2>&1 \
+        || ! sips -g pixelWidth "$build_dir/icon-probe.png" >/dev/null 2>&1; then
+        rm -rf "$build_dir"
+        gum style --foreground red "❌ This macOS could not rasterize the menu bar icon (SVG via sips)."
+        exit 1
+    fi
+    local spec size name
+    for spec in \
+        "16 icon_16x16.png" \
+        "32 icon_16x16@2x.png" \
+        "32 icon_32x32.png" \
+        "64 icon_32x32@2x.png" \
+        "128 icon_128x128.png" \
+        "256 icon_128x128@2x.png" \
+        "256 icon_256x256.png" \
+        "512 icon_256x256@2x.png" \
+        "512 icon_512x512.png" \
+        "1024 icon_512x512@2x.png"; do
+        size="${spec%% *}"
+        name="${spec#* }"
+        sips -s format png -z "$size" "$size" "$build_dir/cove-logo.svg" \
+            --out "$iconset_dir/$name" >/dev/null
+    done
+    iconutil -c icns "$iconset_dir" -o "$build_dir/CoveMenuBar.icns"
+
+    # Replace any existing install — including a pre-official one from the
+    # original standalone repo, which used the same bundle path.
+    pkill -x CoveMenuBar 2>/dev/null || true
+    rm -rf "$MENUBAR_APP_PATH"
+    mkdir -p "$MENUBAR_APP_PATH/Contents/MacOS" "$MENUBAR_APP_PATH/Contents/Resources/Assets"
+    cp "$build_dir/CoveMenuBar" "$MENUBAR_APP_PATH/Contents/MacOS/CoveMenuBar"
+    cp "$build_dir/CoveMenuBar.icns" "$MENUBAR_APP_PATH/Contents/Resources/CoveMenuBar.icns"
+    cp "$build_dir/cove-logo.svg" "$MENUBAR_APP_PATH/Contents/Resources/Assets/"
+    cp "$build_dir/Info.plist" "$MENUBAR_APP_PATH/Contents/Info.plist"
+    rm -rf "$build_dir"
+
+    # Ad-hoc signing keeps Gatekeeper happy without notarization — the binary
+    # was built on this machine, so there is no quarantine to clear.
+    codesign --force --deep --sign - "$MENUBAR_APP_PATH" 2>/dev/null
+
+    open "$MENUBAR_APP_PATH"
+
+    if [ "$quiet" == "quiet" ]; then
+        echo "   - Cove Menu Bar updated to v${MENUBAR_VERSION}."
+        return 0
+    fi
+
+    echo ""
+    gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 \
+        "✅ Cove Menu Bar is enabled" \
+        "Look for the Cove icon in your menu bar." \
+        "It will stay up to date automatically via 'cove upgrade'." \
+        "Remove it anytime with: cove menubar disable"
+}
+
+cove_menubar_disable() {
+    if [ "$OS" != "macos" ]; then
+        gum style --foreground red "❌ The menu bar app is only available on macOS."
+        exit 1
+    fi
+
+    if [ ! -d "$MENUBAR_APP_PATH" ]; then
+        echo "The menu bar app is not enabled."
+        exit 0
+    fi
+
+    pkill -x CoveMenuBar 2>/dev/null || true
+    # SMAppService login items can only be unregistered from inside the app
+    # they belong to — run the binary's unregister mode before deleting the
+    # bundle, or a stale entry lingers in System Settings → Login Items.
+    "$MENUBAR_APP_PATH/Contents/MacOS/CoveMenuBar" unregister 2>/dev/null || true
+    rm -rf "$MENUBAR_APP_PATH"
+    echo "✅ Cove Menu Bar disabled and removed."
+}
+
+# Called from post-upgrade. Strictly opt-in: does nothing unless the app is
+# already installed. Rebuilds only when the installed bundle's version differs
+# from MENUBAR_VERSION (a missing/unreadable version — e.g. the original
+# standalone install — counts as out of date and gets adopted).
+menubar_refresh_if_enabled() {
+    if [ "$OS" != "macos" ] || [ ! -d "$MENUBAR_APP_PATH" ]; then
+        return 0
+    fi
+
+    local installed
+    installed=$(menubar_installed_version)
+    if [ "$installed" != "$MENUBAR_VERSION" ]; then
+        echo "   - Menu bar app is v${installed:-unknown}; rebuilding as v${MENUBAR_VERSION}..."
+        cove_menubar_enable quiet
+    fi
+}
+
+cove_menubar() {
+    local action="$1"
+    shift 2>/dev/null || true
+
+    case "$action" in
+        enable)
+            cove_menubar_enable
+            ;;
+        disable)
+            cove_menubar_disable
+            ;;
+        *)
+            echo "Usage: cove menubar <subcommand>"
+            echo ""
+            echo "Manage the native macOS menu bar companion app."
+            echo "Shows service status at a glance and can start/stop Cove,"
+            echo "open the Dashboard, Adminer, Mailpit, and logs."
+            echo ""
+            echo "Subcommands:"
+            echo "  enable     Build, install, and launch the menu bar app (also updates it)"
+            echo "  disable    Quit and remove the menu bar app"
+            echo ""
+            if [ "$OS" == "macos" ]; then
+                local installed
+                installed=$(menubar_installed_version)
+                if [ -d "$MENUBAR_APP_PATH" ]; then
+                    echo "Currently: enabled (v${installed:-unknown})"
+                else
+                    echo "Currently: disabled"
+                fi
+                echo ""
+            fi
+            echo "Once enabled, 'cove upgrade' keeps the app up to date automatically."
+            exit 0
+            ;;
+    esac
 }
 
 cove_path() {
@@ -9712,6 +9987,13 @@ cove_proxy_add() {
         exit 1
     fi
 
+    # Reject anything but a bare hostname before it becomes a Caddyfile domain
+    # label — otherwise the value can inject an arbitrary server block.
+    if ! validate_hostname "$domain"; then
+        gum style --foreground red "❌ Error: Invalid domain '$domain'." "Domains may contain only letters, numbers, dots, hyphens, and underscores (plus an optional leading '*.' wildcard)."
+        exit 1
+    fi
+
     if [ -z "$target" ]; then
         require_interactive "The proxy target" "it positionally: cove proxy add <name> <domain> <target>"
         target=$(gum input --width 0 --placeholder "Target to proxy to (e.g., 127.0.0.1:4096)")
@@ -9719,6 +10001,12 @@ cove_proxy_add() {
 
     if [ -z "$target" ]; then
         gum style --foreground red "❌ Error: Target is required."
+        exit 1
+    fi
+
+    # Constrain to host[:port] so it can't break out of the reverse_proxy line.
+    if ! validate_proxy_target "$target"; then
+        gum style --foreground red "❌ Error: Invalid proxy target '$target'." "Targets may contain only letters, numbers, dots, hyphens, underscores, and a port colon (e.g. 127.0.0.1:4096)."
         exit 1
     fi
 
@@ -10926,7 +11214,18 @@ PYTHON_PROXY
 }
 
 cove_status() {
-    echo "🔎 Checking Cove service status..."
+    # --porcelain: stable machine-readable output (one key=value per line,
+    # lowercase). This is a CONTRACT consumed by the macOS menu bar app —
+    # reword the human output freely, but never change these keys/values
+    # without updating menubar/Sources/main.m alongside.
+    local porcelain=false
+    if [ "$1" == "--porcelain" ]; then
+        porcelain=true
+    fi
+
+    if [ "$porcelain" == false ]; then
+        echo "🔎 Checking Cove service status..."
+    fi
 
     local caddy_status="❌ Stopped"
     local mariadb_status="❌ Stopped"
@@ -10969,6 +11268,7 @@ cove_status() {
     # Native php-fpm units for sites pinned to an older PHP (`cove php`).
     # One row per version with an installed unit; nothing pinned = no rows.
     local fpm_lines=""
+    local fpm_porcelain=""
     if [ "$OS" == "macos" ]; then
         local fpm_plist fpm_ver fpm_state
         for fpm_plist in "$COVE_DIR"/com.cove.php-fpm-*.plist; do
@@ -10983,7 +11283,21 @@ cove_status() {
                 fpm_state="✅ Running"
             fi
             fpm_lines+="  PHP-FPM $fpm_ver:  $fpm_state"$'\n'
+            if [[ "$fpm_state" == *Running* ]]; then
+                fpm_porcelain+="php-fpm-$fpm_ver=running"$'\n'
+            else
+                fpm_porcelain+="php-fpm-$fpm_ver=stopped"$'\n'
+            fi
         done
+    fi
+
+    if [ "$porcelain" == true ]; then
+        echo "version=$COVE_VERSION"
+        [[ "$caddy_status" == *Running* ]] && echo "caddy=running" || echo "caddy=stopped"
+        [[ "$mariadb_status" == *Running* ]] && echo "mariadb=running" || echo "mariadb=stopped"
+        [[ "$mailpit_status" == *Running* ]] && echo "mailpit=running" || echo "mailpit=stopped"
+        [ -n "$fpm_porcelain" ] && printf '%s' "$fpm_porcelain"
+        return 0
     fi
 
     echo ""
@@ -11043,8 +11357,11 @@ cove_tailscale_enable() {
     # Remove any trailing dot
     hostname="${hostname%.}"
 
-    # Validate it looks like a hostname
-    if [[ ! "$hostname" =~ \. ]]; then
+    # Validate it looks like a hostname. validate_hostname matters here beyond
+    # UX: this value is interpolated raw into Caddyfile server-block labels by
+    # regenerate_caddyfile, so a stray space/brace would take every site down
+    # at the next reload.
+    if [[ ! "$hostname" =~ \. ]] || ! validate_hostname "$hostname"; then
         gum style --foreground red "❌ Error: Invalid hostname. Expected format: machine.tailnet.ts.net"
         exit 1
     fi
@@ -12367,6 +12684,1326 @@ cove_wsl_hosts() {
     echo ""
     gum style --foreground yellow "Note: WSL IP may change on restart. Run 'cove wsl-hosts' again to get updated info."
     echo ""
+}
+
+# --- Embedded macOS Menu Bar App (generated from menubar/ by compile.sh) ---
+
+emit_menubar_main_m() {
+cat <<'COVE_MENUBAR_MAIN_M_EOF'
+// Cove Menu Bar — macOS menu bar companion for Cove.
+//
+// Originally created by Robby McCullough (github.com/RobbyMcCullough/cove-menubar,
+// MIT) and folded into the official Cove project with his blessing.
+// Copyright (c) 2026 Robby McCullough. MIT License.
+//
+// This source is embedded into cove.sh at compile time (see compile.sh) and
+// built on the user's machine by `cove menubar enable` — dependency-free,
+// clang + system frameworks only. Keep it that way.
+//
+// Status is read via `cove status --porcelain` (key=value per line) — a
+// stable contract defined in commands/status. The human-readable status
+// output can change freely; the porcelain keys cannot.
+//
+// Menu architecture: the menu skeleton is built ONCE, with the three core
+// service rows pre-seeded, and every refresh mutates item titles/images in
+// place. Rebuilding items on refresh caused two visible glitches: the first
+// render had no service rows (so no icon column — text flush left), and the
+// first poll's rebuild re-layouted the open menu, making everything jump.
+
+#import <Cocoa/Cocoa.h>
+#import <CoreImage/CoreImage.h>
+#import <ServiceManagement/ServiceManagement.h>
+#import <UserNotifications/UserNotifications.h>
+
+typedef void (^CoveCommandCompletion)(int status, NSString *output, NSError *error);
+
+// Index of the first service row: summary + separator come before it.
+static const NSInteger kServiceRowStartIndex = 2;
+
+@interface AppDelegate : NSObject <NSApplicationDelegate, NSMenuDelegate>
+@property(nonatomic, strong) NSStatusItem *statusItem;
+@property(nonatomic, strong) NSMenu *menu;
+@property(nonatomic, strong) NSTimer *refreshTimer;
+@property(nonatomic, strong) NSTimer *updateCheckTimer;
+// Ordered porcelain keys (caddy, mariadb, mailpit, php-fpm-<ver>...) and
+// their running state from the most recent successful poll. serviceStates is
+// tri-state via absence: no entry for a key yet = unknown ("…" row).
+@property(nonatomic, strong) NSArray<NSString *> *serviceKeys;
+@property(nonatomic, strong) NSDictionary<NSString *, NSNumber *> *serviceStates;
+@property(nonatomic, assign) BOOL statesKnown;
+@property(nonatomic, assign) BOOL busy;
+// What the summary row says while busy ("Starting Cove…", "Creating x…").
+@property(nonatomic, copy) NSString *busyText;
+// Pulses the menu bar icon while a long action runs, so multi-second work
+// (site creation, enable) reads as "working" instead of "locked up".
+@property(nonatomic, strong) NSTimer *busyPulseTimer;
+@property(nonatomic, assign) BOOL pulsePhase;
+@property(nonatomic, copy) NSString *lastError;
+// A failed user action (create/start/stop/login). Unlike lastError, this is
+// NOT cleared by the next successful status poll — only by the next action —
+// so the evidence doesn't vanish seconds after the failure.
+@property(nonatomic, copy) NSString *lastActionError;
+@property(nonatomic, copy) NSString *coveVersion;
+@property(nonatomic, copy) NSString *latestVersion;
+@property(nonatomic, assign) CFAbsoluteTime lastUserActionTime;
+// Services seen newly stopped on the last poll, awaiting a second consecutive
+// stopped poll before the "stopped unexpectedly" notification fires. Absorbs
+// transient restarts (a terminal-run `cove enable`, service churn during
+// `cove upgrade`) that a single-poll snapshot would misread as a crash.
+@property(nonatomic, strong) NSMutableSet<NSString *> *pendingStopKeys;
+@property(nonatomic, assign) BOOL notificationsAllowed;
+@property(nonatomic, strong) NSImage *runningImage;
+@property(nonatomic, strong) NSImage *partialImage;
+@property(nonatomic, strong) NSImage *stoppedImage;
+// Stable menu items, created once and mutated in place.
+@property(nonatomic, strong) NSMenuItem *summaryItem;
+@property(nonatomic, strong) NSMutableArray<NSMenuItem *> *serviceItems;
+@property(nonatomic, strong) NSArray<NSString *> *serviceItemKeys;
+@property(nonatomic, strong) NSMenuItem *errorItem;
+@property(nonatomic, strong) NSMenuItem *actionItem;
+@property(nonatomic, strong) NSMenuItem *refreshItem;
+@property(nonatomic, strong) NSMenuItem *reloadItem;
+@property(nonatomic, strong) NSMenuItem *sitesItem;
+@property(nonatomic, strong) NSMenuItem *dashboardItem;
+@property(nonatomic, strong) NSMenuItem *adminerItem;
+@property(nonatomic, strong) NSMenuItem *mailpitItem;
+@property(nonatomic, strong) NSMenuItem *launchItem;
+@property(nonatomic, strong) NSMenuItem *versionItem;
+@end
+
+@implementation AppDelegate
+
+- (void)applicationDidFinishLaunching:(NSNotification *)notification {
+    [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
+    self.statusItem = [[NSStatusBar systemStatusBar] statusItemWithLength:NSVariableStatusItemLength];
+    [self loadStatusImages];
+
+    // Seed the core trio before the first poll so the very first render
+    // already has the service rows (and their icon column). PHP-FPM rows for
+    // pinned sites are appended when the first poll reports them.
+    self.serviceKeys = @[ @"caddy", @"mariadb", @"mailpit" ];
+    self.serviceStates = @{};
+    self.serviceItems = [NSMutableArray array];
+    self.serviceItemKeys = @[];
+
+    [self buildMenuSkeleton];
+    [self updateMenu];
+
+    __weak typeof(self) weakSelf = self;
+    [[UNUserNotificationCenter currentNotificationCenter]
+        requestAuthorizationWithOptions:UNAuthorizationOptionAlert
+                      completionHandler:^(BOOL granted, NSError *error) {
+                          (void)error;
+                          dispatch_async(dispatch_get_main_queue(), ^{
+                              weakSelf.notificationsAllowed = granted;
+                          });
+                      }];
+
+    [[[NSWorkspace sharedWorkspace] notificationCenter]
+        addObserver:self
+        selector:@selector(refreshStatus)
+        name:NSWorkspaceDidWakeNotification
+        object:nil];
+
+    [self refreshStatus];
+
+    // The menu refreshes on open (menuWillOpen:), so the timer only keeps the
+    // *icon* honest. A generous interval + tolerance lets macOS coalesce the
+    // wakeups instead of spinning up a bash pipeline every few seconds.
+    self.refreshTimer = [NSTimer scheduledTimerWithTimeInterval:20.0
+                                                        target:self
+                                                      selector:@selector(refreshStatus)
+                                                      userInfo:nil
+                                                       repeats:YES];
+    self.refreshTimer.tolerance = 5.0;
+
+    [self checkForUpdates];
+    self.updateCheckTimer = [NSTimer scheduledTimerWithTimeInterval:86400.0
+                                                             target:self
+                                                           selector:@selector(checkForUpdates)
+                                                           userInfo:nil
+                                                            repeats:YES];
+    self.updateCheckTimer.tolerance = 3600.0;
+}
+
+- (void)menuWillOpen:(NSMenu *)menu {
+    // Rebuild the Sites submenu before display (it isn't visible yet, so
+    // this can't cause an on-screen re-layout), then poll for fresh state —
+    // whose completion only mutates titles/images in place.
+    [self rebuildSitesSubmenu];
+    [self refreshStatus];
+}
+
+#pragma mark - Status polling
+
+- (void)refreshStatus {
+    if (self.busy) {
+        return;
+    }
+
+    __weak typeof(self) weakSelf = self;
+    [self runCoveWithArguments:@[@"status", @"--porcelain"]
+                       timeout:20.0
+                    completion:^(int status, NSString *output, NSError *error) {
+        AppDelegate *strongSelf = weakSelf;
+        if (!strongSelf) {
+            return;
+        }
+
+        if (status == 0) {
+            // Clear the prior error FIRST — applyPorcelainOutput may set a new
+            // one (unparseable output), and it must survive this call.
+            strongSelf.lastError = nil;
+            [strongSelf applyPorcelainOutput:output];
+        } else {
+            strongSelf.lastError = error.localizedDescription ?: @"Unable to read Cove status.";
+        }
+
+        [strongSelf updateMenu];
+    }];
+}
+
+- (void)applyPorcelainOutput:(NSString *)output {
+    NSMutableArray<NSString *> *keys = [NSMutableArray array];
+    NSMutableDictionary<NSString *, NSNumber *> *states = [NSMutableDictionary dictionary];
+
+    for (NSString *rawLine in [output componentsSeparatedByCharactersInSet:
+                               [NSCharacterSet newlineCharacterSet]]) {
+        NSString *line = [rawLine stringByTrimmingCharactersInSet:
+                          [NSCharacterSet whitespaceCharacterSet]];
+        NSRange eq = [line rangeOfString:@"="];
+        if (eq.location == NSNotFound || eq.location == 0) {
+            continue;
+        }
+        NSString *key = [line substringToIndex:eq.location];
+        NSString *value = [line substringFromIndex:eq.location + 1];
+
+        if ([key isEqualToString:@"version"]) {
+            self.coveVersion = value;
+            continue;
+        }
+        if ([value isEqualToString:@"running"] || [value isEqualToString:@"stopped"]) {
+            [keys addObject:key];
+            states[key] = @([value isEqualToString:@"running"]);
+        }
+    }
+
+    if (keys.count == 0) {
+        // Porcelain output we can't read — treat as an error, not "all down".
+        self.lastError = @"Unexpected status output from Cove.";
+        return;
+    }
+
+    [self notifyUnexpectedStopsFrom:self.serviceStates to:states];
+
+    self.serviceKeys = keys;
+    self.serviceStates = states;
+    self.statesKnown = YES;
+}
+
+// Post a notification for a service that died out from under a running stack.
+// Suppressed when: states aren't established yet, the user just acted through
+// the menu (start/stop churn), or EVERYTHING went down at once — that shape is
+// almost always a deliberate `cove disable` from a terminal, not a crash.
+// A stop must also survive TWO consecutive polls before it notifies: a service
+// mid-restart (terminal-run `cove enable`, the multi-minute service churn of
+// `cove upgrade`) is back up by the next poll and never alarms.
+- (void)notifyUnexpectedStopsFrom:(NSDictionary<NSString *, NSNumber *> *)oldStates
+                               to:(NSDictionary<NSString *, NSNumber *> *)newStates {
+    if (!self.pendingStopKeys) {
+        self.pendingStopKeys = [NSMutableSet set];
+    }
+    if (!self.statesKnown || !self.notificationsAllowed) {
+        [self.pendingStopKeys removeAllObjects];
+        return;
+    }
+    if (CFAbsoluteTimeGetCurrent() - self.lastUserActionTime < 20.0) {
+        [self.pendingStopKeys removeAllObjects];
+        return;
+    }
+
+    BOOL anyStillRunning = NO;
+    for (NSNumber *running in newStates.allValues) {
+        if (running.boolValue) {
+            anyStillRunning = YES;
+            break;
+        }
+    }
+    if (!anyStillRunning) {
+        [self.pendingStopKeys removeAllObjects];
+        return;
+    }
+
+    NSMutableSet<NSString *> *stillPending = [NSMutableSet set];
+    for (NSString *key in newStates) {
+        if (newStates[key].boolValue) {
+            continue;   // running — any pending suspicion is dropped
+        }
+        if (oldStates[key].boolValue) {
+            // Newly stopped: hold for confirmation on the next poll.
+            [stillPending addObject:key];
+        } else if ([self.pendingStopKeys containsObject:key]) {
+            // Stopped on the previous poll too — confirmed dead.
+            [self postNotificationWithBody:
+                [NSString stringWithFormat:@"%@ stopped unexpectedly.",
+                 [self displayNameForServiceKey:key]]];
+        }
+    }
+    self.pendingStopKeys = stillPending;
+}
+
+- (void)postNotificationWithBody:(NSString *)body {
+    if (!self.notificationsAllowed) {
+        return;
+    }
+    UNMutableNotificationContent *content = [[UNMutableNotificationContent alloc] init];
+    content.title = @"Cove";
+    content.body = body;
+    UNNotificationRequest *request =
+        [UNNotificationRequest requestWithIdentifier:[NSUUID UUID].UUIDString
+                                             content:content
+                                             trigger:nil];
+    [[UNUserNotificationCenter currentNotificationCenter]
+        addNotificationRequest:request withCompletionHandler:nil];
+}
+
+// Async action failures avoid NSAlert on purpose: a modal from an accessory
+// app can land behind a full-screen window where it silently blocks the main
+// thread. Instead: notification + persistent menu error row + a durable log
+// of the full command output at ~/Cove/Logs/menubar.log.
+- (void)reportActionFailure:(NSString *)title detail:(NSString *)detail {
+    NSString *firstLine = [[detail componentsSeparatedByCharactersInSet:
+                            [NSCharacterSet newlineCharacterSet]] firstObject] ?: @"";
+    self.lastActionError = title;
+    [self postNotificationWithBody:[NSString stringWithFormat:@"%@ — %@", title, firstLine]];
+    [self appendToLog:[NSString stringWithFormat:@"%@\n%@\n", title, detail]];
+    [self updateMenu];
+}
+
+- (void)appendToLog:(NSString *)text {
+    NSString *logsDir = [NSHomeDirectory() stringByAppendingPathComponent:@"Cove/Logs"];
+    NSString *path = [logsDir stringByAppendingPathComponent:@"menubar.log"];
+    NSDateFormatter *formatter = [[NSDateFormatter alloc] init];
+    formatter.dateFormat = @"yyyy-MM-dd HH:mm:ss";
+    NSString *stamped = [NSString stringWithFormat:@"[%@] %@\n",
+                         [formatter stringFromDate:[NSDate date]], text];
+
+    NSFileManager *fileManager = [NSFileManager defaultManager];
+    [fileManager createDirectoryAtPath:logsDir withIntermediateDirectories:YES
+                            attributes:nil error:nil];
+    if (![fileManager fileExistsAtPath:path]) {
+        [fileManager createFileAtPath:path contents:nil attributes:nil];
+    }
+    NSFileHandle *handle = [NSFileHandle fileHandleForWritingAtPath:path];
+    [handle seekToEndOfFile];
+    [handle writeData:[stamped dataUsingEncoding:NSUTF8StringEncoding]];
+    [handle closeFile];
+}
+
+- (NSString *)displayNameForServiceKey:(NSString *)key {
+    if ([key isEqualToString:@"caddy"])   { return @"Caddy"; }
+    if ([key isEqualToString:@"mariadb"]) { return @"MariaDB"; }
+    if ([key isEqualToString:@"mailpit"]) { return @"Mailpit"; }
+    if ([key hasPrefix:@"php-fpm-"]) {
+        return [NSString stringWithFormat:@"PHP-FPM %@",
+                [key substringFromIndex:[@"php-fpm-" length]]];
+    }
+    return key;
+}
+
+- (BOOL)serviceRunning:(NSString *)key {
+    return self.serviceStates[key].boolValue;
+}
+
+- (NSInteger)runningServiceCount {
+    NSInteger count = 0;
+    for (NSNumber *running in self.serviceStates.allValues) {
+        if (running.boolValue) {
+            count++;
+        }
+    }
+    return count;
+}
+
+- (BOOL)allServicesRunning {
+    if (!self.statesKnown || self.serviceKeys.count == 0) {
+        return NO;
+    }
+    for (NSString *key in self.serviceKeys) {
+        if (!self.serviceStates[key].boolValue) {
+            return NO;
+        }
+    }
+    return YES;
+}
+
+#pragma mark - Actions
+
+- (void)startCove {
+    [self runActionWithArguments:@[@"enable"] actionName:@"start" busyText:@"Starting Cove…"];
+}
+
+- (void)stopCove {
+    [self runActionWithArguments:@[@"disable"] actionName:@"stop" busyText:@"Stopping Cove…"];
+}
+
+// Regenerates the Caddyfile and reloads Caddy — the thing you want after
+// hand-editing a directive. (Its /etc/hosts sudo step fails silently in a
+// non-interactive shell; that's expected and harmless.)
+- (void)reloadCaddy {
+    [self runActionWithArguments:@[@"reload"] actionName:@"reload" busyText:@"Reloading Caddy…"];
+}
+
+- (void)runActionWithArguments:(NSArray<NSString *> *)arguments
+                    actionName:(NSString *)actionName
+                      busyText:(NSString *)busyText {
+    if (self.busy) {
+        return;
+    }
+
+    self.busy = YES;
+    self.busyText = busyText;
+    self.lastError = nil;
+    self.lastActionError = nil;
+    self.lastUserActionTime = CFAbsoluteTimeGetCurrent();
+    [self updateMenu];
+
+    // enable/disable/reload can legitimately take a while on a big install
+    // (cert issuance, service restarts), so give them generous headroom.
+    __weak typeof(self) weakSelf = self;
+    [self runCoveWithArguments:arguments
+                       timeout:120.0
+                    completion:^(int status, NSString *output, NSError *error) {
+        (void)output;
+        AppDelegate *strongSelf = weakSelf;
+        if (!strongSelf) {
+            return;
+        }
+
+        strongSelf.busy = NO;
+        strongSelf.busyText = nil;
+        strongSelf.lastUserActionTime = CFAbsoluteTimeGetCurrent();
+        if (status != 0) {
+            NSString *detail = error.localizedDescription ?: @"The Cove command failed.";
+            [strongSelf reportActionFailure:[NSString stringWithFormat:@"Could not %@ Cove", actionName]
+                                     detail:detail];
+            return;
+        }
+
+        [strongSelf refreshStatus];
+    }];
+}
+
+- (void)runCoveWithArguments:(NSArray<NSString *> *)arguments
+                     timeout:(NSTimeInterval)timeout
+                  completion:(CoveCommandCompletion)completion {
+    // Fire the completion at most once, on the main queue. The reader thread
+    // and the watchdog both call this; whichever wins, the loser is a no-op.
+    // This is what guarantees the app recovers: even if the blocking read
+    // below never returns (a subprocess inherited the pipe and outlived cove),
+    // the watchdog still fires completion and clears `busy`.
+    NSLock *lock = [[NSLock alloc] init];
+    __block BOOL finished = NO;
+    CoveCommandCompletion finishOnce = ^(int status, NSString *output, NSError *error) {
+        [lock lock];
+        if (finished) { [lock unlock]; return; }
+        finished = YES;
+        [lock unlock];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            completion(status, output, error);
+        });
+    };
+
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        NSString *executable = [self coveExecutablePath];
+        NSArray<NSString *> *actualArguments = arguments;
+        if ([executable isEqualToString:@"/usr/bin/env"]) {
+            actualArguments = [@[@"cove"] arrayByAddingObjectsFromArray:arguments];
+        }
+
+        NSTask *task = [[NSTask alloc] init];
+        NSPipe *outputPipe = [NSPipe pipe];
+        task.executableURL = [NSURL fileURLWithPath:executable];
+        task.arguments = actualArguments;
+        task.standardOutput = outputPipe;
+        task.standardError = outputPipe;
+
+        NSMutableDictionary<NSString *, NSString *> *environment =
+            [[[NSProcessInfo processInfo] environment] mutableCopy];
+        environment[@"PATH"] =
+            @"/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
+        task.environment = environment;
+
+        NSError *launchError = nil;
+        BOOL launched = [task launchAndReturnError:&launchError];
+        if (!launched) {
+            finishOnce(-1, @"", launchError);
+            return;
+        }
+
+        // Watchdog: a command that outlives its timeout is wedged. Terminate it
+        // (which lets the read below unblock in the common case) and report a
+        // timeout now regardless — so a stuck subprocess can't leave the app
+        // disabled forever. In the worst case one reader thread lingers on the
+        // dead pipe; the app itself stays responsive.
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(timeout * NSEC_PER_SEC)),
+                       dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            if (task.isRunning) {
+                [task terminate];
+            }
+            NSError *timeoutError =
+                [NSError errorWithDomain:@"CoveMenuBar"
+                                    code:-2
+                                userInfo:@{NSLocalizedDescriptionKey:
+                                    [NSString stringWithFormat:@"Timed out after %.0f seconds.", timeout]}];
+            finishOnce(-2, @"", timeoutError);
+        });
+
+        NSData *data = [[outputPipe fileHandleForReading] readDataToEndOfFile];
+        [task waitUntilExit];
+        NSString *output = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] ?: @"";
+        int terminationStatus = task.terminationStatus;
+        NSError *commandError = nil;
+
+        if (terminationStatus != 0) {
+            NSString *message = [output stringByTrimmingCharactersInSet:
+                [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+            if (message.length == 0) {
+                message = @"The Cove command exited with an error.";
+            }
+            commandError = [NSError errorWithDomain:@"CoveMenuBar"
+                                                code:terminationStatus
+                                            userInfo:@{NSLocalizedDescriptionKey: message}];
+        }
+
+        finishOnce(terminationStatus, output, commandError);
+    });
+}
+
+- (NSString *)coveExecutablePath {
+    NSFileManager *fileManager = [NSFileManager defaultManager];
+    for (NSString *path in @[@"/opt/homebrew/bin/cove", @"/usr/local/bin/cove"]) {
+        if ([fileManager isExecutableFileAtPath:path]) {
+            return path;
+        }
+    }
+    return @"/usr/bin/env";
+}
+
+#pragma mark - Menu skeleton (built once)
+
+- (void)buildMenuSkeleton {
+    self.menu = [[NSMenu alloc] init];
+    self.menu.autoenablesItems = NO;
+    self.menu.delegate = self;
+
+    self.summaryItem = [[NSMenuItem alloc] initWithTitle:@"" action:nil keyEquivalent:@""];
+    self.summaryItem.enabled = NO;
+    [self.menu addItem:self.summaryItem];
+    [self.menu addItem:[NSMenuItem separatorItem]];
+
+    // Service rows are inserted at kServiceRowStartIndex by syncServiceRows.
+
+    self.errorItem = [[NSMenuItem alloc] initWithTitle:@"" action:nil keyEquivalent:@""];
+    self.errorItem.enabled = NO;
+    self.errorItem.hidden = YES;
+    [self.menu addItem:self.errorItem];
+
+    [self.menu addItem:[NSMenuItem separatorItem]];
+
+    self.actionItem = [[NSMenuItem alloc] initWithTitle:@"Start Cove"
+                                                 action:@selector(startCove)
+                                          keyEquivalent:@""];
+    self.actionItem.target = self;
+    [self.menu addItem:self.actionItem];
+
+    self.refreshItem = [[NSMenuItem alloc] initWithTitle:@"Refresh Status"
+                                                  action:@selector(refreshStatus)
+                                           keyEquivalent:@"r"];
+    self.refreshItem.target = self;
+    [self.menu addItem:self.refreshItem];
+
+    self.reloadItem = [[NSMenuItem alloc] initWithTitle:@"Reload Caddy"
+                                                 action:@selector(reloadCaddy)
+                                          keyEquivalent:@""];
+    self.reloadItem.target = self;
+    [self.menu addItem:self.reloadItem];
+
+    [self.menu addItem:[NSMenuItem separatorItem]];
+
+    self.sitesItem = [[NSMenuItem alloc] initWithTitle:@"Sites" action:nil keyEquivalent:@""];
+    self.sitesItem.submenu = [[NSMenu alloc] init];
+    self.sitesItem.submenu.autoenablesItems = NO;
+    [self.menu addItem:self.sitesItem];
+    [self rebuildSitesSubmenu];
+
+    [self.menu addItem:[NSMenuItem separatorItem]];
+
+    self.dashboardItem = [self linkItemWithTitle:@"Open Cove Dashboard"
+                                          action:@selector(openDashboard)];
+    [self.menu addItem:self.dashboardItem];
+    self.adminerItem = [self linkItemWithTitle:@"Open Adminer"
+                                        action:@selector(openAdminer)];
+    [self.menu addItem:self.adminerItem];
+    self.mailpitItem = [self linkItemWithTitle:@"Open Mailpit"
+                                        action:@selector(openMailpit)];
+    [self.menu addItem:self.mailpitItem];
+    [self.menu addItem:[self linkItemWithTitle:@"Open Cove Logs"
+                                        action:@selector(openLogs)]];
+    [self.menu addItem:[self linkItemWithTitle:@"Open Sites Folder"
+                                        action:@selector(openSitesFolder)]];
+
+    [self.menu addItem:[NSMenuItem separatorItem]];
+
+    self.launchItem = [[NSMenuItem alloc] initWithTitle:@"Launch at Login"
+                                                 action:@selector(toggleLaunchAtLogin)
+                                          keyEquivalent:@""];
+    self.launchItem.target = self;
+    [self.menu addItem:self.launchItem];
+
+    self.versionItem = [[NSMenuItem alloc] initWithTitle:@"" action:nil keyEquivalent:@""];
+    self.versionItem.target = self;
+    self.versionItem.enabled = NO;
+    self.versionItem.hidden = YES;
+    [self.menu addItem:self.versionItem];
+
+    NSMenuItem *quitItem = [[NSMenuItem alloc] initWithTitle:@"Quit Cove Menu Bar"
+                                                     action:@selector(quitApp)
+                                              keyEquivalent:@"q"];
+    quitItem.target = self;
+    [self.menu addItem:quitItem];
+
+    self.statusItem.menu = self.menu;
+}
+
+#pragma mark - Menu updates (in place)
+
+- (void)updateMenu {
+    [self syncBusyPulse];
+    [self updateStatusButton];
+    [self syncServiceRows];
+
+    self.summaryItem.title = [self summaryText];
+
+    // Action failures outlast status errors: a failed create/start/stop stays
+    // visible until the next action, instead of being wiped by the next
+    // successful 20s status poll.
+    NSString *errorText = self.lastActionError.length > 0 ? self.lastActionError : self.lastError;
+    if (errorText.length > 0) {
+        NSString *firstLine = [[errorText componentsSeparatedByCharactersInSet:
+                                [NSCharacterSet newlineCharacterSet]] firstObject];
+        self.errorItem.title = [NSString stringWithFormat:@"Error: %@", firstLine];
+        self.errorItem.hidden = NO;
+    } else {
+        self.errorItem.hidden = YES;
+    }
+
+    BOOL allRunning = [self allServicesRunning];
+    self.actionItem.title = allRunning ? @"Stop Cove" : @"Start Cove";
+    self.actionItem.action = allRunning ? @selector(stopCove) : @selector(startCove);
+    self.actionItem.enabled = !self.busy;
+    self.refreshItem.enabled = !self.busy;
+    self.reloadItem.enabled = !self.busy && [self serviceRunning:@"caddy"];
+
+    self.dashboardItem.enabled = [self serviceRunning:@"caddy"];
+    self.adminerItem.enabled = [self serviceRunning:@"caddy"];
+    self.mailpitItem.enabled = [self serviceRunning:@"mailpit"];
+
+    self.launchItem.state = SMAppService.mainAppService.status == SMAppServiceStatusEnabled
+        ? NSControlStateValueOn
+        : NSControlStateValueOff;
+
+    if ([self updateAvailable]) {
+        self.versionItem.title = [NSString stringWithFormat:@"Update Cove to v%@…", self.latestVersion];
+        self.versionItem.action = @selector(runUpgradeInTerminal);
+        self.versionItem.enabled = YES;
+        self.versionItem.hidden = NO;
+    } else if (self.coveVersion.length > 0) {
+        self.versionItem.title = [NSString stringWithFormat:@"Cove v%@", self.coveVersion];
+        self.versionItem.action = nil;
+        self.versionItem.enabled = NO;
+        self.versionItem.hidden = NO;
+    } else {
+        self.versionItem.hidden = YES;
+    }
+}
+
+// Keep one menu item per service key, inserting/removing rows only when the
+// key set actually changes (e.g. a PHP-FPM pool appears after the first poll
+// or a `cove php` pin). Everything else is a title/image mutation, so an open
+// menu never re-layouts.
+- (void)syncServiceRows {
+    if (![self.serviceItemKeys isEqualToArray:self.serviceKeys]) {
+        for (NSMenuItem *item in self.serviceItems) {
+            [self.menu removeItem:item];
+        }
+        [self.serviceItems removeAllObjects];
+
+        NSInteger index = kServiceRowStartIndex;
+        for (NSString *key in self.serviceKeys) {
+            (void)key;
+            NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:@"" action:nil keyEquivalent:@""];
+            item.enabled = NO;
+            [self.menu insertItem:item atIndex:index++];
+            [self.serviceItems addObject:item];
+        }
+        self.serviceItemKeys = [self.serviceKeys copy];
+    }
+
+    [self.serviceKeys enumerateObjectsUsingBlock:^(NSString *key, NSUInteger idx, BOOL *stop) {
+        (void)stop;
+        NSMenuItem *item = self.serviceItems[idx];
+        NSNumber *state = self.serviceStates[key];
+        NSString *stateText = state ? (state.boolValue ? @"Running" : @"Stopped") : @"…";
+        NSString *symbol = state
+            ? (state.boolValue ? @"checkmark.circle.fill" : @"circle")
+            : @"circle.dotted";
+        item.title = [NSString stringWithFormat:@"%@: %@",
+                      [self displayNameForServiceKey:key], stateText];
+        item.image = [NSImage imageWithSystemSymbolName:symbol accessibilityDescription:nil];
+    }];
+}
+
+#pragma mark - Sites submenu
+
+- (NSString *)sitesDirectory {
+    return [NSHomeDirectory() stringByAppendingPathComponent:@"Cove/Sites"];
+}
+
+// Cove's convention: every site is a directory named <name>.localhost inside
+// ~/Cove/Sites. The directory also collects loose files (logs, scripts), so
+// filter strictly. A cheap readdir on the main thread — sites lists are small.
+// Called from menuWillOpen, before the menu is on screen.
+//
+// Long lists get a "Recent" section: top 5 by the same signal the dashboard's
+// modified column uses — mtime of <site>/public, falling back to the site dir.
+- (void)rebuildSitesSubmenu {
+    NSMenu *submenu = self.sitesItem.submenu;
+    [submenu removeAllItems];
+
+    NSFileManager *fileManager = [NSFileManager defaultManager];
+    NSString *sitesDir = [self sitesDirectory];
+    NSArray<NSString *> *entries =
+        [[fileManager contentsOfDirectoryAtPath:sitesDir error:nil]
+            sortedArrayUsingSelector:@selector(localizedCaseInsensitiveCompare:)];
+
+    NSMutableArray<NSDictionary *> *sites = [NSMutableArray array];
+    for (NSString *entry in entries) {
+        if (![entry hasSuffix:@".localhost"]) {
+            continue;
+        }
+        BOOL isDirectory = NO;
+        NSString *sitePath = [sitesDir stringByAppendingPathComponent:entry];
+        if (![fileManager fileExistsAtPath:sitePath isDirectory:&isDirectory] || !isDirectory) {
+            continue;
+        }
+
+        NSString *publicPath = [sitePath stringByAppendingPathComponent:@"public"];
+        NSDate *modified = [fileManager attributesOfItemAtPath:publicPath error:nil].fileModificationDate
+            ?: [fileManager attributesOfItemAtPath:sitePath error:nil].fileModificationDate
+            ?: [NSDate distantPast];
+        BOOL isWordPress = [fileManager fileExistsAtPath:
+                            [publicPath stringByAppendingPathComponent:@"wp-config.php"]];
+        [sites addObject:@{ @"name": entry, @"modified": modified, @"wp": @(isWordPress) }];
+    }
+
+    if (sites.count >= 8) {
+        NSArray<NSDictionary *> *recent =
+            [[sites sortedArrayUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+                return [b[@"modified"] compare:a[@"modified"]];
+            }] subarrayWithRange:NSMakeRange(0, 5)];
+
+        NSMenuItem *recentHeader = [[NSMenuItem alloc] initWithTitle:@"Recent"
+                                                              action:nil
+                                                       keyEquivalent:@""];
+        recentHeader.enabled = NO;
+        [submenu addItem:recentHeader];
+        for (NSDictionary *site in recent) {
+            [self addItemsForSite:site[@"name"] isWordPress:[site[@"wp"] boolValue] toMenu:submenu];
+        }
+        [submenu addItem:[NSMenuItem separatorItem]];
+    }
+
+    for (NSDictionary *site in sites) {
+        [self addItemsForSite:site[@"name"] isWordPress:[site[@"wp"] boolValue] toMenu:submenu];
+    }
+
+    if (sites.count > 0) {
+        [submenu addItem:[NSMenuItem separatorItem]];
+        self.sitesItem.title = [NSString stringWithFormat:@"Sites (%lu)", (unsigned long)sites.count];
+    } else {
+        self.sitesItem.title = @"Sites";
+    }
+
+    NSMenuItem *newSiteItem = [[NSMenuItem alloc] initWithTitle:@"New Site…"
+                                                         action:@selector(promptForNewSite)
+                                                  keyEquivalent:@""];
+    newSiteItem.target = self;
+    newSiteItem.enabled = !self.busy;
+    [submenu addItem:newSiteItem];
+}
+
+- (void)addItemsForSite:(NSString *)entry isWordPress:(BOOL)isWordPress toMenu:(NSMenu *)submenu {
+    NSMenuItem *siteItem = [[NSMenuItem alloc] initWithTitle:entry
+                                                      action:@selector(openSite:)
+                                               keyEquivalent:@""];
+    siteItem.target = self;
+    siteItem.representedObject = entry;
+    [submenu addItem:siteItem];
+
+    // WordPress sites get an option-key alternate that generates a
+    // one-time admin login via `cove login`.
+    if (isWordPress) {
+        NSMenuItem *loginItem =
+            [[NSMenuItem alloc] initWithTitle:[NSString stringWithFormat:@"Log in to %@", entry]
+                                      action:@selector(loginToSite:)
+                               keyEquivalent:@""];
+        loginItem.target = self;
+        loginItem.representedObject = entry;
+        loginItem.keyEquivalentModifierMask = NSEventModifierFlagOption;
+        loginItem.alternate = YES;
+        [submenu addItem:loginItem];
+    }
+}
+
+#pragma mark - New site
+
+- (void)promptForNewSite {
+    [NSApp activateIgnoringOtherApps:YES];
+    NSAlert *alert = [[NSAlert alloc] init];
+    alert.messageText = @"New Cove Site";
+    alert.informativeText = @"Creates a WordPress site at <name>.localhost.\n"
+                             "Lowercase letters, numbers, and hyphens only.";
+    [alert addButtonWithTitle:@"Create"];
+    [alert addButtonWithTitle:@"Cancel"];
+
+    NSTextField *field = [[NSTextField alloc] initWithFrame:NSMakeRect(0, 0, 230, 24)];
+    field.placeholderString = @"my-new-site";
+    alert.accessoryView = field;
+    alert.window.initialFirstResponder = field;
+
+    if ([alert runModal] != NSAlertFirstButtonReturn) {
+        return;
+    }
+
+    NSString *name = [[field.stringValue lowercaseString] stringByTrimmingCharactersInSet:
+                      [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (name.length == 0) {
+        return;
+    }
+
+    // Mirror cove add's own validation so obvious typos fail fast with a
+    // clear message instead of a shell error.
+    NSRegularExpression *valid =
+        [NSRegularExpression regularExpressionWithPattern:@"^[a-z0-9]([a-z0-9-]*[a-z0-9])?$"
+                                                  options:0
+                                                    error:nil];
+    if (![valid firstMatchInString:name options:0 range:NSMakeRange(0, name.length)]) {
+        [self showErrorWithTitle:@"Invalid site name"
+                         message:@"Site names can only contain lowercase letters, numbers, and "
+                                  "hyphens, and cannot begin or end with a hyphen."];
+        return;
+    }
+
+    if (self.busy) {
+        return;
+    }
+    self.busy = YES;
+    self.busyText = [NSString stringWithFormat:@"Creating %@.localhost… (takes about a minute)", name];
+    self.lastActionError = nil;
+    self.lastUserActionTime = CFAbsoluteTimeGetCurrent();
+    [self updateMenu];
+
+    // A full WordPress install (core download + DB + install + reload) runs a
+    // minute or more; allow four before treating it as wedged.
+    __weak typeof(self) weakSelf = self;
+    [self runCoveWithArguments:@[@"add", name]
+                       timeout:240.0
+                    completion:^(int status, NSString *output, NSError *error) {
+        AppDelegate *strongSelf = weakSelf;
+        if (!strongSelf) {
+            return;
+        }
+
+        strongSelf.busy = NO;
+        strongSelf.busyText = nil;
+        strongSelf.lastUserActionTime = CFAbsoluteTimeGetCurrent();
+        if (status != 0) {
+            [strongSelf reportActionFailure:[NSString stringWithFormat:@"Could not create %@.localhost", name]
+                                     detail:(error.localizedDescription.length > 0
+                                             ? error.localizedDescription
+                                             : (output.length > 0 ? output : @"cove add exited with an error."))];
+            return;
+        }
+
+        [strongSelf postNotificationWithBody:
+            [NSString stringWithFormat:@"%@.localhost is ready — opening it now.", name]];
+        [strongSelf refreshStatus];
+        [strongSelf openCoveHost:[name stringByAppendingString:@".localhost"]];
+    }];
+}
+
+- (void)openSite:(NSMenuItem *)sender {
+    NSString *host = sender.representedObject;
+    if (host.length > 0) {
+        [self openCoveHost:host];
+    }
+}
+
+- (void)loginToSite:(NSMenuItem *)sender {
+    NSString *host = sender.representedObject;
+    if (host.length == 0) {
+        return;
+    }
+    // Guard against a second click while wp-cli is still minting the URL:
+    // each `cove login` run regenerates the one-time token, so a parallel run
+    // would invalidate the first URL right before its tab opens.
+    if (self.busy) {
+        return;
+    }
+    self.busy = YES;
+    self.busyText = [NSString stringWithFormat:@"Logging in to %@…", host];
+    self.lastActionError = nil;
+    self.lastUserActionTime = CFAbsoluteTimeGetCurrent();
+    [self updateMenu];
+
+    // `cove login` takes the site name without the .localhost suffix and
+    // prints a one-time login URL inside a decorative gum box.
+    NSString *siteName = [host stringByReplacingOccurrencesOfString:@".localhost"
+                                                         withString:@""
+                                                            options:NSAnchoredSearch | NSBackwardsSearch
+                                                              range:NSMakeRange(0, host.length)];
+
+    __weak typeof(self) weakSelf = self;
+    [self runCoveWithArguments:@[@"login", siteName]
+                       timeout:45.0
+                    completion:^(int status, NSString *output, NSError *error) {
+        AppDelegate *strongSelf = weakSelf;
+        if (!strongSelf) {
+            return;
+        }
+
+        strongSelf.busy = NO;
+        strongSelf.busyText = nil;
+        strongSelf.lastUserActionTime = CFAbsoluteTimeGetCurrent();
+
+        NSString *loginURL = nil;
+        if (status == 0) {
+            // stdout and stderr are merged, so wp-cli/PHP notices (which often
+            // print their own https:// URLs) can appear before the real login
+            // line. Don't take the first URL — take the one that actually
+            // points at THIS site's login endpoint. Charset widened so a token
+            // containing ~ # + ! @ isn't truncated mid-URL.
+            NSRegularExpression *regex =
+                [NSRegularExpression regularExpressionWithPattern:@"https://[A-Za-z0-9.:/_?=&%~#+!@-]+"
+                                                          options:0
+                                                            error:nil];
+            for (NSTextCheckingResult *match in
+                 [regex matchesInString:output options:0 range:NSMakeRange(0, output.length)]) {
+                NSString *candidate = [output substringWithRange:match.range];
+                if ([candidate containsString:host] && [candidate containsString:@"wp-login"]) {
+                    loginURL = candidate;   // keep scanning; last match wins
+                }
+            }
+        }
+
+        if (loginURL) {
+            [strongSelf updateMenu];
+            [[NSWorkspace sharedWorkspace] openURL:[NSURL URLWithString:loginURL]];
+        } else {
+            [strongSelf reportActionFailure:[NSString stringWithFormat:@"Could not log in to %@", host]
+                                     detail:error.localizedDescription
+                                            ?: @"cove login did not return a login URL."];
+        }
+    }];
+}
+
+- (void)openSitesFolder {
+    NSURL *sitesURL = [NSURL fileURLWithPath:[self sitesDirectory] isDirectory:YES];
+    [[NSWorkspace sharedWorkspace] openURL:sitesURL];
+}
+
+#pragma mark - Update check
+
+// Resolve the latest released version by following the GitHub redirect for
+// releases/latest → .../releases/tag/v<version>. No API token, no rate-limit
+// concerns at once a day, and no JSON parsing needed.
+- (void)checkForUpdates {
+    NSURL *url = [NSURL URLWithString:@"https://github.com/anchorhost/cove/releases/latest"];
+    NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:url];
+    request.HTTPMethod = @"HEAD";
+    request.timeoutInterval = 15.0;
+
+    __weak typeof(self) weakSelf = self;
+    NSURLSessionDataTask *task = [[NSURLSession sharedSession]
+        dataTaskWithRequest:request
+          completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+              (void)data;
+              if (error || !response.URL) {
+                  return;
+              }
+              NSString *tag = response.URL.lastPathComponent;
+              if (![tag hasPrefix:@"v"] || tag.length < 2) {
+                  return;
+              }
+              NSString *version = [tag substringFromIndex:1];
+              dispatch_async(dispatch_get_main_queue(), ^{
+                  AppDelegate *strongSelf = weakSelf;
+                  if (!strongSelf) {
+                      return;
+                  }
+                  strongSelf.latestVersion = version;
+                  [strongSelf updateMenu];
+              });
+          }];
+    [task resume];
+}
+
+- (BOOL)updateAvailable {
+    if (self.coveVersion.length == 0 || self.latestVersion.length == 0) {
+        return NO;
+    }
+    return [self compareVersion:self.latestVersion to:self.coveVersion] == NSOrderedDescending;
+}
+
+// Numeric segment-by-segment comparison, so 1.10 > 1.9.
+- (NSComparisonResult)compareVersion:(NSString *)a to:(NSString *)b {
+    NSArray<NSString *> *aParts = [a componentsSeparatedByString:@"."];
+    NSArray<NSString *> *bParts = [b componentsSeparatedByString:@"."];
+    NSUInteger count = MAX(aParts.count, bParts.count);
+    for (NSUInteger i = 0; i < count; i++) {
+        NSInteger aValue = i < aParts.count ? aParts[i].integerValue : 0;
+        NSInteger bValue = i < bParts.count ? bParts[i].integerValue : 0;
+        if (aValue != bValue) {
+            return aValue > bValue ? NSOrderedDescending : NSOrderedAscending;
+        }
+    }
+    return NSOrderedSame;
+}
+
+// `cove upgrade` can install Homebrew packages and ask questions — that
+// belongs in a real terminal, not a headless NSTask. A .command file opens in
+// Terminal via Launch Services with no automation (TCC) prompt.
+- (void)runUpgradeInTerminal {
+    // The upgrade restarts services from the Terminal window over the next
+    // couple of minutes; mark it as user-initiated so the poll landing in the
+    // middle of it doesn't read the churn as a crash.
+    self.lastUserActionTime = CFAbsoluteTimeGetCurrent();
+    NSString *script = @"#!/bin/zsh\n"
+                        "export PATH=\"/opt/homebrew/bin:/usr/local/bin:$PATH\"\n"
+                        "cove upgrade\n";
+    NSString *path = [NSTemporaryDirectory() stringByAppendingPathComponent:@"cove-upgrade.command"];
+    NSError *error = nil;
+    if (![script writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:&error]) {
+        [self showErrorWithTitle:@"Update Cove" message:error.localizedDescription];
+        return;
+    }
+    [[NSFileManager defaultManager] setAttributes:@{NSFilePosixPermissions: @0755}
+                                     ofItemAtPath:path
+                                            error:nil];
+    [[NSWorkspace sharedWorkspace] openURL:[NSURL fileURLWithPath:path]];
+}
+
+#pragma mark - Status button
+
+- (void)syncBusyPulse {
+    if (self.busy && !self.busyPulseTimer) {
+        self.busyPulseTimer = [NSTimer scheduledTimerWithTimeInterval:0.6
+                                                              target:self
+                                                            selector:@selector(pulseTick)
+                                                            userInfo:nil
+                                                             repeats:YES];
+    } else if (!self.busy && self.busyPulseTimer) {
+        [self.busyPulseTimer invalidate];
+        self.busyPulseTimer = nil;
+        self.pulsePhase = NO;
+    }
+}
+
+- (void)pulseTick {
+    self.pulsePhase = !self.pulsePhase;
+    [self updateStatusButton];
+}
+
+- (void)updateStatusButton {
+    NSStatusBarButton *button = self.statusItem.button;
+    if (!button) {
+        return;
+    }
+
+    NSImage *image;
+    if (self.busy) {
+        // Alternate full-color / grayscale while an action runs — a visible
+        // heartbeat that distinguishes "working" from "hung".
+        image = self.pulsePhase ? self.partialImage : self.runningImage;
+    } else if ([self allServicesRunning] && self.lastError.length == 0) {
+        image = self.runningImage;
+    } else if ([self runningServiceCount] > 0) {
+        image = self.partialImage;
+    } else {
+        image = self.stoppedImage;
+    }
+
+    if (image) {
+        button.title = @"";
+        button.image = image;
+        button.imagePosition = NSImageOnly;
+    } else {
+        // Icon decode failed (loadStatusImages guards against a macOS whose
+        // ImageIO can't rasterize the SVG) — fall back to a text item rather
+        // than an invisible one.
+        button.title = @"Cove";
+        button.image = nil;
+        button.imagePosition = NSNoImage;
+    }
+    button.toolTip = [self summaryText];
+    button.accessibilityLabel = [self summaryText];
+}
+
+- (void)loadStatusImages {
+    // The vector logo — the same mark the dashboard renders. NSImage decoding
+    // SVG is undocumented Apple behavior (CoreSVG, observed working since
+    // macOS 11); if it ever fails, the images stay nil and updateStatusButton
+    // falls back to a "Cove" text item instead of an invisible one.
+    NSURL *assetURL = [[NSBundle mainBundle] URLForResource:@"cove-logo"
+                                             withExtension:@"svg"
+                                              subdirectory:@"Assets"];
+    NSImage *source = assetURL ? [[NSImage alloc] initWithContentsOfURL:assetURL] : nil;
+    if (!source) {
+        return;
+    }
+
+    source.size = NSMakeSize(18, 18);
+    self.runningImage = source;
+    self.partialImage = [self imageByDesaturating:source brightness:0.02 contrast:1.05];
+    self.stoppedImage = [self imageByDesaturating:source brightness:-0.12 contrast:1.20];
+}
+
+- (NSImage *)imageByDesaturating:(NSImage *)source
+                      brightness:(CGFloat)brightness
+                        contrast:(CGFloat)contrast {
+    NSData *sourceData = [source TIFFRepresentation];
+    CIImage *inputImage = sourceData ? [CIImage imageWithData:sourceData] : nil;
+    if (!inputImage) {
+        return source;
+    }
+
+    CIFilter *filter = [CIFilter filterWithName:@"CIColorControls"];
+    [filter setValue:inputImage forKey:kCIInputImageKey];
+    [filter setValue:@0.0 forKey:kCIInputSaturationKey];
+    [filter setValue:@(brightness) forKey:kCIInputBrightnessKey];
+    [filter setValue:@(contrast) forKey:kCIInputContrastKey];
+
+    CIImage *outputImage = filter.outputImage;
+    if (!outputImage) {
+        return source;
+    }
+
+    CIContext *context = [CIContext contextWithOptions:nil];
+    CGImageRef cgImage = [context createCGImage:outputImage fromRect:outputImage.extent];
+    if (!cgImage) {
+        return source;
+    }
+
+    NSImage *result = [[NSImage alloc] initWithCGImage:cgImage size:NSMakeSize(18, 18)];
+    CGImageRelease(cgImage);
+    return result;
+}
+
+- (NSString *)summaryText {
+    if (self.busy) {
+        return self.busyText.length > 0 ? self.busyText : @"Cove is updating…";
+    }
+    if (self.lastError.length > 0) {
+        return @"Cove status unavailable";
+    }
+    if (!self.statesKnown) {
+        return @"Checking Cove status...";
+    }
+    if ([self allServicesRunning]) {
+        return @"Cove is running";
+    }
+    if ([self runningServiceCount] > 0) {
+        return @"Cove is partially running";
+    }
+    return @"Cove is stopped";
+}
+
+- (NSMenuItem *)linkItemWithTitle:(NSString *)title action:(SEL)action {
+    NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:title action:action keyEquivalent:@""];
+    item.target = self;
+    return item;
+}
+
+#pragma mark - Quick links
+
+- (void)openDashboard {
+    [self openCoveHost:@"cove.localhost"];
+}
+
+- (void)openAdminer {
+    [self openCoveHost:@"db.cove.localhost"];
+}
+
+- (void)openMailpit {
+    [self openCoveHost:@"mail.cove.localhost"];
+}
+
+- (void)openCoveHost:(NSString *)host {
+    NSString *urlString = [NSString stringWithFormat:@"https://%@%@", host, [self httpsPortSuffix]];
+    NSURL *url = [NSURL URLWithString:urlString];
+    if (url) {
+        [[NSWorkspace sharedWorkspace] openURL:url];
+    }
+}
+
+- (NSString *)httpsPortSuffix {
+    NSString *configPath = [NSHomeDirectory() stringByAppendingPathComponent:@"Cove/config"];
+    NSString *config = [NSString stringWithContentsOfFile:configPath
+                                                  encoding:NSUTF8StringEncoding
+                                                     error:nil];
+    if (!config) {
+        return @"";
+    }
+
+    NSString *port = nil;
+    for (NSString *line in [config componentsSeparatedByCharactersInSet:
+                            [NSCharacterSet newlineCharacterSet]]) {
+        if ([line hasPrefix:@"HTTPS_PORT="]) {
+            port = [[line substringFromIndex:[@"HTTPS_PORT=" length]]
+                stringByTrimmingCharactersInSet:
+                    [NSCharacterSet characterSetWithCharactersInString:@"'\" "]];
+        }
+    }
+
+    if (port.length == 0 || [port isEqualToString:@"443"]) {
+        return @"";
+    }
+    return [@":" stringByAppendingString:port];
+}
+
+- (void)openLogs {
+    NSURL *logsURL = [NSURL fileURLWithPath:
+        [NSHomeDirectory() stringByAppendingPathComponent:@"Cove/Logs"]
+                               isDirectory:YES];
+    [[NSWorkspace sharedWorkspace] openURL:logsURL];
+}
+
+#pragma mark - Housekeeping
+
+- (void)toggleLaunchAtLogin {
+    SMAppService *service = SMAppService.mainAppService;
+    NSError *error = nil;
+    BOOL succeeded;
+    if (service.status == SMAppServiceStatusEnabled) {
+        succeeded = [service unregisterAndReturnError:&error];
+    } else {
+        succeeded = [service registerAndReturnError:&error];
+    }
+
+    if (!succeeded) {
+        [self showErrorWithTitle:@"Launch at Login"
+                         message:error.localizedDescription ?: @"Unable to change the login item."];
+    }
+    [self updateMenu];
+}
+
+- (void)showErrorWithTitle:(NSString *)title message:(NSString *)message {
+    NSAlert *alert = [[NSAlert alloc] init];
+    alert.alertStyle = NSAlertStyleWarning;
+    alert.messageText = title;
+    alert.informativeText = message;
+    // Accessory apps have no key window; without activation the alert can
+    // appear behind whatever the user is working in.
+    [NSApp activateIgnoringOtherApps:YES];
+    [alert runModal];
+}
+
+- (void)quitApp {
+    [NSApp terminate:nil];
+}
+
+@end
+
+int main(int argc, const char *argv[]) {
+    // `CoveMenuBar unregister` — invoked by `cove menubar disable` before the
+    // bundle is deleted, because SMAppService login items can only be
+    // unregistered from inside the app they belong to. Without this, disable
+    // would leave a stale entry in System Settings → Login Items.
+    if (argc > 1 && strcmp(argv[1], "unregister") == 0) {
+        @autoreleasepool {
+            [SMAppService.mainAppService unregisterAndReturnError:nil];
+        }
+        return 0;
+    }
+
+    @autoreleasepool {
+        NSApplication *application = [NSApplication sharedApplication];
+        AppDelegate *delegate = [[AppDelegate alloc] init];
+        application.delegate = delegate;
+        [application run];
+    }
+    return 0;
+}
+COVE_MENUBAR_MAIN_M_EOF
+}
+
+emit_menubar_info_plist() {
+cat <<'COVE_MENUBAR_PLIST_EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
+    <key>CFBundleDisplayName</key>
+    <string>Cove Menu Bar</string>
+    <key>CFBundleExecutable</key>
+    <string>CoveMenuBar</string>
+    <key>CFBundleIdentifier</key>
+    <string>run.cove.menubar</string>
+    <key>CFBundleIconFile</key>
+    <string>CoveMenuBar.icns</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>Cove Menu Bar</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>__MENUBAR_VERSION__</string>
+    <key>CFBundleVersion</key>
+    <string>__MENUBAR_VERSION__</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>13.0</string>
+    <key>LSUIElement</key>
+    <true/>
+    <key>NSHumanReadableCopyright</key>
+    <string>Copyright 2026 Robby McCullough &amp; Anchor Hosting</string>
+</dict>
+</plist>
+COVE_MENUBAR_PLIST_EOF
+}
+
+emit_menubar_icon_svg() {
+cat <<'COVE_MENUBAR_ICON_EOF'
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" stroke-linecap="round" stroke-linejoin="round">
+    <defs>
+        <clipPath id="cove-clip"><circle cx="32" cy="32" r="28"/></clipPath>
+    </defs>
+    <g clip-path="url(#cove-clip)">
+        <rect x="0" y="0" width="64" height="64" fill="#f6f1e8"/>
+        <rect x="0" y="32" width="64" height="32" fill="#3a97a9"/>
+        <path fill="#58b293" d="M 4 32 C 4 22, 12 12, 22 12 C 30 12, 34 18, 42 16 C 50 14, 58 18, 60 24 L 60 32 Z"/>
+        <line x1="2" y1="32" x2="62" y2="32" stroke="#1c4c58" fill="none" stroke-width="2.5"/>
+        <g stroke="#1c4c58" fill="none" stroke-width="2.6">
+            <path d="M 10 42 Q 18 38, 26 42 T 42 42 T 56 42"/>
+            <path d="M 14 50 Q 22 46, 30 50 T 46 50 T 56 50"/>
+        </g>
+    </g>
+    <circle cx="32" cy="32" r="28" stroke="#1c4c58" fill="none" stroke-width="3"/>
+</svg>
+COVE_MENUBAR_ICON_EOF
 }
 
 #  Pass all script arguments to the main function.

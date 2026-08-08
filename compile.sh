@@ -23,6 +23,18 @@ if [ ! -f "$MAIN_SCRIPT" ] || [ ! -d "$COMMANDS_DIR" ]; then
     exit 1
 fi
 
+# The menu bar sources are REQUIRED — checked before any output is written.
+# Silently skipping them (or cat-ing a missing file into an empty heredoc)
+# would exit 0 and ship a cove.sh whose `cove menubar enable` is broken for
+# every user.
+MENUBAR_DIR="menubar"
+for menubar_file in Sources/main.m Resources/Info.plist Resources/Assets/cove-favicon-source.png; do
+    if [ ! -f "$MENUBAR_DIR/$menubar_file" ]; then
+        echo "Error: ${MENUBAR_DIR}/${menubar_file} not found — cannot embed the menu bar app." >&2
+        exit 1
+    fi
+done
+
 echo "🚀 Starting compilation of ${OUTPUT_FILE}..."
 
 # 1. Start with the main script content, but EXCLUDE the final line that calls the main function.
@@ -51,7 +63,8 @@ done
 #    as real editable files in menubar/ and inlined here at compile time:
 #    main.m + Info.plist as quoted heredocs, the icon PNG as base64.
 #    `cove menubar enable` writes these out and builds locally with clang.
-MENUBAR_DIR="menubar"
+#    Presence of all three source files was asserted up top, before any
+#    output was written.
 if [ -d "$MENUBAR_DIR" ]; then
     echo "   - Embedding macOS menu bar app from ${MENUBAR_DIR}/"
     {
@@ -85,7 +98,15 @@ echo '#  Pass all script arguments to the main function.' >> "$OUTPUT_FILE"
 echo 'main "$@"' >> "$OUTPUT_FILE"
 
 
-# 6. Make the final script executable.
+# 6. Syntax-check the compiled output. Catches an embedding accident — a
+#    heredoc delimiter fused onto a source file's unterminated last line, a
+#    truncated append — that would otherwise ship as a broken artifact.
+if ! bash -n "$OUTPUT_FILE"; then
+    echo "Error: compiled ${OUTPUT_FILE} failed bash -n syntax check." >&2
+    exit 1
+fi
+
+# 7. Make the final script executable.
 chmod +x "$OUTPUT_FILE"
 
 echo ""

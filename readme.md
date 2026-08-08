@@ -94,6 +94,7 @@ Cove provides a simple set of commands to manage your local environment.
 | `cove disable` | Stops all Cove background services. |
 | `cove status` | Checks the status of all background services. |
 | `cove reload` | Regenerates the Caddyfile and reloads the Caddy server. |
+| `cove menubar <enable\|disable>` | (macOS only) Native menu bar app showing service status at a glance, with start/stop controls and quick links to the Dashboard, Adminer, and Mailpit. Opt-in; built locally, no extra download. Originally by [Robby McCullough](https://github.com/RobbyMcCullough/cove-menubar). |
 
 ### Database
 

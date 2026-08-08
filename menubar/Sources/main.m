@@ -42,7 +42,15 @@ static const NSInteger kServiceRowStartIndex = 2;
 @property(nonatomic, assign) BOOL busy;
 // What the summary row says while busy ("Starting Cove…", "Creating x…").
 @property(nonatomic, copy) NSString *busyText;
+// Pulses the menu bar icon while a long action runs, so multi-second work
+// (site creation, enable) reads as "working" instead of "locked up".
+@property(nonatomic, strong) NSTimer *busyPulseTimer;
+@property(nonatomic, assign) BOOL pulsePhase;
 @property(nonatomic, copy) NSString *lastError;
+// A failed user action (create/start/stop/login). Unlike lastError, this is
+// NOT cleared by the next successful status poll — only by the next action —
+// so the evidence doesn't vanish seconds after the failure.
+@property(nonatomic, copy) NSString *lastActionError;
 @property(nonatomic, copy) NSString *coveVersion;
 @property(nonatomic, copy) NSString *latestVersion;
 @property(nonatomic, assign) CFAbsoluteTime lastUserActionTime;
@@ -219,18 +227,59 @@ static const NSInteger kServiceRowStartIndex = 2;
 
     for (NSString *key in newStates) {
         if (oldStates[key].boolValue && !newStates[key].boolValue) {
-            UNMutableNotificationContent *content = [[UNMutableNotificationContent alloc] init];
-            content.title = @"Cove";
-            content.body = [NSString stringWithFormat:@"%@ stopped unexpectedly.",
-                            [self displayNameForServiceKey:key]];
-            UNNotificationRequest *request =
-                [UNNotificationRequest requestWithIdentifier:[NSUUID UUID].UUIDString
-                                                     content:content
-                                                     trigger:nil];
-            [[UNUserNotificationCenter currentNotificationCenter]
-                addNotificationRequest:request withCompletionHandler:nil];
+            [self postNotificationWithBody:
+                [NSString stringWithFormat:@"%@ stopped unexpectedly.",
+                 [self displayNameForServiceKey:key]]];
         }
     }
+}
+
+- (void)postNotificationWithBody:(NSString *)body {
+    if (!self.notificationsAllowed) {
+        return;
+    }
+    UNMutableNotificationContent *content = [[UNMutableNotificationContent alloc] init];
+    content.title = @"Cove";
+    content.body = body;
+    UNNotificationRequest *request =
+        [UNNotificationRequest requestWithIdentifier:[NSUUID UUID].UUIDString
+                                             content:content
+                                             trigger:nil];
+    [[UNUserNotificationCenter currentNotificationCenter]
+        addNotificationRequest:request withCompletionHandler:nil];
+}
+
+// Async action failures avoid NSAlert on purpose: a modal from an accessory
+// app can land behind a full-screen window where it silently blocks the main
+// thread. Instead: notification + persistent menu error row + a durable log
+// of the full command output at ~/Cove/Logs/menubar.log.
+- (void)reportActionFailure:(NSString *)title detail:(NSString *)detail {
+    NSString *firstLine = [[detail componentsSeparatedByCharactersInSet:
+                            [NSCharacterSet newlineCharacterSet]] firstObject] ?: @"";
+    self.lastActionError = title;
+    [self postNotificationWithBody:[NSString stringWithFormat:@"%@ — %@", title, firstLine]];
+    [self appendToLog:[NSString stringWithFormat:@"%@\n%@\n", title, detail]];
+    [self updateMenu];
+}
+
+- (void)appendToLog:(NSString *)text {
+    NSString *logsDir = [NSHomeDirectory() stringByAppendingPathComponent:@"Cove/Logs"];
+    NSString *path = [logsDir stringByAppendingPathComponent:@"menubar.log"];
+    NSDateFormatter *formatter = [[NSDateFormatter alloc] init];
+    formatter.dateFormat = @"yyyy-MM-dd HH:mm:ss";
+    NSString *stamped = [NSString stringWithFormat:@"[%@] %@\n",
+                         [formatter stringFromDate:[NSDate date]], text];
+
+    NSFileManager *fileManager = [NSFileManager defaultManager];
+    [fileManager createDirectoryAtPath:logsDir withIntermediateDirectories:YES
+                            attributes:nil error:nil];
+    if (![fileManager fileExistsAtPath:path]) {
+        [fileManager createFileAtPath:path contents:nil attributes:nil];
+    }
+    NSFileHandle *handle = [NSFileHandle fileHandleForWritingAtPath:path];
+    [handle seekToEndOfFile];
+    [handle writeData:[stamped dataUsingEncoding:NSUTF8StringEncoding]];
+    [handle closeFile];
 }
 
 - (NSString *)displayNameForServiceKey:(NSString *)key {
@@ -297,6 +346,7 @@ static const NSInteger kServiceRowStartIndex = 2;
     self.busy = YES;
     self.busyText = busyText;
     self.lastError = nil;
+    self.lastActionError = nil;
     self.lastUserActionTime = CFAbsoluteTimeGetCurrent();
     [self updateMenu];
 
@@ -312,10 +362,9 @@ static const NSInteger kServiceRowStartIndex = 2;
         strongSelf.busyText = nil;
         strongSelf.lastUserActionTime = CFAbsoluteTimeGetCurrent();
         if (status != 0) {
-            strongSelf.lastError = error.localizedDescription ?: @"The Cove command failed.";
-            [strongSelf showErrorWithTitle:[NSString stringWithFormat:@"Could not %@ Cove", actionName]
-                                   message:strongSelf.lastError];
-            [strongSelf updateMenu];
+            NSString *detail = error.localizedDescription ?: @"The Cove command failed.";
+            [strongSelf reportActionFailure:[NSString stringWithFormat:@"Could not %@ Cove", actionName]
+                                     detail:detail];
             return;
         }
 
@@ -476,13 +525,18 @@ static const NSInteger kServiceRowStartIndex = 2;
 #pragma mark - Menu updates (in place)
 
 - (void)updateMenu {
+    [self syncBusyPulse];
     [self updateStatusButton];
     [self syncServiceRows];
 
     self.summaryItem.title = [self summaryText];
 
-    if (self.lastError.length > 0) {
-        NSString *firstLine = [[self.lastError componentsSeparatedByCharactersInSet:
+    // Action failures outlast status errors: a failed create/start/stop stays
+    // visible until the next action, instead of being wiped by the next
+    // successful 20s status poll.
+    NSString *errorText = self.lastActionError.length > 0 ? self.lastActionError : self.lastError;
+    if (errorText.length > 0) {
+        NSString *firstLine = [[errorText componentsSeparatedByCharactersInSet:
                                 [NSCharacterSet newlineCharacterSet]] firstObject];
         self.errorItem.title = [NSString stringWithFormat:@"Error: %@", firstLine];
         self.errorItem.hidden = NO;
@@ -701,14 +755,14 @@ static const NSInteger kServiceRowStartIndex = 2;
         return;
     }
     self.busy = YES;
-    self.busyText = [NSString stringWithFormat:@"Creating %@.localhost…", name];
+    self.busyText = [NSString stringWithFormat:@"Creating %@.localhost… (takes about a minute)", name];
+    self.lastActionError = nil;
     self.lastUserActionTime = CFAbsoluteTimeGetCurrent();
     [self updateMenu];
 
     __weak typeof(self) weakSelf = self;
     [self runCoveWithArguments:@[@"add", name]
                     completion:^(int status, NSString *output, NSError *error) {
-        (void)output;
         AppDelegate *strongSelf = weakSelf;
         if (!strongSelf) {
             return;
@@ -718,13 +772,15 @@ static const NSInteger kServiceRowStartIndex = 2;
         strongSelf.busyText = nil;
         strongSelf.lastUserActionTime = CFAbsoluteTimeGetCurrent();
         if (status != 0) {
-            [strongSelf showErrorWithTitle:[NSString stringWithFormat:@"Could not create %@", name]
-                                   message:error.localizedDescription
-                                           ?: @"cove add exited with an error."];
-            [strongSelf updateMenu];
+            [strongSelf reportActionFailure:[NSString stringWithFormat:@"Could not create %@.localhost", name]
+                                     detail:(error.localizedDescription.length > 0
+                                             ? error.localizedDescription
+                                             : (output.length > 0 ? output : @"cove add exited with an error."))];
             return;
         }
 
+        [strongSelf postNotificationWithBody:
+            [NSString stringWithFormat:@"%@.localhost is ready — opening it now.", name]];
         [strongSelf refreshStatus];
         [strongSelf openCoveHost:[name stringByAppendingString:@".localhost"]];
     }];
@@ -776,9 +832,9 @@ static const NSInteger kServiceRowStartIndex = 2;
         if (loginURL) {
             [[NSWorkspace sharedWorkspace] openURL:[NSURL URLWithString:loginURL]];
         } else {
-            [strongSelf showErrorWithTitle:[NSString stringWithFormat:@"Could not log in to %@", host]
-                                   message:error.localizedDescription
-                                           ?: @"cove login did not return a login URL."];
+            [strongSelf reportActionFailure:[NSString stringWithFormat:@"Could not log in to %@", host]
+                                     detail:error.localizedDescription
+                                            ?: @"cove login did not return a login URL."];
         }
     }];
 }
@@ -867,6 +923,25 @@ static const NSInteger kServiceRowStartIndex = 2;
 
 #pragma mark - Status button
 
+- (void)syncBusyPulse {
+    if (self.busy && !self.busyPulseTimer) {
+        self.busyPulseTimer = [NSTimer scheduledTimerWithTimeInterval:0.6
+                                                              target:self
+                                                            selector:@selector(pulseTick)
+                                                            userInfo:nil
+                                                             repeats:YES];
+    } else if (!self.busy && self.busyPulseTimer) {
+        [self.busyPulseTimer invalidate];
+        self.busyPulseTimer = nil;
+        self.pulsePhase = NO;
+    }
+}
+
+- (void)pulseTick {
+    self.pulsePhase = !self.pulsePhase;
+    [self updateStatusButton];
+}
+
 - (void)updateStatusButton {
     NSStatusBarButton *button = self.statusItem.button;
     if (!button) {
@@ -874,7 +949,11 @@ static const NSInteger kServiceRowStartIndex = 2;
     }
 
     NSImage *image;
-    if ([self allServicesRunning] && !self.busy && self.lastError.length == 0) {
+    if (self.busy) {
+        // Alternate full-color / grayscale while an action runs — a visible
+        // heartbeat that distinguishes "working" from "hung".
+        image = self.pulsePhase ? self.partialImage : self.runningImage;
+    } else if ([self allServicesRunning] && self.lastError.length == 0) {
         image = self.runningImage;
     } else if ([self runningServiceCount] > 0) {
         image = self.partialImage;

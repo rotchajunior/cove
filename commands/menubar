@@ -47,6 +47,7 @@ cove_menubar_enable() {
         -framework Cocoa \
         -framework CoreImage \
         -framework ServiceManagement \
+        -framework UserNotifications \
         "$build_dir/main.m" \
         -o "$build_dir/CoveMenuBar"; then
         rm -rf "$build_dir"
@@ -118,6 +119,10 @@ cove_menubar_disable() {
     fi
 
     pkill -x CoveMenuBar 2>/dev/null || true
+    # SMAppService login items can only be unregistered from inside the app
+    # they belong to — run the binary's unregister mode before deleting the
+    # bundle, or a stale entry lingers in System Settings → Login Items.
+    "$MENUBAR_APP_PATH/Contents/MacOS/CoveMenuBar" unregister 2>/dev/null || true
     rm -rf "$MENUBAR_APP_PATH"
     echo "✅ Cove Menu Bar disabled and removed."
 }

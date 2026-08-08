@@ -135,7 +135,17 @@ pre_flight_checks() {
         if [ "$OS" == "macos" ]; then
             # For MacOS, offer to install Homebrew
             echo "${YELLOW}${BOLD}CONFIRM:${NC} Homebrew is not installed, but it's required by Cove on MacOS."
-            read -p "Would you like to install it now? (y/N) " -n 1 -r
+            # Read the confirmation from the terminal, not this script's stdin —
+            # under `curl … | bash` stdin is the script pipe, so a bare `read`
+            # eats a script byte and never sees the keypress (the install then
+            # always aborts as "declined"). Same guard as the install handoff
+            # at the end of this file; falls through to a safe decline if there
+            # is genuinely no controlling terminal.
+            if (exec < /dev/tty) 2>/dev/null; then
+                read -p "Would you like to install it now? (y/N) " -n 1 -r < /dev/tty
+            else
+                REPLY=""
+            fi
             echo # Move to a new line
             if [[ $REPLY =~ ^[Yy]$ ]]; then
                 echo_info "Installing Homebrew. This may take a few minutes..."

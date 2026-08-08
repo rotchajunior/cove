@@ -1,0 +1,179 @@
+# --- macOS Menu Bar App ---
+# Native menu bar companion (menubar/ in the repo), embedded into cove.sh at
+# compile time and built locally with clang. Originally by Robby McCullough
+# (github.com/RobbyMcCullough/cove-menubar, MIT), folded in with his blessing.
+MENUBAR_APP_PATH="$HOME/Applications/Cove Menu Bar.app"
+
+# Prints the CFBundleShortVersionString of the installed app, or nothing if the
+# app is missing or the plist is unreadable (e.g. a pre-official install).
+menubar_installed_version() {
+    /usr/libexec/PlistBuddy -c "Print CFBundleShortVersionString" \
+        "$MENUBAR_APP_PATH/Contents/Info.plist" 2>/dev/null
+}
+
+cove_menubar_enable() {
+    local quiet="$1"
+
+    if [ "$OS" != "macos" ]; then
+        gum style --foreground red "❌ The menu bar app is only available on macOS."
+        exit 1
+    fi
+
+    # clang ships with the Command Line Tools, which Homebrew already requires.
+    if ! command -v clang &>/dev/null || ! xcode-select -p &>/dev/null; then
+        gum style --foreground red "❌ Apple Command Line Tools are required to build the menu bar app."
+        echo "   Install them with: xcode-select --install"
+        exit 1
+    fi
+
+    local build_dir
+    build_dir=$(mktemp -d)
+
+    echo "🛠️  Building Cove Menu Bar v${MENUBAR_VERSION}..."
+
+    # Write out the embedded sources. The Info.plist carries a version
+    # placeholder so the installed bundle reports MENUBAR_VERSION — that is
+    # what post-upgrade compares against to decide whether a rebuild is due.
+    emit_menubar_main_m > "$build_dir/main.m"
+    emit_menubar_info_plist | sed "s/__MENUBAR_VERSION__/${MENUBAR_VERSION}/g" > "$build_dir/Info.plist"
+    emit_menubar_icon_base64 | base64 --decode > "$build_dir/cove-favicon-source.png"
+
+    if ! clang \
+        -fobjc-arc \
+        -O2 \
+        -Wall \
+        -Wextra \
+        -mmacosx-version-min=13.0 \
+        -framework Cocoa \
+        -framework CoreImage \
+        -framework ServiceManagement \
+        "$build_dir/main.m" \
+        -o "$build_dir/CoveMenuBar"; then
+        rm -rf "$build_dir"
+        gum style --foreground red "❌ Failed to compile the menu bar app."
+        exit 1
+    fi
+
+    # Generate the .icns from the bundled favicon.
+    local iconset_dir="$build_dir/CoveMenuBar.iconset"
+    mkdir -p "$iconset_dir"
+    local spec size name
+    for spec in \
+        "16 icon_16x16.png" \
+        "32 icon_16x16@2x.png" \
+        "32 icon_32x32.png" \
+        "64 icon_32x32@2x.png" \
+        "128 icon_128x128.png" \
+        "256 icon_128x128@2x.png" \
+        "256 icon_256x256.png" \
+        "512 icon_256x256@2x.png" \
+        "512 icon_512x512.png" \
+        "1024 icon_512x512@2x.png"; do
+        size="${spec%% *}"
+        name="${spec#* }"
+        sips -z "$size" "$size" "$build_dir/cove-favicon-source.png" \
+            --out "$iconset_dir/$name" >/dev/null
+    done
+    iconutil -c icns "$iconset_dir" -o "$build_dir/CoveMenuBar.icns"
+
+    # Replace any existing install — including a pre-official one from the
+    # original standalone repo, which used the same bundle path.
+    pkill -x CoveMenuBar 2>/dev/null || true
+    rm -rf "$MENUBAR_APP_PATH"
+    mkdir -p "$MENUBAR_APP_PATH/Contents/MacOS" "$MENUBAR_APP_PATH/Contents/Resources/Assets"
+    cp "$build_dir/CoveMenuBar" "$MENUBAR_APP_PATH/Contents/MacOS/CoveMenuBar"
+    cp "$build_dir/CoveMenuBar.icns" "$MENUBAR_APP_PATH/Contents/Resources/CoveMenuBar.icns"
+    cp "$build_dir/cove-favicon-source.png" "$MENUBAR_APP_PATH/Contents/Resources/Assets/"
+    cp "$build_dir/Info.plist" "$MENUBAR_APP_PATH/Contents/Info.plist"
+    rm -rf "$build_dir"
+
+    # Ad-hoc signing keeps Gatekeeper happy without notarization — the binary
+    # was built on this machine, so there is no quarantine to clear.
+    codesign --force --deep --sign - "$MENUBAR_APP_PATH" 2>/dev/null
+
+    open "$MENUBAR_APP_PATH"
+
+    if [ "$quiet" == "quiet" ]; then
+        echo "   - Cove Menu Bar updated to v${MENUBAR_VERSION}."
+        return 0
+    fi
+
+    echo ""
+    gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 \
+        "✅ Cove Menu Bar is enabled" \
+        "Look for the Cove icon in your menu bar." \
+        "It will stay up to date automatically via 'cove upgrade'." \
+        "Remove it anytime with: cove menubar disable"
+}
+
+cove_menubar_disable() {
+    if [ "$OS" != "macos" ]; then
+        gum style --foreground red "❌ The menu bar app is only available on macOS."
+        exit 1
+    fi
+
+    if [ ! -d "$MENUBAR_APP_PATH" ]; then
+        echo "The menu bar app is not enabled."
+        exit 0
+    fi
+
+    pkill -x CoveMenuBar 2>/dev/null || true
+    rm -rf "$MENUBAR_APP_PATH"
+    echo "✅ Cove Menu Bar disabled and removed."
+}
+
+# Called from post-upgrade. Strictly opt-in: does nothing unless the app is
+# already installed. Rebuilds only when the installed bundle's version differs
+# from MENUBAR_VERSION (a missing/unreadable version — e.g. the original
+# standalone install — counts as out of date and gets adopted).
+menubar_refresh_if_enabled() {
+    if [ "$OS" != "macos" ] || [ ! -d "$MENUBAR_APP_PATH" ]; then
+        return 0
+    fi
+
+    local installed
+    installed=$(menubar_installed_version)
+    if [ "$installed" != "$MENUBAR_VERSION" ]; then
+        echo "   - Menu bar app is v${installed:-unknown}; rebuilding as v${MENUBAR_VERSION}..."
+        cove_menubar_enable quiet
+    fi
+}
+
+cove_menubar() {
+    local action="$1"
+    shift 2>/dev/null || true
+
+    case "$action" in
+        enable)
+            cove_menubar_enable
+            ;;
+        disable)
+            cove_menubar_disable
+            ;;
+        *)
+            echo "Usage: cove menubar <subcommand>"
+            echo ""
+            echo "Manage the native macOS menu bar companion app."
+            echo "Shows service status at a glance and can start/stop Cove,"
+            echo "open the Dashboard, Adminer, Mailpit, and logs."
+            echo ""
+            echo "Subcommands:"
+            echo "  enable     Build, install, and launch the menu bar app (also updates it)"
+            echo "  disable    Quit and remove the menu bar app"
+            echo ""
+            if [ "$OS" == "macos" ]; then
+                local installed
+                installed=$(menubar_installed_version)
+                if [ -d "$MENUBAR_APP_PATH" ]; then
+                    echo "Currently: enabled (v${installed:-unknown})"
+                else
+                    echo "Currently: disabled"
+                fi
+                echo ""
+            fi
+            echo "Once enabled, 'cove upgrade' keeps the app up to date automatically."
+            echo "Credit: originally created by Robby McCullough."
+            exit 0
+            ;;
+    esac
+}

@@ -46,13 +46,46 @@ for cmd_file in $(find "$COMMANDS_DIR" -type f | sort); do
     fi
 done
 
-# 4. NOW, add the main function call at the very end of the script.
+# 4. Embed the macOS menu bar app (menubar/) as emitter functions so the
+#    distributed cove.sh stays a single self-contained file. Sources are kept
+#    as real editable files in menubar/ and inlined here at compile time:
+#    main.m + Info.plist as quoted heredocs, the icon PNG as base64.
+#    `cove menubar enable` writes these out and builds locally with clang.
+MENUBAR_DIR="menubar"
+if [ -d "$MENUBAR_DIR" ]; then
+    echo "   - Embedding macOS menu bar app from ${MENUBAR_DIR}/"
+    {
+        echo "# --- Embedded macOS Menu Bar App (generated from ${MENUBAR_DIR}/ by compile.sh) ---"
+        echo ""
+        echo "emit_menubar_main_m() {"
+        echo "cat <<'COVE_MENUBAR_MAIN_M_EOF'"
+        cat "$MENUBAR_DIR/Sources/main.m"
+        echo "COVE_MENUBAR_MAIN_M_EOF"
+        echo "}"
+        echo ""
+        echo "emit_menubar_info_plist() {"
+        echo "cat <<'COVE_MENUBAR_PLIST_EOF'"
+        cat "$MENUBAR_DIR/Resources/Info.plist"
+        echo "COVE_MENUBAR_PLIST_EOF"
+        echo "}"
+        echo ""
+        echo "emit_menubar_icon_base64() {"
+        echo "cat <<'COVE_MENUBAR_ICON_EOF'"
+        base64 < "$MENUBAR_DIR/Resources/Assets/cove-favicon-source.png" | tr -d '\n' | fold -w 76
+        echo ""    # fold leaves the last chunk unterminated; the delimiter needs its own line
+        echo "COVE_MENUBAR_ICON_EOF"
+        echo "}"
+        echo ""
+    } >> "$OUTPUT_FILE"
+fi
+
+# 5. NOW, add the main function call at the very end of the script.
 echo "   - Adding final execution call"
 echo '#  Pass all script arguments to the main function.' >> "$OUTPUT_FILE"
 echo 'main "$@"' >> "$OUTPUT_FILE"
 
 
-# 5. Make the final script executable.
+# 6. Make the final script executable.
 chmod +x "$OUTPUT_FILE"
 
 echo ""

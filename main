@@ -196,6 +196,11 @@ WHOOPS_VERSION="2.18.0"
 # compares the two to decide which sites need the plugin re-pushed on upgrade.
 # Bump whenever the mu-plugin code changes so existing sites pick it up.
 MU_PLUGIN_VERSION="0.5.0"
+# Version of the macOS menu bar companion app (menubar/, embedded at compile
+# time). Bump whenever anything under menubar/ changes — post-upgrade compares
+# this against the installed bundle's CFBundleShortVersionString to decide
+# whether an enabled menu bar needs a rebuild. Opt-in: never auto-installed.
+MENUBAR_VERSION="1.0"
 CADDY_CMD="frankenphp"
 
 # Note: BIN_DIR is set in setup_environment() based on OS and architecture
@@ -5112,6 +5117,9 @@ show_general_help() {
     echo "  directive        Add or remove custom Caddyfile rules for a site."
     echo "  proxy            Manage standalone reverse proxy entries."
     echo "  tailscale        Expose all sites to your Tailscale network."
+    if [ "$OS" == "macos" ]; then
+        echo "  menubar          Manage the macOS menu bar companion app."
+    fi
     echo "  db               Manage databases (e.g., 'cove db backup')."
     echo "  lan              Enable LAN access to sites for mobile app sync."
     echo "  ports            Reconfigure HTTP/HTTPS ports + update site URLs."
@@ -5352,6 +5360,24 @@ display_command_help() {
             echo "  cove tailscale enable"
             echo "  cove tailscale enable mycomputer.tail1234.ts.net"
             echo "  cove tailscale status"
+            ;;
+        menubar)
+            echo "Usage: cove menubar <subcommand>"
+            echo ""
+            echo "Manage the native macOS menu bar companion app."
+            echo "The menu bar icon shows Cove's status at a glance and can start/stop"
+            echo "services and open the Dashboard, Adminer, Mailpit, and logs."
+            echo ""
+            echo "Subcommands:"
+            echo "  enable     Build, install, and launch the menu bar app (also updates it)"
+            echo "  disable    Quit and remove the menu bar app"
+            echo ""
+            echo "The app is built locally (requires Apple Command Line Tools) and is"
+            echo "strictly opt-in — once enabled, 'cove upgrade' keeps it up to date."
+            echo ""
+            echo "Examples:"
+            echo "  cove menubar enable"
+            echo "  cove menubar disable"
             ;;
         db)
             echo "Usage: cove db <subcommand>"
@@ -5703,6 +5729,10 @@ main() {
             # up pool-template changes. Restart-shy: unchanged configs with a
             # live master are left alone.
             sync_php_fpm_services
+            # Rebuild the macOS menu bar app ONLY if the user opted in by
+            # enabling it, and only when MENUBAR_VERSION changed. No-op on
+            # Linux and for users without the app installed.
+            menubar_refresh_if_enabled
             ;;
         status)
             check_dependencies
@@ -5765,6 +5795,10 @@ main() {
         tailscale)
             check_dependencies
             cove_tailscale "$@"
+            ;;
+        menubar)
+            check_dependencies
+            cove_menubar "$@"
             ;;
         mappings)
             check_dependencies

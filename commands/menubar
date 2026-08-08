@@ -36,7 +36,7 @@ cove_menubar_enable() {
     # what post-upgrade compares against to decide whether a rebuild is due.
     emit_menubar_main_m > "$build_dir/main.m"
     emit_menubar_info_plist | sed "s/__MENUBAR_VERSION__/${MENUBAR_VERSION}/g" > "$build_dir/Info.plist"
-    emit_menubar_icon_base64 | base64 --decode > "$build_dir/cove-favicon-source.png"
+    emit_menubar_icon_svg > "$build_dir/cove-logo.svg"
 
     if ! clang \
         -fobjc-arc \
@@ -55,9 +55,20 @@ cove_menubar_enable() {
         exit 1
     fi
 
-    # Generate the .icns from the bundled favicon.
+    # Generate the .icns from the bundled vector logo — every slot renders
+    # crisp from the SVG, including the 1024px one. sips decoding SVG is
+    # undocumented Apple behavior (CoreSVG, observed working since macOS 11),
+    # so probe one conversion first and fail loudly rather than assemble a
+    # bundle around a corrupt icon.
     local iconset_dir="$build_dir/CoveMenuBar.iconset"
     mkdir -p "$iconset_dir"
+    if ! sips -s format png -z 16 16 "$build_dir/cove-logo.svg" \
+            --out "$build_dir/icon-probe.png" >/dev/null 2>&1 \
+        || ! sips -g pixelWidth "$build_dir/icon-probe.png" >/dev/null 2>&1; then
+        rm -rf "$build_dir"
+        gum style --foreground red "❌ This macOS could not rasterize the menu bar icon (SVG via sips)."
+        exit 1
+    fi
     local spec size name
     for spec in \
         "16 icon_16x16.png" \
@@ -72,7 +83,7 @@ cove_menubar_enable() {
         "1024 icon_512x512@2x.png"; do
         size="${spec%% *}"
         name="${spec#* }"
-        sips -z "$size" "$size" "$build_dir/cove-favicon-source.png" \
+        sips -s format png -z "$size" "$size" "$build_dir/cove-logo.svg" \
             --out "$iconset_dir/$name" >/dev/null
     done
     iconutil -c icns "$iconset_dir" -o "$build_dir/CoveMenuBar.icns"
@@ -84,7 +95,7 @@ cove_menubar_enable() {
     mkdir -p "$MENUBAR_APP_PATH/Contents/MacOS" "$MENUBAR_APP_PATH/Contents/Resources/Assets"
     cp "$build_dir/CoveMenuBar" "$MENUBAR_APP_PATH/Contents/MacOS/CoveMenuBar"
     cp "$build_dir/CoveMenuBar.icns" "$MENUBAR_APP_PATH/Contents/Resources/CoveMenuBar.icns"
-    cp "$build_dir/cove-favicon-source.png" "$MENUBAR_APP_PATH/Contents/Resources/Assets/"
+    cp "$build_dir/cove-logo.svg" "$MENUBAR_APP_PATH/Contents/Resources/Assets/"
     cp "$build_dir/Info.plist" "$MENUBAR_APP_PATH/Contents/Info.plist"
     rm -rf "$build_dir"
 

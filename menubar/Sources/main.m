@@ -1052,16 +1052,29 @@ static const NSInteger kServiceRowStartIndex = 2;
         image = self.stoppedImage;
     }
 
-    button.title = @"";
-    button.image = image;
-    button.imagePosition = NSImageOnly;
+    if (image) {
+        button.title = @"";
+        button.image = image;
+        button.imagePosition = NSImageOnly;
+    } else {
+        // Icon decode failed (loadStatusImages guards against a macOS whose
+        // ImageIO can't rasterize the SVG) — fall back to a text item rather
+        // than an invisible one.
+        button.title = @"Cove";
+        button.image = nil;
+        button.imagePosition = NSNoImage;
+    }
     button.toolTip = [self summaryText];
     button.accessibilityLabel = [self summaryText];
 }
 
 - (void)loadStatusImages {
-    NSURL *assetURL = [[NSBundle mainBundle] URLForResource:@"cove-favicon-source"
-                                             withExtension:@"png"
+    // The vector logo — the same mark the dashboard renders. NSImage decoding
+    // SVG is undocumented Apple behavior (CoreSVG, observed working since
+    // macOS 11); if it ever fails, the images stay nil and updateStatusButton
+    // falls back to a "Cove" text item instead of an invisible one.
+    NSURL *assetURL = [[NSBundle mainBundle] URLForResource:@"cove-logo"
+                                             withExtension:@"svg"
                                               subdirectory:@"Assets"];
     NSImage *source = assetURL ? [[NSImage alloc] initWithContentsOfURL:assetURL] : nil;
     if (!source) {

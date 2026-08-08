@@ -28,7 +28,7 @@ fi
 # would exit 0 and ship a cove.sh whose `cove menubar enable` is broken for
 # every user.
 MENUBAR_DIR="menubar"
-for menubar_file in Sources/main.m Resources/Info.plist Resources/Assets/cove-favicon-source.png; do
+for menubar_file in Sources/main.m Resources/Info.plist Resources/Assets/cove-logo.svg; do
     if [ ! -f "$MENUBAR_DIR/$menubar_file" ]; then
         echo "Error: ${MENUBAR_DIR}/${menubar_file} not found — cannot embed the menu bar app." >&2
         exit 1
@@ -61,7 +61,7 @@ done
 # 4. Embed the macOS menu bar app (menubar/) as emitter functions so the
 #    distributed cove.sh stays a single self-contained file. Sources are kept
 #    as real editable files in menubar/ and inlined here at compile time:
-#    main.m + Info.plist as quoted heredocs, the icon PNG as base64.
+#    main.m + Info.plist + the SVG logo as quoted heredocs.
 #    `cove menubar enable` writes these out and builds locally with clang.
 #    Presence of all three source files was asserted up top, before any
 #    output was written.
@@ -82,10 +82,9 @@ if [ -d "$MENUBAR_DIR" ]; then
         echo "COVE_MENUBAR_PLIST_EOF"
         echo "}"
         echo ""
-        echo "emit_menubar_icon_base64() {"
+        echo "emit_menubar_icon_svg() {"
         echo "cat <<'COVE_MENUBAR_ICON_EOF'"
-        base64 < "$MENUBAR_DIR/Resources/Assets/cove-favicon-source.png" | tr -d '\n' | fold -w 76
-        echo ""    # fold leaves the last chunk unterminated; the delimiter needs its own line
+        cat "$MENUBAR_DIR/Resources/Assets/cove-logo.svg"
         echo "COVE_MENUBAR_ICON_EOF"
         echo "}"
         echo ""

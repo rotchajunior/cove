@@ -28,8 +28,11 @@ cove_tailscale_enable() {
     # Remove any trailing dot
     hostname="${hostname%.}"
 
-    # Validate it looks like a hostname
-    if [[ ! "$hostname" =~ \. ]]; then
+    # Validate it looks like a hostname. validate_hostname matters here beyond
+    # UX: this value is interpolated raw into Caddyfile server-block labels by
+    # regenerate_caddyfile, so a stray space/brace would take every site down
+    # at the next reload.
+    if [[ ! "$hostname" =~ \. ]] || ! validate_hostname "$hostname"; then
         gum style --foreground red "❌ Error: Invalid hostname. Expected format: machine.tailnet.ts.net"
         exit 1
     fi

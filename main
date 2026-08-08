@@ -1770,15 +1770,18 @@ validate_site_name() {
 }
 
 # Validate a hostname/domain label before it is written into the Caddyfile and
-# /etc/hosts (site mappings, proxy domains). Accepts only a bare hostname or IP:
-# no whitespace, no Caddy metacharacters ({ } newlines), no slashes. Without
-# this a mapping/proxy value could inject a Caddy server block, or (once read
-# back into update_etc_hosts) a second root-written /etc/hosts line.
+# /etc/hosts (site mappings, proxy domains, the Tailscale hostname). Accepts a
+# bare hostname or IP — underscores included (dev hostnames, _domainkey-style
+# labels) and an optional leading "*." wildcard label (valid as a Caddy site
+# address) — but no whitespace, no Caddy metacharacters ({ } newlines), no
+# slashes. Without this the value could inject a Caddy server block, or (once
+# read back into update_etc_hosts) a second root-written /etc/hosts line.
 validate_hostname() {
     local host="$1"
     [ -n "$host" ] || return 1
     [ "${#host}" -le 253 ] || return 1
-    [[ "$host" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] || return 1
+    host="${host#\*.}"
+    [[ "$host" =~ ^[A-Za-z0-9_]([A-Za-z0-9._-]*[A-Za-z0-9_])?$ ]] || return 1
     return 0
 }
 

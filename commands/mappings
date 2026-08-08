@@ -42,7 +42,7 @@ cove_mappings() {
         # Reject anything that isn't a bare hostname before it reaches the
         # Caddyfile and /etc/hosts (both generated from this file).
         if ! validate_hostname "$domain"; then
-            gum style --foreground red "❌ Error: Invalid domain '$domain'." "Domains may contain only letters, numbers, dots, and hyphens."
+            gum style --foreground red "❌ Error: Invalid domain '$domain'." "Domains may contain only letters, numbers, dots, hyphens, and underscores (plus an optional leading '*.' wildcard)."
             exit 1
         fi
 

@@ -88,7 +88,7 @@ cove_proxy_add() {
     # Reject anything but a bare hostname before it becomes a Caddyfile domain
     # label — otherwise the value can inject an arbitrary server block.
     if ! validate_hostname "$domain"; then
-        gum style --foreground red "❌ Error: Invalid domain '$domain'." "Domains may contain only letters, numbers, dots, and hyphens."
+        gum style --foreground red "❌ Error: Invalid domain '$domain'." "Domains may contain only letters, numbers, dots, hyphens, and underscores (plus an optional leading '*.' wildcard)."
         exit 1
     fi
 

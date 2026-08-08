@@ -1,5 +1,16 @@
 cove_status() {
-    echo "🔎 Checking Cove service status..."
+    # --porcelain: stable machine-readable output (one key=value per line,
+    # lowercase). This is a CONTRACT consumed by the macOS menu bar app —
+    # reword the human output freely, but never change these keys/values
+    # without updating menubar/Sources/main.m alongside.
+    local porcelain=false
+    if [ "$1" == "--porcelain" ]; then
+        porcelain=true
+    fi
+
+    if [ "$porcelain" == false ]; then
+        echo "🔎 Checking Cove service status..."
+    fi
 
     local caddy_status="❌ Stopped"
     local mariadb_status="❌ Stopped"
@@ -42,6 +53,7 @@ cove_status() {
     # Native php-fpm units for sites pinned to an older PHP (`cove php`).
     # One row per version with an installed unit; nothing pinned = no rows.
     local fpm_lines=""
+    local fpm_porcelain=""
     if [ "$OS" == "macos" ]; then
         local fpm_plist fpm_ver fpm_state
         for fpm_plist in "$COVE_DIR"/com.cove.php-fpm-*.plist; do
@@ -56,7 +68,21 @@ cove_status() {
                 fpm_state="✅ Running"
             fi
             fpm_lines+="  PHP-FPM $fpm_ver:  $fpm_state"$'\n'
+            if [[ "$fpm_state" == *Running* ]]; then
+                fpm_porcelain+="php-fpm-$fpm_ver=running"$'\n'
+            else
+                fpm_porcelain+="php-fpm-$fpm_ver=stopped"$'\n'
+            fi
         done
+    fi
+
+    if [ "$porcelain" == true ]; then
+        echo "version=$COVE_VERSION"
+        [[ "$caddy_status" == *Running* ]] && echo "caddy=running" || echo "caddy=stopped"
+        [[ "$mariadb_status" == *Running* ]] && echo "mariadb=running" || echo "mariadb=stopped"
+        [[ "$mailpit_status" == *Running* ]] && echo "mailpit=running" || echo "mailpit=stopped"
+        [ -n "$fpm_porcelain" ] && printf '%s' "$fpm_porcelain"
+        return 0
     fi
 
     echo ""

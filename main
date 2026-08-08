@@ -5167,9 +5167,13 @@ display_command_help() {
             echo "Stops all background services managed by Cove."
             ;;
         status)
-            echo "Usage: cove status"
+            echo "Usage: cove status [--porcelain]"
             echo ""
             echo "Checks the status of all background services."
+            echo ""
+            echo "Options:"
+            echo "  --porcelain    Stable machine-readable output (key=value per line),"
+            echo "                 as consumed by the menu bar app."
             ;;
         health)
             echo "Usage: cove health"
@@ -5736,7 +5740,7 @@ main() {
             ;;
         status)
             check_dependencies
-            cove_status
+            cove_status "$@"
             ;;
         health)
             check_dependencies

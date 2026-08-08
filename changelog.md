@@ -8,6 +8,7 @@
 
 ### 🛠️ Improvements & Changes
 
+* **Dashboard Filter Focused on Load:** Opening `https://cove.localhost` now puts the cursor in the filter box immediately, so you can start typing a site name the moment the page lands — type to narrow, arrow to pick, Enter to open, no click required. Esc still clears and blurs the filter for the `j`/`k` crowd.
 * **Machine-Readable Service Status:** `cove status --porcelain` emits a stable `key=value` line per service (`caddy=running`, `mariadb=stopped`, `php-fpm-8.2=running`, plus `version=`) intended for tooling — it's what the menu bar app consumes. The human-readable output is unchanged and remains free to evolve; the porcelain keys are a contract and won't.
 
 ### 🔒 Security & Bug Fixes

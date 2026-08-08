@@ -54,6 +54,11 @@ static const NSInteger kServiceRowStartIndex = 2;
 @property(nonatomic, copy) NSString *coveVersion;
 @property(nonatomic, copy) NSString *latestVersion;
 @property(nonatomic, assign) CFAbsoluteTime lastUserActionTime;
+// Services seen newly stopped on the last poll, awaiting a second consecutive
+// stopped poll before the "stopped unexpectedly" notification fires. Absorbs
+// transient restarts (a terminal-run `cove enable`, service churn during
+// `cove upgrade`) that a single-poll snapshot would misread as a crash.
+@property(nonatomic, strong) NSMutableSet<NSString *> *pendingStopKeys;
 @property(nonatomic, assign) BOOL notificationsAllowed;
 @property(nonatomic, strong) NSImage *runningImage;
 @property(nonatomic, strong) NSImage *partialImage;
@@ -208,12 +213,20 @@ static const NSInteger kServiceRowStartIndex = 2;
 // Suppressed when: states aren't established yet, the user just acted through
 // the menu (start/stop churn), or EVERYTHING went down at once — that shape is
 // almost always a deliberate `cove disable` from a terminal, not a crash.
+// A stop must also survive TWO consecutive polls before it notifies: a service
+// mid-restart (terminal-run `cove enable`, the multi-minute service churn of
+// `cove upgrade`) is back up by the next poll and never alarms.
 - (void)notifyUnexpectedStopsFrom:(NSDictionary<NSString *, NSNumber *> *)oldStates
                                to:(NSDictionary<NSString *, NSNumber *> *)newStates {
+    if (!self.pendingStopKeys) {
+        self.pendingStopKeys = [NSMutableSet set];
+    }
     if (!self.statesKnown || !self.notificationsAllowed) {
+        [self.pendingStopKeys removeAllObjects];
         return;
     }
     if (CFAbsoluteTimeGetCurrent() - self.lastUserActionTime < 20.0) {
+        [self.pendingStopKeys removeAllObjects];
         return;
     }
 
@@ -225,16 +238,26 @@ static const NSInteger kServiceRowStartIndex = 2;
         }
     }
     if (!anyStillRunning) {
+        [self.pendingStopKeys removeAllObjects];
         return;
     }
 
+    NSMutableSet<NSString *> *stillPending = [NSMutableSet set];
     for (NSString *key in newStates) {
-        if (oldStates[key].boolValue && !newStates[key].boolValue) {
+        if (newStates[key].boolValue) {
+            continue;   // running — any pending suspicion is dropped
+        }
+        if (oldStates[key].boolValue) {
+            // Newly stopped: hold for confirmation on the next poll.
+            [stillPending addObject:key];
+        } else if ([self.pendingStopKeys containsObject:key]) {
+            // Stopped on the previous poll too — confirmed dead.
             [self postNotificationWithBody:
                 [NSString stringWithFormat:@"%@ stopped unexpectedly.",
                  [self displayNameForServiceKey:key]]];
         }
     }
+    self.pendingStopKeys = stillPending;
 }
 
 - (void)postNotificationWithBody:(NSString *)body {
@@ -840,6 +863,18 @@ static const NSInteger kServiceRowStartIndex = 2;
     if (host.length == 0) {
         return;
     }
+    // Guard against a second click while wp-cli is still minting the URL:
+    // each `cove login` run regenerates the one-time token, so a parallel run
+    // would invalidate the first URL right before its tab opens.
+    if (self.busy) {
+        return;
+    }
+    self.busy = YES;
+    self.busyText = [NSString stringWithFormat:@"Logging in to %@…", host];
+    self.lastActionError = nil;
+    self.lastUserActionTime = CFAbsoluteTimeGetCurrent();
+    [self updateMenu];
+
     // `cove login` takes the site name without the .localhost suffix and
     // prints a one-time login URL inside a decorative gum box.
     NSString *siteName = [host stringByReplacingOccurrencesOfString:@".localhost"
@@ -855,6 +890,10 @@ static const NSInteger kServiceRowStartIndex = 2;
         if (!strongSelf) {
             return;
         }
+
+        strongSelf.busy = NO;
+        strongSelf.busyText = nil;
+        strongSelf.lastUserActionTime = CFAbsoluteTimeGetCurrent();
 
         NSString *loginURL = nil;
         if (status == 0) {
@@ -877,6 +916,7 @@ static const NSInteger kServiceRowStartIndex = 2;
         }
 
         if (loginURL) {
+            [strongSelf updateMenu];
             [[NSWorkspace sharedWorkspace] openURL:[NSURL URLWithString:loginURL]];
         } else {
             [strongSelf reportActionFailure:[NSString stringWithFormat:@"Could not log in to %@", host]
@@ -953,6 +993,10 @@ static const NSInteger kServiceRowStartIndex = 2;
 // belongs in a real terminal, not a headless NSTask. A .command file opens in
 // Terminal via Launch Services with no automation (TCC) prompt.
 - (void)runUpgradeInTerminal {
+    // The upgrade restarts services from the Terminal window over the next
+    // couple of minutes; mark it as user-initiated so the poll landing in the
+    // middle of it doesn't read the churn as a crash.
+    self.lastUserActionTime = CFAbsoluteTimeGetCurrent();
     NSString *script = @"#!/bin/zsh\n"
                         "export PATH=\"/opt/homebrew/bin:/usr/local/bin:$PATH\"\n"
                         "cove upgrade\n";

@@ -177,7 +177,6 @@ cove_menubar() {
                 echo ""
             fi
             echo "Once enabled, 'cove upgrade' keeps the app up to date automatically."
-            echo "Credit: originally created by Robby McCullough."
             exit 0
             ;;
     esac

@@ -3354,6 +3354,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                     autocapitalize="off"
                     autocorrect="off"
                     aria-label="Filter sites"
+                    autofocus
                 >
                 <button
                     type="button"

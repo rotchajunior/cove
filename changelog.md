@@ -9,6 +9,7 @@
 ### 🛠️ Improvements & Changes
 
 * **Dashboard Filter Focused on Load:** Opening `https://cove.localhost` now puts the cursor in the filter box immediately, so you can start typing a site name the moment the page lands — type to narrow, arrow to pick, Enter to open, no click required. Esc still clears and blurs the filter for the `j`/`k` crowd.
+* **The Menu Bar Icon Is Now a Vector:** The embedded icon asset switched from a 300×300 PNG to the same SVG mark the dashboard renders, so there is one logo source of truth — and the Finder/Login Items app icon is now generated crisp at every size up to 1024px instead of being upscaled from 300px. The embedded asset shrank from 29KB of base64 to under 1KB of text. Because Apple's SVG rasterization is technically undocumented, `cove menubar enable` probes it first and fails with a clear message rather than assembling a bundle around a corrupt icon, and if the app itself ever can't decode the logo it falls back to a "Cove" text item in the menu bar instead of an invisible one.
 * **Machine-Readable Service Status:** `cove status --porcelain` emits a stable `key=value` line per service (`caddy=running`, `mariadb=stopped`, `php-fpm-8.2=running`, plus `version=`) intended for tooling — it's what the menu bar app consumes. The human-readable output is unchanged and remains free to evolve; the porcelain keys are a contract and won't.
 
 ### 🔒 Security & Bug Fixes

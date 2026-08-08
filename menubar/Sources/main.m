@@ -11,6 +11,12 @@
 // Status is read via `cove status --porcelain` (key=value per line) — a
 // stable contract defined in commands/status. The human-readable status
 // output can change freely; the porcelain keys cannot.
+//
+// Menu architecture: the menu skeleton is built ONCE, with the three core
+// service rows pre-seeded, and every refresh mutates item titles/images in
+// place. Rebuilding items on refresh caused two visible glitches: the first
+// render had no service rows (so no icon column — text flush left), and the
+// first poll's rebuild re-layouted the open menu, making everything jump.
 
 #import <Cocoa/Cocoa.h>
 #import <CoreImage/CoreImage.h>
@@ -19,13 +25,17 @@
 
 typedef void (^CoveCommandCompletion)(int status, NSString *output, NSError *error);
 
+// Index of the first service row: summary + separator come before it.
+static const NSInteger kServiceRowStartIndex = 2;
+
 @interface AppDelegate : NSObject <NSApplicationDelegate, NSMenuDelegate>
 @property(nonatomic, strong) NSStatusItem *statusItem;
 @property(nonatomic, strong) NSMenu *menu;
 @property(nonatomic, strong) NSTimer *refreshTimer;
 @property(nonatomic, strong) NSTimer *updateCheckTimer;
 // Ordered porcelain keys (caddy, mariadb, mailpit, php-fpm-<ver>...) and
-// their running state from the most recent successful poll.
+// their running state from the most recent successful poll. serviceStates is
+// tri-state via absence: no entry for a key yet = unknown ("…" row).
 @property(nonatomic, strong) NSArray<NSString *> *serviceKeys;
 @property(nonatomic, strong) NSDictionary<NSString *, NSNumber *> *serviceStates;
 @property(nonatomic, assign) BOOL statesKnown;
@@ -38,6 +48,19 @@ typedef void (^CoveCommandCompletion)(int status, NSString *output, NSError *err
 @property(nonatomic, strong) NSImage *runningImage;
 @property(nonatomic, strong) NSImage *partialImage;
 @property(nonatomic, strong) NSImage *stoppedImage;
+// Stable menu items, created once and mutated in place.
+@property(nonatomic, strong) NSMenuItem *summaryItem;
+@property(nonatomic, strong) NSMutableArray<NSMenuItem *> *serviceItems;
+@property(nonatomic, strong) NSArray<NSString *> *serviceItemKeys;
+@property(nonatomic, strong) NSMenuItem *errorItem;
+@property(nonatomic, strong) NSMenuItem *actionItem;
+@property(nonatomic, strong) NSMenuItem *refreshItem;
+@property(nonatomic, strong) NSMenuItem *sitesItem;
+@property(nonatomic, strong) NSMenuItem *dashboardItem;
+@property(nonatomic, strong) NSMenuItem *adminerItem;
+@property(nonatomic, strong) NSMenuItem *mailpitItem;
+@property(nonatomic, strong) NSMenuItem *launchItem;
+@property(nonatomic, strong) NSMenuItem *versionItem;
 @end
 
 @implementation AppDelegate
@@ -47,16 +70,16 @@ typedef void (^CoveCommandCompletion)(int status, NSString *output, NSError *err
     self.statusItem = [[NSStatusBar systemStatusBar] statusItemWithLength:NSVariableStatusItemLength];
     [self loadStatusImages];
 
-    self.serviceKeys = @[];
+    // Seed the core trio before the first poll so the very first render
+    // already has the service rows (and their icon column). PHP-FPM rows for
+    // pinned sites are appended when the first poll reports them.
+    self.serviceKeys = @[ @"caddy", @"mariadb", @"mailpit" ];
     self.serviceStates = @{};
+    self.serviceItems = [NSMutableArray array];
+    self.serviceItemKeys = @[];
 
-    // One menu instance for the app's lifetime, mutated in place. Rebuilding a
-    // fresh NSMenu per refresh left the *open* menu showing stale state — an
-    // assigned-but-replaced menu doesn't update what's already on screen.
-    self.menu = [[NSMenu alloc] init];
-    self.menu.autoenablesItems = NO;
-    self.menu.delegate = self;
-    self.statusItem.menu = self.menu;
+    [self buildMenuSkeleton];
+    [self updateMenu];
 
     __weak typeof(self) weakSelf = self;
     [[UNUserNotificationCenter currentNotificationCenter]
@@ -74,7 +97,6 @@ typedef void (^CoveCommandCompletion)(int status, NSString *output, NSError *err
         name:NSWorkspaceDidWakeNotification
         object:nil];
 
-    [self rebuildMenu];
     [self refreshStatus];
 
     // The menu refreshes on open (menuWillOpen:), so the timer only keeps the
@@ -97,6 +119,10 @@ typedef void (^CoveCommandCompletion)(int status, NSString *output, NSError *err
 }
 
 - (void)menuWillOpen:(NSMenu *)menu {
+    // Rebuild the Sites submenu before display (it isn't visible yet, so
+    // this can't cause an on-screen re-layout), then poll for fresh state —
+    // whose completion only mutates titles/images in place.
+    [self rebuildSitesSubmenu];
     [self refreshStatus];
 }
 
@@ -122,7 +148,7 @@ typedef void (^CoveCommandCompletion)(int status, NSString *output, NSError *err
             strongSelf.lastError = error.localizedDescription ?: @"Unable to read Cove status.";
         }
 
-        [strongSelf rebuildMenu];
+        [strongSelf updateMenu];
     }];
 }
 
@@ -230,9 +256,15 @@ typedef void (^CoveCommandCompletion)(int status, NSString *output, NSError *err
 }
 
 - (BOOL)allServicesRunning {
-    return self.statesKnown
-        && self.serviceKeys.count > 0
-        && [self runningServiceCount] == (NSInteger)self.serviceKeys.count;
+    if (!self.statesKnown || self.serviceKeys.count == 0) {
+        return NO;
+    }
+    for (NSString *key in self.serviceKeys) {
+        if (!self.serviceStates[key].boolValue) {
+            return NO;
+        }
+    }
+    return YES;
 }
 
 #pragma mark - Actions
@@ -253,7 +285,7 @@ typedef void (^CoveCommandCompletion)(int status, NSString *output, NSError *err
     self.busy = YES;
     self.lastError = nil;
     self.lastUserActionTime = CFAbsoluteTimeGetCurrent();
-    [self rebuildMenu];
+    [self updateMenu];
 
     __weak typeof(self) weakSelf = self;
     [self runCoveWithArguments:arguments completion:^(int status, NSString *output, NSError *error) {
@@ -269,7 +301,7 @@ typedef void (^CoveCommandCompletion)(int status, NSString *output, NSError *err
             strongSelf.lastError = error.localizedDescription ?: @"The Cove command failed.";
             [strongSelf showErrorWithTitle:[NSString stringWithFormat:@"Could not %@ Cove", actionName]
                                    message:strongSelf.lastError];
-            [strongSelf rebuildMenu];
+            [strongSelf updateMenu];
             return;
         }
 
@@ -341,107 +373,166 @@ typedef void (^CoveCommandCompletion)(int status, NSString *output, NSError *err
     return @"/usr/bin/env";
 }
 
-#pragma mark - Menu
+#pragma mark - Menu skeleton (built once)
 
-- (void)rebuildMenu {
-    [self updateStatusButton];
+- (void)buildMenuSkeleton {
+    self.menu = [[NSMenu alloc] init];
+    self.menu.autoenablesItems = NO;
+    self.menu.delegate = self;
 
-    NSMenu *menu = self.menu;
-    [menu removeAllItems];
+    self.summaryItem = [[NSMenuItem alloc] initWithTitle:@"" action:nil keyEquivalent:@""];
+    self.summaryItem.enabled = NO;
+    [self.menu addItem:self.summaryItem];
+    [self.menu addItem:[NSMenuItem separatorItem]];
 
-    NSMenuItem *summary = [[NSMenuItem alloc] initWithTitle:[self summaryText]
-                                                    action:nil
-                                             keyEquivalent:@""];
-    summary.enabled = NO;
-    [menu addItem:summary];
-    [menu addItem:[NSMenuItem separatorItem]];
+    // Service rows are inserted at kServiceRowStartIndex by syncServiceRows.
 
-    for (NSString *key in self.serviceKeys) {
-        [menu addItem:[self serviceMenuItemWithName:[self displayNameForServiceKey:key]
-                                            running:[self serviceRunning:key]]];
-    }
+    self.errorItem = [[NSMenuItem alloc] initWithTitle:@"" action:nil keyEquivalent:@""];
+    self.errorItem.enabled = NO;
+    self.errorItem.hidden = YES;
+    [self.menu addItem:self.errorItem];
 
-    if (self.lastError.length > 0) {
-        [menu addItem:[NSMenuItem separatorItem]];
-        NSString *firstLine = [[self.lastError componentsSeparatedByCharactersInSet:
-                                [NSCharacterSet newlineCharacterSet]] firstObject];
-        NSMenuItem *errorItem =
-            [[NSMenuItem alloc] initWithTitle:[NSString stringWithFormat:@"Error: %@", firstLine]
-                                      action:nil
-                               keyEquivalent:@""];
-        errorItem.enabled = NO;
-        [menu addItem:errorItem];
-    }
+    [self.menu addItem:[NSMenuItem separatorItem]];
 
-    [menu addItem:[NSMenuItem separatorItem]];
-    BOOL allRunning = [self allServicesRunning];
-    NSMenuItem *actionItem =
-        [[NSMenuItem alloc] initWithTitle:(allRunning ? @"Stop Cove" : @"Start Cove")
-                                  action:(allRunning ? @selector(stopCove) : @selector(startCove))
-                           keyEquivalent:@""];
-    actionItem.target = self;
-    actionItem.enabled = !self.busy;
-    [menu addItem:actionItem];
+    self.actionItem = [[NSMenuItem alloc] initWithTitle:@"Start Cove"
+                                                 action:@selector(startCove)
+                                          keyEquivalent:@""];
+    self.actionItem.target = self;
+    [self.menu addItem:self.actionItem];
 
-    NSMenuItem *refreshItem = [[NSMenuItem alloc] initWithTitle:@"Refresh Status"
-                                                        action:@selector(refreshStatus)
-                                                 keyEquivalent:@"r"];
-    refreshItem.target = self;
-    refreshItem.enabled = !self.busy;
-    [menu addItem:refreshItem];
+    self.refreshItem = [[NSMenuItem alloc] initWithTitle:@"Refresh Status"
+                                                  action:@selector(refreshStatus)
+                                           keyEquivalent:@"r"];
+    self.refreshItem.target = self;
+    [self.menu addItem:self.refreshItem];
 
-    [menu addItem:[NSMenuItem separatorItem]];
-    [menu addItem:[self sitesMenuItem]];
+    [self.menu addItem:[NSMenuItem separatorItem]];
 
-    [menu addItem:[NSMenuItem separatorItem]];
-    [menu addItem:[self linkItemWithTitle:@"Open Cove Dashboard"
-                                   action:@selector(openDashboard)
-                                  enabled:[self serviceRunning:@"caddy"]]];
-    [menu addItem:[self linkItemWithTitle:@"Open Adminer"
-                                   action:@selector(openAdminer)
-                                  enabled:[self serviceRunning:@"caddy"]]];
-    [menu addItem:[self linkItemWithTitle:@"Open Mailpit"
-                                   action:@selector(openMailpit)
-                                  enabled:[self serviceRunning:@"mailpit"]]];
-    [menu addItem:[self linkItemWithTitle:@"Open Cove Logs"
-                                   action:@selector(openLogs)
-                                  enabled:YES]];
-    [menu addItem:[self linkItemWithTitle:@"Open Sites Folder"
-                                   action:@selector(openSitesFolder)
-                                  enabled:YES]];
+    self.sitesItem = [[NSMenuItem alloc] initWithTitle:@"Sites" action:nil keyEquivalent:@""];
+    self.sitesItem.submenu = [[NSMenu alloc] init];
+    self.sitesItem.submenu.autoenablesItems = NO;
+    [self.menu addItem:self.sitesItem];
+    [self rebuildSitesSubmenu];
 
-    [menu addItem:[NSMenuItem separatorItem]];
-    NSMenuItem *launchItem = [[NSMenuItem alloc] initWithTitle:@"Launch at Login"
-                                                        action:@selector(toggleLaunchAtLogin)
-                                                 keyEquivalent:@""];
-    launchItem.target = self;
-    launchItem.state = SMAppService.mainAppService.status == SMAppServiceStatusEnabled
-        ? NSControlStateValueOn
-        : NSControlStateValueOff;
-    [menu addItem:launchItem];
+    [self.menu addItem:[NSMenuItem separatorItem]];
 
-    if ([self updateAvailable]) {
-        NSMenuItem *updateItem =
-            [[NSMenuItem alloc] initWithTitle:[NSString stringWithFormat:@"Update Cove to v%@…",
-                                               self.latestVersion]
-                                      action:@selector(runUpgradeInTerminal)
-                               keyEquivalent:@""];
-        updateItem.target = self;
-        [menu addItem:updateItem];
-    } else if (self.coveVersion.length > 0) {
-        NSMenuItem *versionItem =
-            [[NSMenuItem alloc] initWithTitle:[NSString stringWithFormat:@"Cove v%@", self.coveVersion]
-                                      action:nil
-                               keyEquivalent:@""];
-        versionItem.enabled = NO;
-        [menu addItem:versionItem];
-    }
+    self.dashboardItem = [self linkItemWithTitle:@"Open Cove Dashboard"
+                                          action:@selector(openDashboard)];
+    [self.menu addItem:self.dashboardItem];
+    self.adminerItem = [self linkItemWithTitle:@"Open Adminer"
+                                        action:@selector(openAdminer)];
+    [self.menu addItem:self.adminerItem];
+    self.mailpitItem = [self linkItemWithTitle:@"Open Mailpit"
+                                        action:@selector(openMailpit)];
+    [self.menu addItem:self.mailpitItem];
+    [self.menu addItem:[self linkItemWithTitle:@"Open Cove Logs"
+                                        action:@selector(openLogs)]];
+    [self.menu addItem:[self linkItemWithTitle:@"Open Sites Folder"
+                                        action:@selector(openSitesFolder)]];
+
+    [self.menu addItem:[NSMenuItem separatorItem]];
+
+    self.launchItem = [[NSMenuItem alloc] initWithTitle:@"Launch at Login"
+                                                 action:@selector(toggleLaunchAtLogin)
+                                          keyEquivalent:@""];
+    self.launchItem.target = self;
+    [self.menu addItem:self.launchItem];
+
+    self.versionItem = [[NSMenuItem alloc] initWithTitle:@"" action:nil keyEquivalent:@""];
+    self.versionItem.target = self;
+    self.versionItem.enabled = NO;
+    self.versionItem.hidden = YES;
+    [self.menu addItem:self.versionItem];
 
     NSMenuItem *quitItem = [[NSMenuItem alloc] initWithTitle:@"Quit Cove Menu Bar"
                                                      action:@selector(quitApp)
                                               keyEquivalent:@"q"];
     quitItem.target = self;
-    [menu addItem:quitItem];
+    [self.menu addItem:quitItem];
+
+    self.statusItem.menu = self.menu;
+}
+
+#pragma mark - Menu updates (in place)
+
+- (void)updateMenu {
+    [self updateStatusButton];
+    [self syncServiceRows];
+
+    self.summaryItem.title = [self summaryText];
+
+    if (self.lastError.length > 0) {
+        NSString *firstLine = [[self.lastError componentsSeparatedByCharactersInSet:
+                                [NSCharacterSet newlineCharacterSet]] firstObject];
+        self.errorItem.title = [NSString stringWithFormat:@"Error: %@", firstLine];
+        self.errorItem.hidden = NO;
+    } else {
+        self.errorItem.hidden = YES;
+    }
+
+    BOOL allRunning = [self allServicesRunning];
+    self.actionItem.title = allRunning ? @"Stop Cove" : @"Start Cove";
+    self.actionItem.action = allRunning ? @selector(stopCove) : @selector(startCove);
+    self.actionItem.enabled = !self.busy;
+    self.refreshItem.enabled = !self.busy;
+
+    self.dashboardItem.enabled = [self serviceRunning:@"caddy"];
+    self.adminerItem.enabled = [self serviceRunning:@"caddy"];
+    self.mailpitItem.enabled = [self serviceRunning:@"mailpit"];
+
+    self.launchItem.state = SMAppService.mainAppService.status == SMAppServiceStatusEnabled
+        ? NSControlStateValueOn
+        : NSControlStateValueOff;
+
+    if ([self updateAvailable]) {
+        self.versionItem.title = [NSString stringWithFormat:@"Update Cove to v%@…", self.latestVersion];
+        self.versionItem.action = @selector(runUpgradeInTerminal);
+        self.versionItem.enabled = YES;
+        self.versionItem.hidden = NO;
+    } else if (self.coveVersion.length > 0) {
+        self.versionItem.title = [NSString stringWithFormat:@"Cove v%@", self.coveVersion];
+        self.versionItem.action = nil;
+        self.versionItem.enabled = NO;
+        self.versionItem.hidden = NO;
+    } else {
+        self.versionItem.hidden = YES;
+    }
+}
+
+// Keep one menu item per service key, inserting/removing rows only when the
+// key set actually changes (e.g. a PHP-FPM pool appears after the first poll
+// or a `cove php` pin). Everything else is a title/image mutation, so an open
+// menu never re-layouts.
+- (void)syncServiceRows {
+    if (![self.serviceItemKeys isEqualToArray:self.serviceKeys]) {
+        for (NSMenuItem *item in self.serviceItems) {
+            [self.menu removeItem:item];
+        }
+        [self.serviceItems removeAllObjects];
+
+        NSInteger index = kServiceRowStartIndex;
+        for (NSString *key in self.serviceKeys) {
+            (void)key;
+            NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:@"" action:nil keyEquivalent:@""];
+            item.enabled = NO;
+            [self.menu insertItem:item atIndex:index++];
+            [self.serviceItems addObject:item];
+        }
+        self.serviceItemKeys = [self.serviceKeys copy];
+    }
+
+    [self.serviceKeys enumerateObjectsUsingBlock:^(NSString *key, NSUInteger idx, BOOL *stop) {
+        (void)stop;
+        NSMenuItem *item = self.serviceItems[idx];
+        NSNumber *state = self.serviceStates[key];
+        NSString *stateText = state ? (state.boolValue ? @"Running" : @"Stopped") : @"…";
+        NSString *symbol = state
+            ? (state.boolValue ? @"checkmark.circle.fill" : @"circle")
+            : @"circle.dotted";
+        item.title = [NSString stringWithFormat:@"%@: %@",
+                      [self displayNameForServiceKey:key], stateText];
+        item.image = [NSImage imageWithSystemSymbolName:symbol accessibilityDescription:nil];
+    }];
 }
 
 #pragma mark - Sites submenu
@@ -453,12 +544,10 @@ typedef void (^CoveCommandCompletion)(int status, NSString *output, NSError *err
 // Cove's convention: every site is a directory named <name>.localhost inside
 // ~/Cove/Sites. The directory also collects loose files (logs, scripts), so
 // filter strictly. A cheap readdir on the main thread — sites lists are small.
-- (NSMenuItem *)sitesMenuItem {
-    NSMenuItem *sitesItem = [[NSMenuItem alloc] initWithTitle:@"Sites"
-                                                      action:nil
-                                               keyEquivalent:@""];
-    NSMenu *submenu = [[NSMenu alloc] init];
-    submenu.autoenablesItems = NO;
+// Called from menuWillOpen, before the menu is on screen.
+- (void)rebuildSitesSubmenu {
+    NSMenu *submenu = self.sitesItem.submenu;
+    [submenu removeAllItems];
 
     NSFileManager *fileManager = [NSFileManager defaultManager];
     NSString *sitesDir = [self sitesDirectory];
@@ -507,12 +596,10 @@ typedef void (^CoveCommandCompletion)(int status, NSString *output, NSError *err
                                                     keyEquivalent:@""];
         emptyItem.enabled = NO;
         [submenu addItem:emptyItem];
+        self.sitesItem.title = @"Sites";
     } else {
-        sitesItem.title = [NSString stringWithFormat:@"Sites (%lu)", (unsigned long)siteCount];
+        self.sitesItem.title = [NSString stringWithFormat:@"Sites (%lu)", (unsigned long)siteCount];
     }
-
-    sitesItem.submenu = submenu;
-    return sitesItem;
 }
 
 - (void)openSite:(NSMenuItem *)sender {
@@ -603,7 +690,7 @@ typedef void (^CoveCommandCompletion)(int status, NSString *output, NSError *err
                       return;
                   }
                   strongSelf.latestVersion = version;
-                  [strongSelf rebuildMenu];
+                  [strongSelf updateMenu];
               });
           }];
     [task resume];
@@ -739,21 +826,9 @@ typedef void (^CoveCommandCompletion)(int status, NSString *output, NSError *err
     return @"Cove is stopped";
 }
 
-- (NSMenuItem *)serviceMenuItemWithName:(NSString *)name running:(BOOL)running {
-    NSString *title = [NSString stringWithFormat:@"%@: %@", name, running ? @"Running" : @"Stopped"];
-    NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:title action:nil keyEquivalent:@""];
-    item.image = [NSImage imageWithSystemSymbolName:(running ? @"checkmark.circle.fill" : @"circle")
-                          accessibilityDescription:nil];
-    item.enabled = NO;
-    return item;
-}
-
-- (NSMenuItem *)linkItemWithTitle:(NSString *)title
-                           action:(SEL)action
-                          enabled:(BOOL)enabled {
+- (NSMenuItem *)linkItemWithTitle:(NSString *)title action:(SEL)action {
     NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:title action:action keyEquivalent:@""];
     item.target = self;
-    item.enabled = enabled;
     return item;
 }
 
@@ -827,7 +902,7 @@ typedef void (^CoveCommandCompletion)(int status, NSString *output, NSError *err
         [self showErrorWithTitle:@"Launch at Login"
                          message:error.localizedDescription ?: @"Unable to change the login item."];
     }
-    [self rebuildMenu];
+    [self updateMenu];
 }
 
 - (void)showErrorWithTitle:(NSString *)title message:(NSString *)message {

@@ -79,6 +79,10 @@ cove_share() {
             # Fedora/RHEL
             install_cmd="curl -fsSL https://pkg.cloudflare.com/cloudflared-ascii.repo | sudo tee /etc/yum.repos.d/cloudflared.repo && sudo dnf install -y cloudflared"
             install_name="dnf"
+        elif command -v pacman &> /dev/null; then
+            # Arch/Manjaro
+            install_cmd="sudo pacman -S --needed --noconfirm cloudflared"
+            install_name="pacman"
         fi
         
         if [ -n "$install_cmd" ]; then

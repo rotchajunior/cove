@@ -18,6 +18,8 @@ cove_trust() {
                 $SUDO_CMD apt install -y libnss3-tools &>/dev/null || true
             elif [ "$PKG_MANAGER" = "dnf" ]; then
                 $SUDO_CMD dnf install -y nss-tools &>/dev/null || true
+            elif [ "$PKG_MANAGER" = "pacman" ]; then
+                $SUDO_CMD pacman -S --needed --noconfirm nss &>/dev/null || true
             fi
         fi
     fi
@@ -67,7 +69,7 @@ cove_trust() {
                 # layer stale copies, then add the current root.
                 certutil -D -d sql:"$profile_dir" -n "Cove Local Authority" 2>/dev/null || true
                 certutil -A -d sql:"$profile_dir" -n "Cove Local Authority" -t "C,," -i "$root_cert" 2>/dev/null || true
-            done < <(find "$HOME/snap" "$HOME/.mozilla/firefox" \
+            done < <(find "$HOME/.pki" "$HOME/snap" "$HOME/.mozilla/firefox" \
                 -name 'cert9.db' 2>/dev/null)
         else
             gum style --foreground yellow "⚠️ Could not locate Caddy root.crt — snap Firefox/Chromium trust skipped."

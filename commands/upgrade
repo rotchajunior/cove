@@ -21,6 +21,14 @@ upgrade_frankenphp() {
                 gum style --foreground red "❌ Failed to upgrade FrankenPHP via dnf."
                 return 1
             fi
+        elif [ "$PKG_MANAGER" = "pacman" ]; then
+            echo "   - FrankenPHP installed via pacman. Upgrading with pacman..."
+            if $SUDO_CMD pacman -S --needed --noconfirm frankenphp; then
+                echo "   - ✅ FrankenPHP upgraded successfully via pacman."
+            else
+                gum style --foreground red "❌ Failed to upgrade FrankenPHP via pacman."
+                return 1
+            fi
         else
             echo "   - ⚠️ Unknown package manager for FrankenPHP at /usr/bin. Skipping upgrade."
             return 1

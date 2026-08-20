@@ -92,9 +92,11 @@ setup_environment() {
             PKG_MANAGER="apt"
         elif [[ "$ID" == "fedora" || "$ID" == "centos" || "$ID" == "rhel" || "$ID_LIKE" == *"fedora"* || "$ID_LIKE" == *"rhel"* ]]; then
             PKG_MANAGER="dnf"
+        elif [[ "$ID" == "arch" || "$ID" == "manjaro" || "$ID_LIKE" == *"arch"* ]]; then
+            PKG_MANAGER="pacman"
         else
             echo "❌ ERROR: Unsupported Linux distribution: $ID." >&2
-            echo "Supported: Ubuntu, Debian, Fedora, CentOS, RHEL and derivatives." >&2
+            echo "Supported: Ubuntu, Debian, Fedora, CentOS, RHEL, Arch, Manjaro and derivatives." >&2
             exit 1
         fi
         
@@ -7576,10 +7578,16 @@ install_dependency() {
     local apt_pkg="$3"       # The package name for apt (Debian/Ubuntu)
     local dnf_pkg="$4"       # The package name for dnf (Fedora/RHEL) - can differ from apt
     local binary_url="$5"    # Optional URL to a binary/tarball for fallback
+    local pacman_pkg="$6"    # The package name for pacman (Arch/Manjaro)
 
     # If dnf_pkg not specified, default to apt_pkg
     if [ -z "$dnf_pkg" ]; then
         dnf_pkg="$apt_pkg"
+    fi
+
+    # If pacman_pkg not specified, default to apt_pkg
+    if [ -z "$pacman_pkg" ]; then
+        pacman_pkg="$apt_pkg"
     fi
 
     # 1. Validate the command. If it runs, we're done.
@@ -7609,12 +7617,14 @@ install_dependency() {
         if "$MAC_BREW" install "$brew_pkg"; then
             installed_successfully=true
         fi
-    else # For Linux (apt/dnf)
+    else # For Linux (apt/dnf/pacman)
         # Determine the correct package name for this distro
         if [ "$PKG_MANAGER" == "apt" ]; then
             pkg_name="$apt_pkg"
-        else
+        elif [ "$PKG_MANAGER" == "dnf" ]; then
             pkg_name="$dnf_pkg"
+        elif [ "$PKG_MANAGER" == "pacman" ]; then
+            pkg_name="$pacman_pkg"
         fi
         
         # Only try native package manager if a name is provided
@@ -7622,8 +7632,10 @@ install_dependency() {
             echo "   - Updating package cache..."
             if [ "$PKG_MANAGER" == "apt" ]; then
                 $SUDO_CMD apt-get update -qq >/dev/null 2>&1
-            else
+            elif [ "$PKG_MANAGER" == "dnf" ]; then
                 $SUDO_CMD dnf makecache -q >/dev/null 2>&1 || true
+            elif [ "$PKG_MANAGER" == "pacman" ]; then
+                $SUDO_CMD pacman -Sy --noconfirm >/dev/null 2>&1 || true
             fi
             
             echo "   - Installing $pkg_name via $PKG_MANAGER..."
@@ -7631,8 +7643,12 @@ install_dependency() {
                 if $SUDO_CMD apt-get install -y "$pkg_name" >/dev/null 2>&1; then
                     installed_successfully=true
                 fi
-            else
+            elif [ "$PKG_MANAGER" == "dnf" ]; then
                 if $SUDO_CMD dnf install -y "$pkg_name" >/dev/null 2>&1; then
+                    installed_successfully=true
+                fi
+            elif [ "$PKG_MANAGER" == "pacman" ]; then
+                if $SUDO_CMD pacman -S --needed --noconfirm $pkg_name >/dev/null 2>&1; then
                     installed_successfully=true
                 fi
             fi
@@ -7657,8 +7673,10 @@ install_dependency() {
                     echo "   - Installing tar (required to extract)..."
                     if [ "$PKG_MANAGER" == "apt" ]; then
                         $SUDO_CMD apt-get install -y tar >/dev/null 2>&1
-                    else
+                    elif [ "$PKG_MANAGER" == "dnf" ]; then
                         $SUDO_CMD dnf install -y tar >/dev/null 2>&1
+                    elif [ "$PKG_MANAGER" == "pacman" ]; then
+                        $SUDO_CMD pacman -S --needed --noconfirm tar >/dev/null 2>&1
                     fi
                 fi
                 echo "   - Downloading and extracting tarball..."
@@ -7804,7 +7822,7 @@ cove_install() {
         gum_arch="arm64"
     fi
     local gum_url="https://github.com/charmbracelet/gum/releases/download/v0.14.1/gum_0.14.1_Linux_${gum_arch}.tar.gz"
-    install_dependency "gum" "gum" "gum" "gum" "$gum_url"
+    install_dependency "gum" "gum" "gum" "gum" "$gum_url" "gum"
 
     # --- Port Selection ---
     # Two paths can run here:
@@ -8032,7 +8050,16 @@ cove_install() {
     fi
 
     # MariaDB - Database server
-    install_dependency "mariadb" "mariadb" "mariadb-server" "mariadb-server" ""
+    install_dependency "mariadb" "mariadb" "mariadb-server" "mariadb-server" "" "mariadb mariadb-clients"
+
+    # On Arch Linux / Manjaro, MariaDB requires initializing the data directory if not already done
+    if [ "$OS" = "linux" ] && [ "$PKG_MANAGER" = "pacman" ]; then
+        if [ ! -d "/var/lib/mysql/mysql" ]; then
+            echo "   - Initializing MariaDB data directory (mariadb-install-db)..."
+            $SUDO_CMD mariadb-install-db --user=mysql --basedir=/usr --datadir=/var/lib/mysql >/dev/null 2>&1 || \
+            $SUDO_CMD mariadb-install-db --user=mysql --basedir=/usr --datadir=/var/lib/mysql
+        fi
+    fi
 
     # No standalone PHP install — wp-cli is invoked through `frankenphp php-cli`
     # (see get_wp_cmd in main), so FrankenPHP's bundled PHP is the single PHP
@@ -8061,7 +8088,7 @@ cove_install() {
 
     # WP-CLI - WordPress command line tool
     # Not in default Linux repos, so we use the phar download as fallback
-    install_dependency "wp" "wp-cli" "" "" "https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar"
+    install_dependency "wp" "wp-cli" "" "" "https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar" "wp-cli"
 
     # --- Directory and Service Setup (Copied from original file) ---
     echo "📁 Creating Cove directory structure..."
@@ -8072,11 +8099,28 @@ cove_install() {
     # error_reporting=6143 is E_ALL minus E_DEPRECATED/E_USER_DEPRECATED/E_STRICT
     # so wp-cli's bundled vendor code (react/promise, php-cli-tools/Colors.php)
     # doesn't flood every command on PHP 8.5+.
+    local mysql_socket=""
+    for s in /run/mysqld/mysqld.sock /var/run/mysqld/mysqld.sock /var/lib/mysql/mysql.sock /tmp/mysql.sock; do
+        if [ -S "$s" ]; then
+            mysql_socket="$s"
+            break
+        fi
+    done
+    if [ -z "$mysql_socket" ]; then
+        if [ "$PKG_MANAGER" = "pacman" ]; then
+            mysql_socket="/run/mysqld/mysqld.sock"
+        elif [ "$PKG_MANAGER" = "dnf" ]; then
+            mysql_socket="/var/lib/mysql/mysql.sock"
+        fi
+    fi
+
     echo "⚙️ Writing Cove PHP ini..."
-    cat > "$PHP_INI_FILE" <<'INI'
+    cat > "$PHP_INI_FILE" <<INI
 memory_limit = 1G
 display_errors = 0
 error_reporting = 6143
+${mysql_socket:+mysqli.default_socket = $mysql_socket}
+${mysql_socket:+pdo_mysql.default_socket = $mysql_socket}
 INI
     echo "🗃️ Downloading Adminer 6.0.0..."
     curl -sL "https://github.com/vrana/adminer/releases/download/v6.0.0/adminer-6.0.0.php" -o "$ADMINER_DIR/adminer-core.php"
@@ -8234,9 +8278,18 @@ INI
         echo "  On Linux, the CA certificate is located at:"
         echo "    ~/.local/share/caddy/pki/authorities/local/root.crt"
         echo ""
-        echo "  To trust it system-wide (Ubuntu/Debian):"
-        echo "    sudo cp ~/.local/share/caddy/pki/authorities/local/root.crt /usr/local/share/ca-certificates/caddy.crt"
-        echo "    sudo update-ca-certificates"
+        if [ "$PKG_MANAGER" = "apt" ]; then
+            echo "  To trust it system-wide (Ubuntu/Debian):"
+            echo "    sudo cp ~/.local/share/caddy/pki/authorities/local/root.crt /usr/local/share/ca-certificates/caddy.crt"
+            echo "    sudo update-ca-certificates"
+        elif [ "$PKG_MANAGER" = "pacman" ]; then
+            echo "  To trust it system-wide (Arch/Manjaro):"
+            echo "    sudo trust anchor --store ~/.local/share/caddy/pki/authorities/local/root.crt"
+        elif [ "$PKG_MANAGER" = "dnf" ]; then
+            echo "  To trust it system-wide (Fedora/RHEL):"
+            echo "    sudo cp ~/.local/share/caddy/pki/authorities/local/root.crt /etc/pki/ca-trust/source/anchors/caddy.crt"
+            echo "    sudo update-ca-trust"
+        fi
         echo ""
         echo "  For browser-only trust, import the certificate in your browser settings."
     fi
@@ -10938,6 +10991,10 @@ cove_share() {
             # Fedora/RHEL
             install_cmd="curl -fsSL https://pkg.cloudflare.com/cloudflared-ascii.repo | sudo tee /etc/yum.repos.d/cloudflared.repo && sudo dnf install -y cloudflared"
             install_name="dnf"
+        elif command -v pacman &> /dev/null; then
+            # Arch/Manjaro
+            install_cmd="sudo pacman -S --needed --noconfirm cloudflared"
+            install_name="pacman"
         fi
         
         if [ -n "$install_cmd" ]; then
@@ -11548,6 +11605,7 @@ pkg_install() {
     fi
     if   command -v apt-get >/dev/null 2>&1; then $sudo_cmd apt-get install -y -qq "$pkg" >/dev/null 2>&1
     elif command -v dnf     >/dev/null 2>&1; then $sudo_cmd dnf install -y -q "$pkg"      >/dev/null 2>&1
+    elif command -v pacman  >/dev/null 2>&1; then $sudo_cmd pacman -S --needed --noconfirm -q "$pkg" >/dev/null 2>&1
     elif command -v yum     >/dev/null 2>&1; then $sudo_cmd yum install -y -q "$pkg"      >/dev/null 2>&1
     elif command -v apk     >/dev/null 2>&1; then $sudo_cmd apk add --no-cache "$pkg"     >/dev/null 2>&1
     elif command -v zypper  >/dev/null 2>&1; then $sudo_cmd zypper -q install -y "$pkg"   >/dev/null 2>&1
@@ -12097,6 +12155,8 @@ cove_trust() {
                 $SUDO_CMD apt install -y libnss3-tools &>/dev/null || true
             elif [ "$PKG_MANAGER" = "dnf" ]; then
                 $SUDO_CMD dnf install -y nss-tools &>/dev/null || true
+            elif [ "$PKG_MANAGER" = "pacman" ]; then
+                $SUDO_CMD pacman -S --needed --noconfirm nss &>/dev/null || true
             fi
         fi
     fi
@@ -12146,7 +12206,7 @@ cove_trust() {
                 # layer stale copies, then add the current root.
                 certutil -D -d sql:"$profile_dir" -n "Cove Local Authority" 2>/dev/null || true
                 certutil -A -d sql:"$profile_dir" -n "Cove Local Authority" -t "C,," -i "$root_cert" 2>/dev/null || true
-            done < <(find "$HOME/snap" "$HOME/.mozilla/firefox" \
+            done < <(find "$HOME/.pki" "$HOME/snap" "$HOME/.mozilla/firefox" \
                 -name 'cert9.db' 2>/dev/null)
         else
             gum style --foreground yellow "⚠️ Could not locate Caddy root.crt — snap Firefox/Chromium trust skipped."
@@ -12194,6 +12254,14 @@ upgrade_frankenphp() {
                 echo "   - ✅ FrankenPHP upgraded successfully via dnf."
             else
                 gum style --foreground red "❌ Failed to upgrade FrankenPHP via dnf."
+                return 1
+            fi
+        elif [ "$PKG_MANAGER" = "pacman" ]; then
+            echo "   - FrankenPHP installed via pacman. Upgrading with pacman..."
+            if $SUDO_CMD pacman -S --needed --noconfirm frankenphp; then
+                echo "   - ✅ FrankenPHP upgraded successfully via pacman."
+            else
+                gum style --foreground red "❌ Failed to upgrade FrankenPHP via pacman."
                 return 1
             fi
         else

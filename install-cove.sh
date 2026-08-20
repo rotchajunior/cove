@@ -104,8 +104,10 @@ setup_environment() {
             PKG_MANAGER="apt"
         elif [[ "$ID" == "fedora" || "$ID" == "centos" || "$ID" == "rhel" || "$ID_LIKE" == *"fedora"* || "$ID_LIKE" == *"rhel"* ]]; then
             PKG_MANAGER="dnf"
+        elif [[ "$ID" == "arch" || "$ID" == "manjaro" || "$ID_LIKE" == *"arch"* ]]; then
+            PKG_MANAGER="pacman"
         else
-            echo_error "Unsupported Linux distribution: $ID. Supported: Ubuntu, Debian, Fedora, CentOS, RHEL and derivatives."
+            echo_error "Unsupported Linux distribution: $ID. Supported: Ubuntu, Debian, Fedora, CentOS, RHEL, Arch, Manjaro and derivatives."
         fi
         
         # Check if we need to use sudo

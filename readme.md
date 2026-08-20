@@ -267,7 +267,7 @@ The `--dev` flag tells the installer to use the local `cove.sh` from the same di
 ### Supported Platforms
 
 - **macOS**: Intel and Apple Silicon (via Homebrew)
-- **Linux**: Ubuntu/Debian (apt) and Fedora/RHEL/CentOS (dnf)
+- **Linux**: Ubuntu/Debian (apt), Fedora/RHEL/CentOS (dnf), and Arch Linux/Manjaro (pacman - see [ARCH_LINUX.md](ARCH_LINUX.md))
 - **WSL2**: Windows Subsystem for Linux (requires systemd enabled)
 
 ## 🩺 Troubleshooting

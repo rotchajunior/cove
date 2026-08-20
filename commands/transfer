@@ -66,6 +66,7 @@ pkg_install() {
     fi
     if   command -v apt-get >/dev/null 2>&1; then $sudo_cmd apt-get install -y -qq "$pkg" >/dev/null 2>&1
     elif command -v dnf     >/dev/null 2>&1; then $sudo_cmd dnf install -y -q "$pkg"      >/dev/null 2>&1
+    elif command -v pacman  >/dev/null 2>&1; then $sudo_cmd pacman -S --needed --noconfirm -q "$pkg" >/dev/null 2>&1
     elif command -v yum     >/dev/null 2>&1; then $sudo_cmd yum install -y -q "$pkg"      >/dev/null 2>&1
     elif command -v apk     >/dev/null 2>&1; then $sudo_cmd apk add --no-cache "$pkg"     >/dev/null 2>&1
     elif command -v zypper  >/dev/null 2>&1; then $sudo_cmd zypper -q install -y "$pkg"   >/dev/null 2>&1

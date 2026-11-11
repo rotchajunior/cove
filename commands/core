@@ -68,6 +68,9 @@ cove_core_scan() {
             if ($item === "." || $item === "..") continue;
             $public = $sites_dir . "/" . $item . "/public";
             if (!is_file($public . "/wp-config.php")) continue;
+            // Minn Engine sites keep a version.php naming the WordPress
+            // release they speak; there is no WordPress core to update.
+            if (is_file($public . "/.minn-install.php") || (is_file($public . "/minn/bootstrap.php") && !is_file($public . "/wp-load.php"))) continue;
             $file = $public . "/wp-includes/version.php";
             if (!is_file($file)) continue;
             $head = @file_get_contents($file, false, null, 0, 4096);
@@ -170,11 +173,17 @@ cove_core() {
                     --all)              all=true ;;
                     --dry-run)          dry_run=true ;;
                     --yes|-y|--force)   assume_yes=true ;;
-                    -*)                 ;;
+                    # A typo stops it: --dryrun going ahead as an update
+                    # is the one mistake this mustn't make.
+                    -*)
+                        gum style --foreground red "❌ Error: Unknown option '$arg'."
+                        echo "Usage: cove core update <site> [version] [--dry-run]"
+                        echo "       cove core update --all [--dry-run] [--yes]"
+                        exit 1 ;;
                     *)
-                        # Same grammar as `cove add`: a bare token that starts
-                        # with a digit is a version, anything else is a site.
-                        if [[ "$arg" == [0-9]* ]]; then target="$arg"; else site="$arg"; fi ;;
+                        # A version has a dot (6.4, 6.9-RC1); site names
+                        # can't, so 3d-shop is a site.
+                        if [[ "$arg" =~ ^[0-9]+\.[0-9] ]]; then target="$arg"; else site="${arg%.localhost}"; fi ;;
                 esac
             done
 
@@ -194,12 +203,32 @@ cove_core() {
             if [ "$all" = false ]; then
                 local public_dir="$SITES_DIR/$site.localhost/public"
                 if [ ! -d "$SITES_DIR/$site.localhost" ]; then
-                    gum style --foreground red "❌ Error: Site '$site.localhost' not found."
-                    exit 1
+                    site_not_found "$site"
                 fi
                 if [ ! -f "$public_dir/wp-config.php" ]; then
                     gum style --foreground red "❌ Error: '$site.localhost' is not a WordPress site."
                     exit 1
+                fi
+                if site_is_minn "$public_dir"; then
+                    gum style --foreground red "❌ Error: '$site.localhost' runs Minn Engine, which has no WordPress core to update." "Update the engine with its own tools instead."
+                    exit 1
+                fi
+                # --dry-run holds here too: it used to be read only by --all,
+                # so a single site was updated for real.
+                if [ "$dry_run" = true ]; then
+                    local to="$target"
+                    if [ -z "$to" ]; then
+                        cove_wpver_refresh >/dev/null 2>&1
+                        to=$(grep -oE '"version":"[^"]+","status":"latest"' "$COVE_WPVER_CACHE" 2>/dev/null | head -1 | cut -d'"' -f4)
+                    fi
+                    local now
+                    now=$(cove_wp_version "$public_dir" 2>/dev/null)
+                    if [ -n "$to" ] && [ "$now" = "$to" ]; then
+                        echo "🔎 Dry run — $site.localhost is already on WordPress $now, so there's nothing to update. Nothing changed."
+                    else
+                        echo "🔎 Dry run — $site.localhost is on WordPress ${now:-an unknown version} and would move to ${to:-the latest release}. Nothing changed."
+                    fi
+                    return 0
                 fi
                 source_config
                 echo "🔄 Updating WordPress core on $site.localhost..."
@@ -245,6 +274,10 @@ cove_core() {
             fi
 
             if [ "$assume_yes" = false ]; then
+                if [ ! -t 0 ]; then
+                    gum style --foreground red "❌ Error: No terminal to confirm on." "Run it again with --yes to update $count site(s) without asking."
+                    return 1
+                fi
                 if ! gum confirm "Update $count site(s)?"; then
                     echo "Aborted."
                     return 1
@@ -272,16 +305,7 @@ cove_core() {
             fi
             ;;
         *)
-            echo "Usage: cove core <check|update>"
-            echo ""
-            echo "  cove core check                    Report the WordPress version of every site."
-            echo "  cove core update <site> [version]  Update one site to the latest, or to a version."
-            echo "  cove core update --all             Update every site that is behind."
-            echo ""
-            echo "Flags:"
-            echo "  --all          Apply to every WordPress site."
-            echo "  --dry-run      List what would change without touching anything."
-            echo "  --yes, -y      Skip the confirmation prompt."
+            cove_unknown_subcommand core "$sub" "check update"
             ;;
     esac
 }

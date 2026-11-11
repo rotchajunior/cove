@@ -1,6 +1,10 @@
 cove_delete() {
     source_config
     local site_name="$1"
+    if [ -z "$site_name" ]; then
+        gum style --foreground red "❌ Error: Which site? Usage: cove delete <name> [--yes]" "See your sites with: cove list"
+        exit 1
+    fi
     # Reject traversal / metacharacters before the name reaches rm -rf and
     # DROP DATABASE below — cove delete never validated it, so `../x` escaped
     # the Sites tree (and the sudo -n rm fallback made that worse).
@@ -17,10 +21,16 @@ cove_delete() {
 
     local force_delete=false
     local no_reload=false
-    for arg in "$@"; do
+    local arg
+    for arg in "${@:2}"; do
         case "$arg" in
             --force|--yes|-y) force_delete=true ;;
             --no-reload) no_reload=true ;;
+            # Anything else stops it: a delete can't be undone, so a typo
+            # (or a --dry-run it doesn't have) mustn't go ahead as one.
+            *)
+                gum style --foreground red "❌ Error: Unknown option '$arg'." "Usage: cove delete <name> [--yes]" "It asks before deleting anything unless you add --yes."
+                exit 1 ;;
         esac
     done
     # Non-interactive callers (dashboard shell_exec, scripted cleanup) have no
@@ -29,8 +39,7 @@ cove_delete() {
 
     local site_dir="$SITES_DIR/$site_name.localhost"
     if [ ! -d "$site_dir" ]; then
-        echo "⚠️ Site '$site_name.localhost' not found."
-        exit 1
+        site_not_found "$site_name"
     fi
 
     if ! $force_delete; then
@@ -44,27 +53,67 @@ cove_delete() {
     local hosts_to_remove=("$site_name.localhost")
     if [ -f "$site_dir/mappings" ]; then
         while IFS= read -r mapping || [ -n "$mapping" ]; do
-            if [ -n "$mapping" ]; then
-                hosts_to_remove+=("$mapping")
-            fi
+            hosts_to_remove+=("$mapping")
         done < "$site_dir/mappings"
+    fi
+    local twin_entry twin_domain twin_folder twin_as_site
+    if twin_entry=$(site_twin "$site_dir"); then
+        IFS=$'\t' read -r twin_domain twin_folder twin_as_site <<< "$twin_entry"
+        hosts_to_remove+=("$twin_domain")
+        [ -n "$twin_as_site" ] && hosts_to_remove+=("$twin_as_site")
     fi
 
     echo "🔥 Deleting site: $site_name.localhost"
+    laravel_workers_hold "$site_name"
+    laravel_workers_stop_site "$site_name"
     if [ -f "$site_dir/public/wp-config.php" ]; then
-        local db_name wp_cmd
-        wp_cmd=$(get_wp_cmd "$site_dir")
-        # Prefer the DB actually named in wp-config.php. Deriving cove_<name>
-        # blindly (as before) would orphan the real database for any site whose
-        # DB_NAME was changed — and could drop an unrelated database that
-        # happened to match the derived name. Fall back to the derived name only
-        # if wp-config can't be read.
-        db_name=$( (cd "$site_dir/public" && $wp_cmd config get DB_NAME --skip-plugins --skip-themes 2>/dev/null) )
+        # Only the database Cove made for the site (either spelling, see
+        # cove_db_is_sites): one wp-config.php was pointed at by hand may be
+        # another site's, or one you use elsewhere. When wp-config.php can't
+        # be read, whichever of Cove's two spellings is there.
+        local db_name
+        db_name=$(wp_site_db "$site_dir")
         if [ -z "$db_name" ]; then
-            db_name=$(echo "cove_$site_name" | tr -c '[:alnum:]_' '_')
+            db_name=$(cove_db_name "$site_name")
+            cove_db_exists "$db_name" || db_name="${db_name}_"
+        elif ! cove_db_is_sites "$db_name" "$site_name"; then
+            echo "🗄️ Keeping database '$db_name': wp-config.php names it, and it isn't one Cove made for this site."
+            db_name=""
         fi
-        echo "🗄️ Deleting database: $db_name"
-        mysql -u "$DB_USER" -p"$DB_PASSWORD" -e "DROP DATABASE IF EXISTS \`$db_name\`;"
+        if [ -n "$db_name" ]; then
+            echo "🗄️ Deleting database: $db_name"
+            # The files stay when it can't be dropped: without them, nothing
+            # would lead back to the database.
+            if ! MYSQL_PWD="$DB_PASSWORD" mysql -u "$DB_USER" -e "DROP DATABASE IF EXISTS \`$db_name\`;"; then
+                laravel_workers_release "$site_name"
+                gum style --foreground red "❌ Error: Could not delete the database '$db_name', so the site stays as it is." "Is MariaDB running? See: cove status"
+                exit 1
+            fi
+        fi
+    elif site_is_laravel "$site_dir"; then
+        # Only the database Cove made for the site: one .env was pointed at
+        # by hand may be shared, or someone else's.
+        local db_name server
+        if db_name=$(laravel_cove_db "$site_dir" "$site_name"); then
+            server=$(laravel_db_server "$site_dir")
+            echo "🗄️ Deleting database: $db_name"
+            # A PostgreSQL that won't start is a database that can't be
+            # dropped, as with MariaDB: the site stays, and with it the way
+            # back to the database (uninstall --purge counts on the failure).
+            if [ "$server" = "pgsql" ] && ! ensure_postgres >/dev/null; then
+                laravel_workers_release "$site_name"
+                gum style --foreground red "❌ Error: PostgreSQL isn't running, so the database '$db_name' can't be deleted and the site stays as it is." "Start it (see: cove status), then delete the site again."
+                exit 1
+            fi
+            if ! cove_server_db_drop "$server" "$db_name"; then
+                laravel_workers_release "$site_name"
+                gum style --foreground red "❌ Error: Could not delete the database '$db_name', so the site stays as it is." "Is $([ "$server" = pgsql ] && echo PostgreSQL || echo MariaDB) running? See: cove status"
+                exit 1
+            fi
+        fi
+        # Its keys in Cove's Redis, when the prefix is the one Cove gave it:
+        # only once the database is gone, as a site that stays keeps them.
+        [ "$(laravel_env_get "$site_dir" REDIS_PREFIX)" = "$(cove_redis_prefix "$site_name")" ] && cove_redis_forget "$(cove_redis_prefix "$site_name")"
     fi
 
     # Don't trust the bare rm — a pre-1.10 dashboard-created site would be
@@ -79,6 +128,21 @@ cove_delete() {
         fi
     fi
     echo "✅ Directory deleted."
+    laravel_workers_release "$site_name"
+
+    # What Cove kept about the site outside its directory: snapshots, the
+    # dashboard preview, and any archive an import left behind. Backups in
+    # ~/Cove/Backups are the user's own files and stay.
+    if [ -d "$COVE_DIR/Snapshots/$site_name" ]; then
+        local snaps; snaps=$(ls -1d "$COVE_DIR/Snapshots/$site_name"/*/ 2>/dev/null | wc -l | tr -d ' ')
+        rm -rf "$COVE_DIR/Snapshots/$site_name"
+        echo "📸 Removed $snaps snapshot(s)."
+    fi
+    rm -f "$COVE_DIR/cache/screenshots/$site_name.png" "$COVE_DIR/cache/screenshots/$site_name.png.tmp.png" "$COVE_DIR/cache/screenshots/thumbs/$site_name.webp" "$COVE_DIR/cache/screenshots/thumbs/mini/$site_name.webp" 2>/dev/null
+    rm -f "$COVE_DIR/cache/imports/$site_name"-*.zip "$COVE_DIR/cache/imports/$site_name"-*.tar.gz "$COVE_DIR/cache/imports/$site_name"-*.tgz 2>/dev/null
+    if ls "$COVE_DIR/Backups/$site_name"-*.zip >/dev/null 2>&1; then
+        echo "💾 Backups in ~/Cove/Backups were kept: $(ls -1 "$COVE_DIR/Backups/$site_name"-*.zip 2>/dev/null | wc -l | tr -d ' ') file(s)."
+    fi
 
     # A reload already in flight snapshotted the Sites listing while this
     # site still existed. When that stale Caddyfile applies, Caddy re-creates
@@ -101,34 +165,7 @@ cove_delete() {
     fi
 
     # --- Clean /etc/hosts entries ---
-    local entries_exist=false
-    local host
-    for host in "${hosts_to_remove[@]}"; do
-        if grep -qE "^127\.0\.0\.1[[:space:]]+${host//./\\.}[[:space:]]*$" /etc/hosts 2>/dev/null; then
-            entries_exist=true
-            break
-        fi
-    done
-
-    if $entries_exist; then
-        echo "🧹 Removing /etc/hosts entries (requires sudo)..."
-        local sed_args=()
-        for host in "${hosts_to_remove[@]}"; do
-            sed_args+=(-e "/^127\.0\.0\.1[[:space:]]+${host//./\\.}[[:space:]]*$/d")
-        done
-        # Use non-interactive sudo when we don't have a TTY (e.g., the dashboard's
-        # PHP shell_exec). In that context an interactive sudo prompt can hang
-        # the caller waiting for a password that will never arrive. From a real
-        # terminal the flag is empty, so sudo prompts as normal.
-        local sudo_flag=""
-        [ -t 0 ] || sudo_flag="-n"
-        if sudo $sudo_flag sed -i.bak -E "${sed_args[@]}" /etc/hosts 2>/dev/null; then
-            sudo $sudo_flag rm -f /etc/hosts.bak 2>/dev/null
-            echo "   - ✅ /etc/hosts cleaned."
-        else
-            gum style --foreground yellow "   - ⚠️ Skipped /etc/hosts cleanup (sudo unavailable from this context). Run 'cove reload' from a terminal to sync."
-        fi
-    fi
+    prune_etc_hosts "${hosts_to_remove[@]}"
 
     # Regenerate the Caddyfile so Caddy stops holding log file handles for
     # this site. Without this, a later Caddy restart would re-create the

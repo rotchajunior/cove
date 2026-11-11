@@ -19,20 +19,23 @@ cove_push() {
     local arg_site=""
     local arg_ssh=""
     local arg_path=""
+    local arg_tenant=""
     local force=false
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --force|--yes|-y) force=true; shift ;;
-            --site) arg_site="$2"; shift 2 ;;
+            --tenant) [ $# -ge 2 ] || log_error "--tenant needs a value."; arg_tenant="$2"; shift 2 ;;
+            --tenant=*) arg_tenant="${1#*=}"; shift ;;
+            --site) [ $# -ge 2 ] || log_error "--site needs a value."; arg_site="$2"; shift 2 ;;
             --site=*) arg_site="${1#*=}"; shift ;;
-            --ssh)  arg_ssh="$2";  shift 2 ;;
+            --ssh)  [ $# -ge 2 ] || log_error "--ssh needs a value."; arg_ssh="$2";  shift 2 ;;
             --ssh=*)  arg_ssh="${1#*=}";  shift ;;
-            --path) arg_path="$2"; shift 2 ;;
+            --path) [ $# -ge 2 ] || log_error "--path needs a value."; arg_path="$2"; shift 2 ;;
             --path=*) arg_path="${1#*=}"; shift ;;
             -h|--help) display_command_help push; exit 0 ;;
             *)
                 gum style --foreground red "❌ Unknown option: $1" >&2
-                echo "Usage: cove push [--site <name>] [--ssh \"user@host -p 22\"] [--path public/] [--yes]" >&2
+                echo "Usage: cove push [--site <name>] [--ssh \"user@host -p 22\"] [--path public/] [--tenant <id|domain>] [--yes]" >&2
                 exit 1
                 ;;
         esac
@@ -44,7 +47,7 @@ cove_push() {
     # password or unlocks their key once instead of four times.
     local ssh_ctl
     ssh_ctl=$(mktemp -u "${TMPDIR:-/tmp}/cove-ssh-XXXXXXXX")
-    local ssh_opts="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ControlMaster=auto -o ControlPath=$ssh_ctl -o ControlPersist=5m"
+    local ssh_opts="-o StrictHostKeyChecking=accept-new -o LogLevel=ERROR -o ControlMaster=auto -o ControlPath=$ssh_ctl -o ControlPersist=5m"
     # shellcheck disable=SC2064 # we want $ssh_ctl expanded at trap-set time
     trap "rm -f '$ssh_ctl'" EXIT
 
@@ -53,7 +56,7 @@ cove_push() {
     # ~16KB/s against a real gateway and then stalled outright, while the same
     # file moved in 15s on its own connection. Key auth makes the extra
     # connection free; with a password you are asked once more.
-    local ssh_bulk_opts="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ServerAliveInterval=15 -o ServerAliveCountMax=8"
+    local ssh_bulk_opts="-o StrictHostKeyChecking=accept-new -o LogLevel=ERROR -o ServerAliveInterval=15 -o ServerAliveCountMax=8"
 
     gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "This tool will guide you through pushing a local Cove site to a remote server."
 
@@ -117,6 +120,16 @@ cove_push() {
     # A single probe confirms there's a usable WordPress there and reports the
     # host's tooling, so a remote without WP-CLI gets the phar sideloaded before
     # we spend time building a backup that couldn't be restored anyway.
+    # Connect once in the open before the quiet probe below. Host keys are
+    # checked now: a host seen for the first time is remembered in
+    # ~/.ssh/known_hosts, and one whose key changed since is refused, with
+    # OpenSSH's own warning on screen instead of a vague probe failure. This
+    # used to skip the check entirely, which let anyone in the network path
+    # hand pull a hostile archive or receive a push's files and database.
+    if ! ssh $ssh_opts $remote_ssh true; then
+        log_error "Could not connect to ${remote_ssh} over SSH (see the message above). If the host was rebuilt and its key changed on purpose, clear the old one with ssh-keygen -R and try again."
+    fi
+
     log_step "Validating remote WordPress site..."
     local wp_cli_flag=""
     wp_cli_flag=$(transfer_ensure_remote_wp_cli "$ssh_opts" "$remote_ssh" "$remote_path")
@@ -131,7 +144,66 @@ cove_push() {
         fi
         log_error "Could not find a valid WordPress site at the specified path. Check your connection details and path."
     fi
-    log_success "Found remote site to overwrite: $remote_url"
+    # A WP Freighter host runs many sites out of this one install, and a push
+    # to the install replaces its files and empties its database: every
+    # tenant would go with it. So on such a host a push goes to one tenant,
+    # and only that tenant's tables and own folder are replaced.
+    local tenant="" tenant_rows freighter_host
+    tenant_rows=$(transfer_probe_tenants "$remote_probe")
+    # Read from the host's files rather than through WordPress, so a host
+    # whose tenant list could not be read (PHP failed, /tmp full) is still
+    # known for what it is and refused instead of pushed over whole.
+    freighter_host=$(echo "$remote_probe" | sed -n 's/^freighter_host=//p')
+    if [ -z "$tenant_rows" ] && [ "$freighter_host" = y ]; then
+        log_error "${remote_url} runs WP Freighter, but its tenant sites could not be listed, and a push to the whole install would replace every one of them. Nothing was changed."
+    elif [ -n "$tenant_rows" ]; then
+        local tenant_count
+        tenant_count=$(printf '%s\n' "$tenant_rows" | grep -c .)
+        if [ "$arg_tenant" = main ]; then
+            log_error "Refusing to push over the whole install at ${remote_url}: it is a WP Freighter host, and the push would replace the files and tables of all ${tenant_count} of its tenant sites too. Push to one tenant with --tenant=<id|domain>."
+        elif [ -n "$arg_tenant" ]; then
+            tenant=$(transfer_match_tenant "$tenant_rows" "$arg_tenant")
+            if [ -z "$tenant" ]; then
+                log_error "No tenant '${arg_tenant}' on this host. Its tenants: $(transfer_list_tenants "$tenant_rows")."
+            elif [ "$(printf '%s\n' "$tenant" | grep -c .)" -gt 1 ]; then
+                log_error "'${arg_tenant}' names more than one tenant on this host (ids $(echo $tenant)). Pass the id instead."
+            fi
+        elif is_noninteractive; then
+            log_error "${remote_url} is a WP Freighter host with ${tenant_count} tenant sites, and a push to the whole install would overwrite every one of them. Pass --tenant=<id|domain> to push to one tenant."
+        else
+            tenant=$(transfer_choose_tenant "$tenant_rows" "")
+            if [ -z "$tenant" ]; then log_error "No tenant selected."; fi
+        fi
+    elif [ -n "$arg_tenant" ]; then
+        log_error "--tenant: ${remote_url} is not a WP Freighter host (it lists no tenant sites)."
+    fi
+
+    local tenant_flag="" tenant_scope=""
+    if [ -n "$tenant" ]; then
+        tenant_flag="--tenant=$tenant"
+        remote_probe=$(transfer_remote "$ssh_opts" "$remote_ssh" probe "$remote_path" "$tenant_flag" $wp_cli_flag 2>/dev/null)
+        local tenant_error
+        tenant_error=$(echo "$remote_probe" | sed -n 's/^tenant_error=//p')
+        if [ -n "$tenant_error" ]; then log_error "$tenant_error"; fi
+        remote_url=$(echo "$remote_probe" | sed -n 's/^home=//p')
+        if [[ ! "$remote_url" == http* ]]; then
+            log_error "Tenant ${tenant} has no home URL."
+        fi
+        local t_prefix t_files t_dir t_root
+        t_prefix=$(echo "$remote_probe" | sed -n 's/^prefix=//p')
+        t_files=$(echo "$remote_probe" | sed -n 's/^tenant_files=//p')
+        t_dir=$(echo "$remote_probe" | sed -n 's/^tenant_dir=//p')
+        t_root=$(echo "$remote_probe" | sed -n 's/^abspath=//p')
+        t_dir="${t_dir#"$t_root"/}"
+        case "$t_files" in
+            content) tenant_scope="its tables (${t_prefix}*) and its folder ${t_dir}/" ;;
+            uploads) tenant_scope="its tables (${t_prefix}*) and its uploads folder ${t_dir}/. Plugins and themes are shared by every tenant on this host, so they are not pushed" ;;
+            *)       tenant_scope="its tables (${t_prefix}*). Files are shared by every tenant on this host, so none are pushed" ;;
+        esac
+        log_success "Found tenant ${tenant} to overwrite: $remote_url"
+    else
+        log_success "Found remote site to overwrite: $remote_url"
+    fi
     local remote_ext remote_db
     remote_ext=$(echo "$remote_probe" | sed -n 's/^extractor=//p')
     remote_db=$(echo "$remote_probe" | sed -n 's/^db_load=//p')
@@ -146,7 +218,11 @@ cove_push() {
     # caller has to say --yes out loud.
     if ! $force; then
         require_interactive "Overwriting the remote site at '${remote_url}'" "--yes to confirm the push"
-        if ! gum confirm "🚨 Are you sure you want to push '${site_name}' to '${remote_url}'? This will completely overwrite the remote site's files and database."; then
+        local confirm_text="🚨 Are you sure you want to push '${site_name}' to '${remote_url}'? This will completely overwrite the remote site's files and database."
+        if [ -n "$tenant" ]; then
+            confirm_text="🚨 Are you sure you want to push '${site_name}' to tenant ${tenant} (${remote_url})? This replaces ${tenant_scope}. The other tenants and the main site are not touched."
+        fi
+        if ! gum confirm "$confirm_text"; then
             echo "🚫 Push cancelled."
             exit 0
         fi
@@ -154,8 +230,23 @@ cove_push() {
 
     # --- 5. Perform Local Backup ---
     log_step "Generating local backup for ${site_name}..."
+    # Cove's one-time-login mu-plugin is local-only and stays home: it is left
+    # out of the archive, and the restore keeps whatever the remote had at
+    # that path (a host's own helper of the same name, or nothing at all).
+    local cove_helper="wp-content/mu-plugins/captaincore-helper.php"
+    # The host's own mu-plugins stay too. Kinsta installs its cache and CDN
+    # plugin there (WP Freighter copies it into each dedicated tenant), and
+    # `wp kinsta cache purge` goes with it if a push replaces the folder.
+    local -a host_keeps=(
+        --keep=wp-content/mu-plugins/kinsta-mu-plugins.php
+        --keep=wp-content/mu-plugins/kinsta-mu-plugins
+    )
     local backup_path
-    backup_path=$(transfer_local backup "$local_path")
+    # A tenant gets only this site's own tables: anything else in the local
+    # database would land in the host's shared one.
+    local only_prefix=""
+    [ -n "$tenant" ] && only_prefix="--only-prefix"
+    backup_path=$(transfer_local backup "$local_path" --exclude="$cove_helper" $only_prefix)
     if [ -z "$backup_path" ] || [ ! -f "$backup_path" ]; then
         log_error "Failed to generate the local backup."
     fi
@@ -182,8 +273,12 @@ cove_push() {
 
     # --- 7. Remote Restore ---
     log_step "Restoring backup on remote server..."
+    # Without a tenant, the helper re-checks the host's files and refuses a
+    # WP Freighter install itself, whatever the probe said.
+    local refuse_flag=""
+    [ -z "$tenant" ] && refuse_flag="--refuse-freighter"
     if ! transfer_remote "$ssh_opts" "$remote_ssh" restore "$remote_path" "$remote_tmp" \
-            --url-to="$remote_url" $wp_cli_flag; then
+            --url-to="$remote_url" --keep="$cove_helper" "${host_keeps[@]}" $tenant_flag $refuse_flag $wp_cli_flag; then
         rm -f "$backup_path"
         ssh $ssh_opts $remote_ssh "rm -f $remote_tmp_q" 2>/dev/null
         log_error "The remote restore failed."

@@ -20,6 +20,9 @@ Neste fork, foram adicionados:
    - `wp-cli`: Instalado via `pacman -S --needed --noconfirm wp-cli`.
    - `nss`: Ferramentas NSS (`certutil`) instaladas via `pacman -S --needed --noconfirm nss`.
    - `cloudflared`: Instalado via `pacman -S --needed --noconfirm cloudflared` (para `cove share`).
+   - `postgresql`: Instalado e inicializado (`initdb -D /var/lib/postgres/data`) automaticamente para sites Laravel com PostgreSQL (`cove postgres install` / `--database=pgsql`).
+   - `valkey` / `redis`: Instalado via `pacman` para sites Laravel que utilizam Redis (`cove redis install`).
+   - `python-gobject gtk3 libayatana-appindicator libnotify`: Instalados via `pacman` ao ativar o ícone de bandeja (`cove menubar enable`).
 
 3. **Inicialização Automática do MariaDB**:
    - No Arch/Manjaro, a instalação do MariaDB não inicializa automaticamente a pasta `/var/lib/mysql`.
@@ -28,28 +31,30 @@ Neste fork, foram adicionados:
      sudo mariadb-install-db --user=mysql --basedir=/usr --datadir=/var/lib/mysql
      ```
 
-4. **Autodetecção do Socket UNIX do MariaDB no PHP**:
+4. **Autodetecção do Socket UNIX do MariaDB no PHP e FrankenPHP**:
    - O MariaDB no Arch/Manjaro expõe o socket em `/run/mysqld/mysqld.sock`.
-   - O `cove install` agora detecta o caminho do socket ativo no sistema e o injeta automaticamente no `~/Cove/php.ini`:
+   - O Cove detecta o caminho do socket ativo no sistema e o injeta automaticamente tanto no `~/Cove/php.ini` (para CLI/WP-CLI) quanto no bloco `frankenphp` do `~/Cove/Caddyfile` (para requisições web):
      ```ini
      mysqli.default_socket = /run/mysqld/mysqld.sock
      pdo_mysql.default_socket = /run/mysqld/mysqld.sock
      ```
-   - Isso evita o erro de conexão `Database connection error (2002)` ao rodar o WP-CLI ou acessar o banco.
+   - Isso evita o erro de conexão `Database connection error (2002)` ao rodar o WP-CLI ou acessar sites após reiniciar o computador (sem depender de symlinks temporários em `/tmp/mysql.sock`).
 
 5. **Confiança de Certificados SSL nos Navegadores (`cove trust`)**:
-   - O comando `cove trust` agora busca os bancos de dados NSS também em `~/.pki/nssdb` (padrão de navegadores Chromium/Chrome no Arch Linux), além dos perfis do Firefox.
+   - O comando `cove trust` busca os bancos de dados NSS em `~/.pki/nssdb` (Chromium/Chrome/Brave), `~/.mozilla/firefox`, `~/.firedragon` (FireDragon no Manjaro/Garuda) e `~/.librewolf`.
 
 ---
 
 ## 🛠️ Arquivos Modificados
 
 - [`install-cove.sh`](install-cove.sh): Adicionada detecção do `pacman` no instalador standalone.
-- [`main`](main): Adicionado suporte a distribuições baseadas em Arch no script central.
+- [`main`](main): Suporte a distribuições baseadas em Arch, inicialização de PostgreSQL e Valkey/Redis via `pacman`, e injeção automática do socket do MariaDB no `php.ini` e `Caddyfile`.
 - [`commands/install`](commands/install): Suporte a pacman em `install_dependency`, inicialização do MariaDB e injeção do socket no `php.ini`.
-- [`commands/trust`](commands/trust): Suporte a pacote `nss` no Arch e inclusão de `~/.pki` na varredura de certificados.
+- [`commands/trust`](commands/trust): Suporte a pacote `nss` no Arch e inclusão de `~/.pki`, `~/.firedragon` e `~/.librewolf` na varredura de certificados.
+- [`commands/menubar`](commands/menubar): Instalação automática das dependências GTK3/AppIndicator via `pacman` em `cove menubar enable`.
 - [`commands/share`](commands/share): Instalação do `cloudflared` via `pacman`.
-- [`commands/upgrade`](commands/upgrade): Suporte a atualização do `frankenphp` via `pacman` ou binário estático.
+- [`commands/upgrade`](commands/upgrade): Suporte a atualização do `frankenphp` via `pacman` ou binário estático, preservando o binário local do fork Manjaro/Arch quando a release upstream não inclui suporte nativo ao `pacman`.
+- [`commands/uninstall`](commands/uninstall): Instruções de remoção de pacotes via `pacman` ao desinstalar.
 - [`commands/transfer`](commands/transfer): Fallback de instalação de pacotes remotos via `pacman`.
 - [`cove.sh`](cove.sh): Script final recompilado gerado por `./compile.sh`.
 

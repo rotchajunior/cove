@@ -72,10 +72,23 @@ upgrade_frankenphp() {
             return 1
         fi
         
-        local temp_binary="/tmp/frankenphp_new"
-        if curl -L --progress-bar "https://github.com/php/frankenphp/releases/latest/download/${binary_name}" -o "$temp_binary"; then
-            chmod +x "$temp_binary"
+        # mktemp, not a fixed /tmp name another account could create first,
+        # and --fail so an HTTP error page is never installed as the binary.
+        local temp_binary
+        temp_binary=$(mktemp "${TMPDIR:-/tmp}/frankenphp_new.XXXXXX") || return 1
+        if curl -L --fail --progress-bar "https://github.com/php/frankenphp/releases/latest/download/${binary_name}" -o "$temp_binary"; then
+            chmod 755 "$temp_binary"
+            if [ ! -t 0 ] && ! sudo -n true 2>/dev/null; then
+                rm -f "$temp_binary"
+                gum style --foreground red "❌ Replacing $target_bin_dir/frankenphp needs sudo, and there is no terminal to ask on." "Run: sudo cove upgrade"
+                return 1
+            fi
             if sudo mv "$temp_binary" "$target_bin_dir/frankenphp"; then
+                # Root-owned, like the rest of $target_bin_dir. The moved file
+                # kept this user as its owner, and Cove runs this binary under
+                # sudo (trust, enable): anything running as this user, a
+                # site's PHP included, could have swapped it out first.
+                sudo chown 0:0 "$target_bin_dir/frankenphp" 2>/dev/null || true
                 # Set capability to bind to low ports without root
                 if command -v setcap &>/dev/null; then
                     $SUDO_CMD setcap 'cap_net_bind_service=+ep' "$target_bin_dir/frankenphp" 2>/dev/null || true
@@ -87,6 +100,7 @@ upgrade_frankenphp() {
                 return 1
             fi
         else
+            rm -f "$temp_binary"
             gum style --foreground red "❌ Failed to download FrankenPHP binary."
             return 1
         fi
@@ -104,95 +118,10 @@ upgrade_frankenphp() {
     return 0
 }
 
-cove_upgrade() {
-    local auto_yes=false
-    for arg in "$@"; do
-        case "$arg" in
-            --yes|-y|--force) auto_yes=true ;;
-        esac
-    done
-    # Non-interactive callers have no TTY — auto-yes so the Adminer prompt
-    # (only shown when the local version can't be parsed) doesn't hang.
-    [ -t 0 ] || auto_yes=true
-
-    echo "🔎 Checking for the latest version of Cove..."
-
-    local download_url="https://github.com/anchorhost/cove/releases/latest/download/cove.sh"
-    local temp_script="/tmp/cove.sh.latest"
-    local install_path
-
-    # Find the real path of the currently running script. $0 is authoritative:
-    # when cove runs via a shell alias or absolute path, `command -v cove`
-    # finds whatever happens to sit in PATH — possibly a different, older
-    # copy. (A stale v1.8 in /opt/homebrew/bin once answered a v1.11
-    # upgrade's post-upgrade/reload calls: "Unknown command 'post-upgrade'",
-    # plus a reload through three-versions-old generators.) PATH lookup is
-    # only the fallback when $0 is unusable.
-    install_path="$(cd "$(dirname "$0")" 2>/dev/null && pwd -P)/$(basename "$0")"
-    if [ ! -f "$install_path" ]; then
-        install_path=$(command -v cove)
-    fi
-    if [ -z "$install_path" ]; then
-        install_path="/usr/local/bin/cove" # Fallback to default
-    fi
-
-    # 1. Download the latest script
-    echo "   - Downloading latest Cove script from GitHub..."
-    if ! curl -L --fail --progress-bar "$download_url" -o "$temp_script"; then
-        echo "❌ Error: Failed to download the latest version. Please check your connection."
-        rm -f "$temp_script" 2>/dev/null
-        return 1
-    fi
-
-    # 2. Make it executable
-    chmod +x "$temp_script"
-
-    # 3. Get the new version from the downloaded script
-    local new_version
-    new_version=$("$temp_script" version | awk '{print $3}')
-
-    if [ -z "$new_version" ]; then
-        echo "❌ Error: Could not determine the version from the downloaded script."
-        rm -f "$temp_script" 2>/dev/null
-        return 1
-    fi
-
-    # 4. Get the current version from the running script
-    local current_version="$COVE_VERSION"
-    echo "   - Current Cove version:         $current_version"
-    echo "   - Latest available Cove version: $new_version"
-
-    # 5. Compare versions
-    local latest
-    latest=$(printf '%s\n' "$current_version" "$new_version" | sort -V | tail -n1)
-
-    if [[ "$latest" == "$current_version" ]] && [[ "$new_version" != "$current_version" ]]; then
-         echo "✅ Your current Cove version ($current_version) is newer than the latest release ($new_version). No action taken."
-         rm -f "$temp_script" 2>/dev/null
-    elif [[ "$latest" == "$current_version" ]]; then
-        echo "✅ You are already using the latest version of Cove."
-        rm -f "$temp_script" 2>/dev/null
-    else
-        # 6. Perform the Cove upgrade
-        echo "🚀 Upgrading Cove to version $new_version..."
-
-        if [ ! -w "$(dirname "$install_path")" ]; then
-            echo "❌ Error: No write permissions for '$(dirname "$install_path")'."
-            echo "   Please try running with sudo: 'sudo cove upgrade'"
-            rm -f "$temp_script" 2>/dev/null
-            return 1
-        fi
-
-        if ! mv "$temp_script" "$install_path"; then
-            echo "❌ Error: Failed to replace the old script at '$install_path'."
-            rm -f "$temp_script" 2>/dev/null
-        else
-            echo "✅ Cove has been successfully upgraded to version $new_version!"
-            echo "   Run 'cove version' to see the new version."
-        fi
-    fi
-
-    # --- New Section: FrankenPHP Upgrade Check ---
+# FrankenPHP's check for `cove upgrade`: the newest release replaces the one
+# installed. A failure here ends only this check, never the upgrade, whose
+# post-upgrade refresh has to run either way.
+cove_upgrade_frankenphp_check() {
     echo ""
     echo "🔎 Checking for FrankenPHP updates..."
 
@@ -233,21 +162,36 @@ cove_upgrade() {
 
     if [ "$needs_upgrade" == "true" ]; then
         echo "🚀 Upgrading FrankenPHP to version $latest_frankenphp_version..."
-        upgrade_frankenphp
+        if upgrade_frankenphp; then
+            # The on-disk binary is new, but the running process is still the
+            # old one. `caddy reload` adapts with the NEW binary (which may
+            # emit JSON fields the old handler rejects — 1.12.7's php_server
+            # adapter adds `route_group`) and POSTs that at the old process.
+            # Stop it now so the later `cove reload` starts the new binary
+            # (launchd KeepAlive / systemd Restart=on-failure will also
+            # respawn it from the new file).
+            echo "   - Stopping the old FrankenPHP process so the next reload starts $latest_frankenphp_version..."
+            "$CADDY_CMD" stop --config "$CADDYFILE_PATH" &>/dev/null || true
+        fi
     else
         echo "✅ FrankenPHP is already up to date."
     fi
     
-    # --- Adminer Upgrade Check ---
+}
+
+# Adminer's: brought up to the newest release, or fetched when it's missing.
+# $1 is true to fetch one of unknown version without asking.
+cove_upgrade_adminer_check() {
+    local auto_yes="${1:-false}"
     echo ""
     echo "🔎 Checking for Adminer updates..."
     
     local adminer_file="$ADMINER_DIR/adminer-core.php"
-    if [ ! -f "$adminer_file" ]; then
-        echo "   - ⚠️ Adminer not found. Skipping update check."
-        return 0
-    fi
-    
+    # Missing (a download that failed at install), it's fetched below as one
+    # of an unknown version would be, without asking.
+    local adminer_missing=false
+    [ -f "$adminer_file" ] || { echo "   - ⚠️ Adminer isn't installed."; adminer_missing=true; auto_yes=true; }
+
     # Get current Adminer version from the file (portable — BSD grep has no -P/\K)
     local current_adminer_version
     current_adminer_version=$(LC_ALL=C sed -nE 's/.*VERSION="([0-9]+\.[0-9]+\.[0-9]+)".*/\1/p' "$adminer_file" 2>/dev/null | head -1)
@@ -256,7 +200,7 @@ cove_upgrade() {
     fi
     
     if [ -z "$current_adminer_version" ]; then
-        echo "   - ⚠️ Could not determine current Adminer version."
+        $adminer_missing || echo "   - ⚠️ Could not determine current Adminer version."
         current_adminer_version="unknown"
     fi
     
@@ -285,9 +229,13 @@ cove_upgrade() {
         
         if [ "$adminer_needs_upgrade" == "true" ]; then
             echo "🚀 Upgrading Adminer to version $latest_adminer_version..."
-            if curl -sL "https://github.com/vrana/adminer/releases/download/v${latest_adminer_version}/adminer-${latest_adminer_version}.php" -o "$adminer_file"; then
+            # Saved beside it and moved into place, so a failed download
+            # (--fail keeps an HTTP error page out) leaves the old one working.
+            if curl -fsSL "https://github.com/vrana/adminer/releases/download/v${latest_adminer_version}/adminer-${latest_adminer_version}.php" -o "$adminer_file.new" \
+                && mv -f "$adminer_file.new" "$adminer_file"; then
                 echo "✅ Adminer upgraded successfully."
             else
+                rm -f "$adminer_file.new"
                 echo "❌ Failed to download Adminer $latest_adminer_version."
             fi
         else
@@ -303,13 +251,143 @@ cove_upgrade() {
         fi
         if $do_download; then
             echo "🚀 Downloading Adminer $latest_adminer_version..."
-            if curl -sL "https://github.com/vrana/adminer/releases/download/v${latest_adminer_version}/adminer-${latest_adminer_version}.php" -o "$adminer_file"; then
+            mkdir -p "$ADMINER_DIR"
+            if curl -fsSL "https://github.com/vrana/adminer/releases/download/v${latest_adminer_version}/adminer-${latest_adminer_version}.php" -o "$adminer_file.new" \
+                && mv -f "$adminer_file.new" "$adminer_file"; then
                 echo "✅ Adminer downloaded successfully."
             else
+                rm -f "$adminer_file.new"
                 echo "❌ Failed to download Adminer $latest_adminer_version."
             fi
         fi
     fi
+}
+
+cove_upgrade() {
+    local auto_yes=false
+    for arg in "$@"; do
+        case "$arg" in
+            --yes|-y|--force) auto_yes=true ;;
+        esac
+    done
+    # Non-interactive callers have no TTY — auto-yes so the Adminer prompt
+    # (only shown when the local version can't be parsed) doesn't hang.
+    [ -t 0 ] || auto_yes=true
+
+    echo "🔎 Checking for the latest version of Cove..."
+
+    local download_url="https://github.com/anchorhost/cove/releases/latest/download/cove.sh"
+    local temp_script
+    temp_script=$(mktemp "${TMPDIR:-/tmp}/cove.sh.latest.XXXXXX") || return 1
+    local install_path
+
+    # Find the real path of the currently running script. $0 is authoritative:
+    # when cove runs via a shell alias or absolute path, `command -v cove`
+    # finds whatever happens to sit in PATH — possibly a different, older
+    # copy. (A stale v1.8 in /opt/homebrew/bin once answered a v1.11
+    # upgrade's post-upgrade/reload calls: "Unknown command 'post-upgrade'",
+    # plus a reload through three-versions-old generators.) PATH lookup is
+    # only the fallback when $0 is unusable.
+    install_path="$(cd "$(dirname "$0")" 2>/dev/null && pwd -P)/$(basename "$0")"
+    if [ ! -f "$install_path" ]; then
+        install_path=$(command -v cove)
+    fi
+    if [ -z "$install_path" ]; then
+        install_path="$BIN_DIR/cove" # Where the installer puts it: /opt/homebrew/bin on Apple Silicon
+    fi
+
+    # 1. Download the latest script
+    echo "   - Downloading latest Cove script from GitHub..."
+    if ! curl -L --fail --progress-bar "$download_url" -o "$temp_script"; then
+        echo "❌ Error: Failed to download the latest version. Please check your connection."
+        rm -f "$temp_script" 2>/dev/null
+        return 1
+    fi
+
+    # 2. Make it executable
+    chmod 755 "$temp_script"
+
+    # 3. Get the new version from the downloaded script
+    local new_version
+    new_version=$("$temp_script" version 2>/dev/null | awk '{print $3}')
+    if [ -z "$new_version" ]; then
+        new_version=$(sed -nE 's/^COVE_VERSION="([^"]+)".*/\1/p' "$temp_script" 2>/dev/null | head -n1)
+    fi
+
+    if [ -z "$new_version" ]; then
+        echo "❌ Error: Could not determine the version from the downloaded script."
+        rm -f "$temp_script" 2>/dev/null
+        return 1
+    fi
+
+    # 4. Get the current version from the running script
+    local current_version="$COVE_VERSION"
+    echo "   - Current Cove version:         $current_version"
+    echo "   - Latest available Cove version: $new_version"
+
+    # 5. Compare versions
+    local latest
+    latest=$(printf '%s\n' "$current_version" "$new_version" | sort -V | tail -n1)
+
+    if [[ "$latest" == "$current_version" ]] && [[ "$new_version" != "$current_version" ]]; then
+         echo "✅ Your current Cove version ($current_version) is newer than the latest release ($new_version). No action taken."
+         rm -f "$temp_script" 2>/dev/null
+    elif [[ "$latest" == "$current_version" ]]; then
+        echo "✅ You are already using the latest version of Cove."
+        rm -f "$temp_script" 2>/dev/null
+    elif [ "$PKG_MANAGER" = "pacman" ] && ! grep -q 'PKG_MANAGER="pacman"' "$temp_script" 2>/dev/null; then
+        echo "ℹ️  Upstream v$new_version does not bundle Arch/Manjaro (pacman) support directly."
+        echo "   Update your local fork via 'git fetch upstream && git merge upstream/main && ./compile.sh && sudo ./install-cove.sh --dev'."
+        rm -f "$temp_script" 2>/dev/null
+    else
+        # 6. Perform the Cove upgrade
+        echo "🚀 Upgrading Cove to version $new_version..."
+
+        # The new script goes in beside the old one as $install_path.new and
+        # is renamed over it, so it's a new file rather than the old one
+        # rewritten. Bash reads a script as it runs it, and this process is
+        # still running the old one: written into in place, it went on at its
+        # old byte offset in the new text once main returned, running whatever
+        # was there (a 2.4 upgrade landed in the middle of cove proxy delete).
+        # A rename leaves the old file intact under this process. The copy
+        # comes first because $TMPDIR is often another filesystem, where mv
+        # copies into the existing file instead of renaming.
+        #
+        # The install dir is root-owned on Linux. Escalate for just these two
+        # steps rather than asking the user to run the whole upgrade under
+        # sudo — a root-run upgrade lands in /root/Cove (see the guard at the
+        # top of main). install run under sudo makes the .new file root's, so
+        # the binary stays root-owned; moving the download in would hand it
+        # to whoever downloaded it.
+        local replaced=false
+        local staged="$install_path.new"
+        if [ -w "$(dirname "$install_path")" ] && [ -w "$install_path" ]; then
+            if cp "$temp_script" "$staged" && chmod 755 "$staged" && mv -f "$staged" "$install_path"; then
+                replaced=true
+            else
+                rm -f "$staged" 2>/dev/null
+            fi
+        elif [ -n "$SUDO_CMD" ]; then
+            echo "   - Replacing $install_path (requires sudo — you may be prompted)..."
+            if $SUDO_CMD install -m 755 "$temp_script" "$staged" && $SUDO_CMD mv -f "$staged" "$install_path"; then
+                replaced=true
+            else
+                $SUDO_CMD rm -f "$staged" 2>/dev/null
+            fi
+        fi
+        rm -f "$temp_script" 2>/dev/null
+
+        if [ "$replaced" != true ]; then
+            echo "❌ Error: Failed to replace the old script at '$install_path'."
+            rm -f "$temp_script" 2>/dev/null
+        else
+            echo "✅ Cove has been successfully upgraded to version $new_version!"
+            echo "   Run 'cove version' to see the new version."
+        fi
+    fi
+
+    cove_upgrade_frankenphp_check || true
+    cove_upgrade_adminer_check "$auto_yes" || true
 
     # Always refresh the Cove Adminer theme + entry point. Pre-1.10 installs
     # shipped the Catppuccin CSS and a bare index.php without the head()
@@ -353,14 +431,7 @@ cove_upgrade() {
         if [ "$current" = "-1" ]; then
             echo "   ✓ ${k}: -1 (unlimited)"
         elif [ -z "$current" ] || [ "$current_bytes" -lt "$floor_bytes" ]; then
-            mkdir -p "$(dirname "$PHP_INI_FILE")"
-            touch "$PHP_INI_FILE"
-            if grep -qE "^[[:space:]]*${k}[[:space:]]*=" "$PHP_INI_FILE"; then
-                sed -i.bak -E "s|^[[:space:]]*${k}[[:space:]]*=.*|${k} = ${install_default_memory}|" "$PHP_INI_FILE"
-            else
-                echo "${k} = ${install_default_memory}" >> "$PHP_INI_FILE"
-            fi
-            rm -f "${PHP_INI_FILE}.bak"
+            cove_ini_set "$k" "$install_default_memory"
             echo "   ↑ ${k}: ${current:-unset} → ${install_default_memory}"
             bumped_any=true
         else

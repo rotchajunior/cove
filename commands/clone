@@ -22,14 +22,128 @@ cove_copy_tree() {
     cp -R "$src" "$dst"
 }
 
+# Copies a project site's folder ($1 → $2): the whole project, without
+# Cove's own files (COVE_SITE_OWN) or what a restore left half-done.
+cove_copy_project() {
+    local src="$1" dst="$2" entry name
+    mkdir -p "$dst" || return 1
+    for entry in "$src"/* "$src"/.[!.]* "$src"/..?*; do
+        [ -e "$entry" ] || [ -L "$entry" ] || continue
+        name="${entry##*/}"
+        case " $COVE_SITE_OWN .project.restoring .project.replaced " in *" $name "*) continue ;; esac
+        cove_copy_tree "$entry" "$dst/$name" || return 1
+    done
+}
+
+# Copies one database into a new one ($1 → $2) on MariaDB or, with $3
+# pgsql, PostgreSQL. The new one is dropped again if the import fails.
+# MariaDB needs source_config.
+cove_copy_database() {
+    local from="$1" to="$2" server="${3:-mariadb}" dump rc
+    # Never into one that exists: a failure would drop it.
+    if cove_server_db_exists "$server" "$to"; then
+        echo "   ❌ A database named '$to' already exists, perhaps left by an earlier site." >&2
+        return 1
+    fi
+    dump=$(mktemp) || return 1
+    if [ "$server" = "pgsql" ]; then
+        if ! cove_pg_dump "$from" > "$dump" 2>/dev/null; then
+            rm -f "$dump"
+            return 1
+        fi
+        cove_server_db_create pgsql "$to" && cove_pg_load "$to" < "$dump" 2>/dev/null
+        rc=$?
+    else
+        if ! MYSQL_PWD="$DB_PASSWORD" mysqldump -u "$DB_USER" "$from" > "$dump" 2>/dev/null; then
+            rm -f "$dump"
+            return 1
+        fi
+        MYSQL_PWD="$DB_PASSWORD" mysql -u "$DB_USER" -e "CREATE DATABASE IF NOT EXISTS \`$to\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;" \
+            && MYSQL_PWD="$DB_PASSWORD" mysql -u "$DB_USER" "$to" < "$dump" 2>/dev/null
+        rc=$?
+    fi
+    rm -f "$dump"
+    if [ "$rc" -ne 0 ]; then
+        cove_server_db_drop "$server" "$to"
+        return 1
+    fi
+}
+
+# A Laravel clone or rename's own database ($1 the site folder, $2 and $3
+# the old and new names): a copy of the one Cove made under the old name,
+# with .env pointed at it. An SQLite file moves with the folder (see
+# laravel_retarget for a full path). Prints the new database, if any.
+# Needs source_config.
+laravel_take_database() {
+    local site_dir="$1" old_name="$2" new_name="$3" db new_db server
+    if db=$(laravel_cove_db "$site_dir" "$old_name"); then
+        server=$(laravel_db_server "$site_dir")
+        if [ "$server" = "pgsql" ]; then
+            ensure_postgres >&2 || return 1
+        fi
+        new_db=$(cove_db_name "$new_name")
+        echo "   - Copying database '$db' to '$new_db'..." >&2
+        cove_copy_database "$db" "$new_db" "$server" || return 1
+        if ! COVE_ENV_SET="{\"DB_DATABASE\":$(cove_json_str "$new_db")}" laravel_env_set "$site_dir/.env"; then
+            cove_server_db_drop "$server" "$new_db"
+            return 1
+        fi
+        echo "$new_db"
+        return 0
+    fi
+    case "$(laravel_env_get "$site_dir" DB_CONNECTION)" in
+        sqlite|"") ;;
+        *) echo "   ⚠️  .env names the database '$(laravel_env_get "$site_dir" DB_DATABASE)', which Cove didn't make for this site; it is left as it is." >&2 ;;
+    esac
+}
+
+# A Laravel clone's Reverb settings ($1 the clone's folder, $2 its source's,
+# $3 its name). .env came
+# over as it was, so the clone's app would broadcast to the source's Reverb
+# (its REVERB_PORT is the source's reverb_port, a file of Cove's that isn't
+# copied) under the source's app id, key and secret, which reach the
+# source's browsers. The port goes, as on a site that hasn't turned Reverb
+# on (cove laravel <site> reverb on gives the clone one of its own), and
+# the app gets keys of its own, made the way laravel_reverb_install makes
+# them. A front end already built has the old key in it, so it needs
+# building again. A site without Reverb is left as it is.
+cove_clone_reverb() {
+    local new_dir="$1" source_dir="$2" new_name="$3" pairs=() port rand_id keys=false
+    port=$(cat "$source_dir/reverb_port" 2>/dev/null)
+    if [[ "$port" =~ ^[0-9]+$ ]] && [ "$(laravel_env_get "$new_dir" REVERB_PORT)" = "$port" ]; then
+        pairs+=("\"REVERB_PORT\":null")
+    fi
+    if [ -n "$(laravel_env_get "$new_dir" REVERB_APP_KEY)" ]; then
+        keys=true
+        rand_id=$(( (RANDOM * 32768 + RANDOM) % 900000 + 100000 ))
+        pairs+=("\"REVERB_APP_ID\":\"$rand_id\"" "\"REVERB_APP_KEY\":\"$(LC_ALL=C tr -dc 'a-z0-9' < /dev/urandom 2>/dev/null | head -c 20)\"" "\"REVERB_APP_SECRET\":\"$(LC_ALL=C tr -dc 'a-z0-9' < /dev/urandom 2>/dev/null | head -c 20)\"")
+    fi
+    [ "${#pairs[@]}" -gt 0 ] || return 0
+    if ! COVE_ENV_SET="{$(IFS=,; echo "${pairs[*]}")}" laravel_env_set "$new_dir/.env"; then
+        gum style --foreground yellow "⚠️  Could not give the clone Reverb settings of its own; its .env still names the source's Reverb (REVERB_PORT, REVERB_APP_*)."
+        return 0
+    fi
+    echo "   - Gave the clone Reverb settings of its own (cove laravel $new_name reverb on gives it a port too)."
+    if [ "$keys" = true ] && [ -d "$new_dir/public/build" ]; then
+        gum style --foreground yellow "⚠️  The clone's built front end still has the source's Reverb key: build it again (npm run build in $new_dir)."
+    fi
+}
+
 cove_clone() {
     cd ~/
     local source_name="$1"
     local new_name="$2"
     local no_reload_flag=false
 
-    for arg in "$@"; do
-        [ "$arg" == "--no-reload" ] && no_reload_flag=true
+    local arg
+    for arg in "${@:3}"; do
+        case "$arg" in
+            --no-reload) no_reload_flag=true ;;
+            *)
+                gum style --foreground red "❌ Error: Unknown option '$arg'."
+                echo "Usage: cove clone <source> <new-name>"
+                exit 1 ;;
+        esac
     done
 
     # --- Validation ---
@@ -46,8 +160,7 @@ cove_clone() {
 
     local source_dir="$SITES_DIR/$source_name.localhost"
     if [ ! -d "$source_dir" ]; then
-        gum style --foreground red "❌ Error: Site '$source_name.localhost' not found."
-        exit 1
+        site_not_found "$source_name"
     fi
 
     # Same name rules as cove_add — a clone must produce a site add could have.
@@ -71,19 +184,50 @@ cove_clone() {
         gum style --foreground red "❌ Error: A site named '$new_name.localhost' already exists."
         exit 1
     fi
+    local owner
+    if owner=$(cove_domain_owner "$new_name.localhost"); then
+        gum style --foreground red "❌ Error: '$new_name.localhost' already answers as $owner."
+        exit 1
+    fi
 
-    local is_wordpress=false
+    local is_wordpress=false is_laravel=false
     [ -f "$source_dir/public/wp-config.php" ] && is_wordpress=true
+    site_is_laravel "$source_dir" && is_laravel=true
+
+    # A WordPress source's database is the one its wp-config.php names (a
+    # site added before 2.5 spells it with a trailing underscore). The
+    # copy's must be new: a failed import drops it.
+    local source_db="" new_db=""
+    if [ "$is_wordpress" = true ]; then
+        source_config
+        source_db=$( (cd "$source_dir/public" && $(get_wp_cmd "$source_dir") config get DB_NAME --skip-plugins --skip-themes 2>/dev/null </dev/null) )
+        new_db=$(cove_db_name "$new_name")
+        if [ -z "$source_db" ]; then
+            gum style --foreground red "❌ Error: Could not read DB_NAME from $source_name.localhost's wp-config.php."
+            exit 1
+        fi
+        if cove_db_exists "$new_db"; then
+            gum style --foreground red "❌ Error: A database named '$new_db' already exists, perhaps left by an earlier site." "Remove it (Adminer, or the dashboard's SQL console) or choose another name."
+            exit 1
+        fi
+    fi
 
     echo "🧬 Cloning $source_name.localhost → $new_name.localhost"
 
     # --- Files ---
-    # Only public/ is cloned. logs/ is the source's own request history and
-    # would be actively misleading under a new hostname, so the clone starts
-    # with an empty one.
+    # Only public/ is cloned, or a project site's whole folder (Laravel, or
+    # an app `cove add --from` brought in). logs/ is the
+    # source's own request history and would be actively misleading under a
+    # new hostname, so the clone starts with an empty one.
     mkdir -p "$new_dir"
     echo "   - Copying files..."
-    if ! cove_copy_tree "$source_dir/public" "$new_dir/public"; then
+    local copied=true
+    if site_is_project "$source_dir"; then
+        cove_copy_project "$source_dir" "$new_dir" || copied=false
+    else
+        cove_copy_tree "$source_dir/public" "$new_dir/public" || copied=false
+    fi
+    if [ "$copied" = false ]; then
         gum style --foreground red "❌ Error: Failed to copy site files."
         rm -rf "$new_dir"
         exit 1
@@ -97,15 +241,20 @@ cove_clone() {
         cp "$source_dir/php_version" "$new_dir/php_version"
     fi
 
+    # Carry the multisite marker so the clone's Caddy block keeps its wildcard
+    # alias / subdirectory rewrites. Must exist before the regenerate below.
+    local ms_mode=""
+    if [ -f "$source_dir/multisite" ]; then
+        ms_mode=$(cat "$source_dir/multisite")
+        cp "$source_dir/multisite" "$new_dir/multisite"
+    fi
+
     # --- Database ---
     if [ "$is_wordpress" = true ]; then
         source_config
         local wp_cmd
         wp_cmd=$(get_wp_cmd "$new_dir")
 
-        local source_db new_db
-        source_db=$(echo "cove_$source_name" | tr -c '[:alnum:]_' '_')
-        new_db=$(echo "cove_$new_name" | tr -c '[:alnum:]_' '_')
 
         local temp_sql
         temp_sql=$(mktemp) || {
@@ -117,17 +266,17 @@ cove_clone() {
         trap 'rm -f "$temp_sql"' EXIT
 
         echo "   - Dumping database '$source_db'..."
-        if ! mysqldump -u "$DB_USER" -p"$DB_PASSWORD" "$source_db" > "$temp_sql" 2>/dev/null; then
+        if ! MYSQL_PWD="$DB_PASSWORD" mysqldump -u "$DB_USER" "$source_db" > "$temp_sql" 2>/dev/null; then
             gum style --foreground red "❌ Error: Failed to dump the source database '$source_db'."
             rm -rf "$new_dir"
             exit 1
         fi
 
         echo "   - Creating database '$new_db'..."
-        mysql -u "$DB_USER" -p"$DB_PASSWORD" -e "CREATE DATABASE IF NOT EXISTS \`$new_db\`;"
-        if ! mysql -u "$DB_USER" -p"$DB_PASSWORD" "$new_db" < "$temp_sql" 2>/dev/null; then
+        MYSQL_PWD="$DB_PASSWORD" mysql -u "$DB_USER" -e "CREATE DATABASE IF NOT EXISTS \`$new_db\`;"
+        if ! MYSQL_PWD="$DB_PASSWORD" mysql -u "$DB_USER" "$new_db" < "$temp_sql" 2>/dev/null; then
             gum style --foreground red "❌ Error: Failed to import into '$new_db'."
-            mysql -u "$DB_USER" -p"$DB_PASSWORD" -e "DROP DATABASE IF EXISTS \`$new_db\`;"
+            MYSQL_PWD="$DB_PASSWORD" mysql -u "$DB_USER" -e "DROP DATABASE IF EXISTS \`$new_db\`;"
             rm -rf "$new_dir"
             exit 1
         fi
@@ -135,7 +284,7 @@ cove_clone() {
         echo "   - Pointing wp-config.php at '$new_db'..."
         if ! (cd "$new_dir/public" && $wp_cmd config set DB_NAME "$new_db" --quiet </dev/null); then
             gum style --foreground red "❌ Error: Failed to update wp-config.php."
-            mysql -u "$DB_USER" -p"$DB_PASSWORD" -e "DROP DATABASE IF EXISTS \`$new_db\`;"
+            MYSQL_PWD="$DB_PASSWORD" mysql -u "$DB_USER" -e "DROP DATABASE IF EXISTS \`$new_db\`;"
             rm -rf "$new_dir"
             exit 1
         fi
@@ -148,12 +297,52 @@ cove_clone() {
             gum style --foreground yellow "⚠️  search-replace did not complete cleanly; verify the cloned site's URLs."
         fi
 
+        if [ -n "$ms_mode" ]; then
+            # Multisite stores BARE hostnames (no scheme) in wp_blogs.domain
+            # and wp_site.domain — for subdomain networks that includes every
+            # subsite (store.old.localhost). A bare-hostname pass rewrites
+            # them all in one sweep; the scheme'd pass above already handled
+            # option/content URLs.
+            if ! (cd "$new_dir/public" && $wp_cmd search-replace "$source_name.localhost" "$new_name.localhost" --all-tables --skip-plugins --skip-themes --quiet </dev/null); then
+                gum style --foreground yellow "⚠️  network domain search-replace did not complete cleanly; verify subsite domains."
+            fi
+            # DOMAIN_CURRENT_SITE is a wp-config constant, invisible to
+            # search-replace; stale, it points the whole network at the source.
+            (cd "$new_dir/public" && $wp_cmd config set DOMAIN_CURRENT_SITE "$new_name.localhost" --type=constant --quiet </dev/null) || \
+                gum style --foreground yellow "⚠️  Could not update DOMAIN_CURRENT_SITE in wp-config.php."
+        fi
+
         inject_mu_plugin "$new_dir/public"
+    fi
+
+    if [ "$is_laravel" = true ]; then
+        source_config
+        if ! laravel_take_database "$new_dir" "$source_name" "$new_name" >/dev/null; then
+            gum style --foreground red "❌ Error: Failed to copy the Laravel site's database."
+            rm -rf "$new_dir"
+            exit 1
+        fi
+        laravel_retarget "$new_dir" "$source_name" "$new_name" "$source_dir" || \
+            gum style --foreground yellow "⚠️  Could not update APP_URL in the clone's .env."
+        cove_clone_reverb "$new_dir" "$source_dir" "$new_name"
+        # An SQLite file named by a full path outside the folder isn't copied.
+        local sqlite_path
+        sqlite_path=$(laravel_env_get "$new_dir" DB_DATABASE)
+        if [ "$(laravel_env_get "$new_dir" DB_CONNECTION)" = "sqlite" ] && [[ "$sqlite_path" == /* ]] && [[ "$sqlite_path" != "$new_dir/"* ]]; then
+            gum style --foreground yellow "⚠️  Both sites use the SQLite file $sqlite_path, which is outside the site's folder."
+        fi
+    fi
+
+    # Made during `cove demo`: it joins the demo, like a site from `cove add`.
+    if [ -f "$COVE_DIR/demo" ] && ! grep -qx "$new_name" "$COVE_DIR/demo"; then
+        echo "$new_name" >> "$COVE_DIR/demo"
+        demo_db_sync
     fi
 
     # --- Custom Caddy directives ---
     # Carried over so the clone behaves like its source. Directives can hardcode
     # the old hostname, so say so rather than letting it fail mysteriously.
+
     local source_conf="$CUSTOM_CADDY_DIR/$source_name.localhost"
     if [ -f "$source_conf" ]; then
         cp "$source_conf" "$CUSTOM_CADDY_DIR/$new_name.localhost"

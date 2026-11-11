@@ -29,8 +29,14 @@ cat << 'COVE_TRANSFER_HELPER'
 #
 # Subcommands:
 #   probe   <site_dir>                     report tool capabilities as key=value
-#   backup  <site_dir> [--exclude=GLOB]... create an archive, print its path
-#   restore <site_dir> <archive> [--url-to=URL]
+#   backup  <site_dir> [--exclude=GLOB]... [--only-prefix]
+#                                          create an archive, print its path
+#   restore <site_dir> <archive> [--url-to=URL] [--keep=PATH]... [--refuse-freighter]
+#
+# All three take --tenant=<id> to work on one WP Freighter tenant of the
+# install at <site_dir> rather than the install itself: its stacked_<id>_
+# tables and the folder that belongs to it alone, never the shared core, the
+# other tenants or the main site.
 #
 # Design note: every capability degrades rather than failing. Archiving prefers
 # zip, falls back to tar, and finally to PHP itself; the database is dumped and
@@ -47,6 +53,9 @@ EXTRACTOR=""     # unzip | tar | php
 DB_DUMP=""       # native | php
 DB_LOAD=""       # native | php
 WP_CLI_PHAR=""   # optional sideloaded phar path (--wp-cli=)
+TENANT=""        # WP Freighter tenant id (--tenant=), exported as STACKED_SITE_ID
+ONLY_PREFIX=false  # dump only the tables under the site's own prefix (--only-prefix)
+REFUSE_FREIGHTER=false  # a whole-site restore refuses a WP Freighter host (--refuse-freighter)
 
 log()  { [ "${QUIET:-false}" = true ] || echo "$@" >&2; }
 die()  { echo "cove-transfer: $*" >&2; exit 1; }
@@ -97,6 +106,21 @@ resolve_wp() {
         if [ -f "$c" ] && have php; then WP="php $c$root_flag"; return 0; fi
     done
     return 1
+}
+
+# $table_prefix straight out of a wp-config.php, without booting PHP — the
+# source's config may name a database that does not exist on this machine.
+read_table_prefix() {
+    [ -f "$1" ] || return 0
+    grep -m1 -E '^[[:space:]]*\$table_prefix[[:space:]]*=' "$1" 2>/dev/null \
+        | sed -nE "s/.*=[[:space:]]*['\"]([A-Za-z0-9_]+)['\"].*/\1/p"
+}
+
+# Fallback when the archive carries no readable config: the prefix is whatever
+# precedes `options` in the dump's CREATE TABLE for the options table.
+infer_table_prefix_from_dump() {
+    grep -m1 -oE 'CREATE TABLE `?[A-Za-z0-9_]*options`?' "$1" 2>/dev/null \
+        | sed -E 's/CREATE TABLE `?([A-Za-z0-9_]*)options`?/\1/'
 }
 
 # --- capability detection -----------------------------------------------------
@@ -152,12 +176,17 @@ php_dump_script() {
 cat << 'PHPDUMP'
 <?php
 // Dump every table to $args[0] as portable SQL. Used when no mysqldump exists.
+// With $args[1] = 'prefix', only the tables under the site's own prefix.
 global $wpdb;
 $out = $args[0];
 $fh  = fopen( $out, 'w' );
 if ( ! $fh ) { WP_CLI::error( 'Cannot write ' . $out ); }
 fwrite( $fh, "SET NAMES utf8mb4;\nSET FOREIGN_KEY_CHECKS=0;\n" );
-$tables = $wpdb->get_col( 'SHOW TABLES' );
+if ( isset( $args[1] ) && 'prefix' === $args[1] ) {
+    $tables = $wpdb->get_col( $wpdb->prepare( 'SHOW TABLES LIKE %s', $wpdb->esc_like( $wpdb->prefix ) . '%' ) );
+} else {
+    $tables = $wpdb->get_col( 'SHOW TABLES' );
+}
 foreach ( $tables as $table ) {
     $create = $wpdb->get_row( "SHOW CREATE TABLE `$table`", ARRAY_N );
     fwrite( $fh, "\nDROP TABLE IF EXISTS `$table`;\n" . $create[1] . ";\n" );
@@ -259,14 +288,18 @@ if ( 'extract' === $mode ) {
     return;
 }
 
+// create-follow descends into symlinked folders, as zip and tar -h do: a
+// tenant backup is a folder of symlinks into the real install.
 $excludes = array_slice( $args, 3 );
 $zip      = new ZipArchive();
 if ( true !== $zip->open( $archive, ZipArchive::CREATE | ZipArchive::OVERWRITE ) ) {
     WP_CLI::error( 'Cannot create archive.' );
 }
+$flags = FilesystemIterator::SKIP_DOTS;
+if ( 'create-follow' === $mode ) { $flags |= FilesystemIterator::FOLLOW_SYMLINKS; }
 $base = basename( $dir );
 $it   = new RecursiveIteratorIterator(
-    new RecursiveDirectoryIterator( $dir, FilesystemIterator::SKIP_DOTS ),
+    new RecursiveDirectoryIterator( $dir, $flags ),
     RecursiveIteratorIterator::SELF_FIRST
 );
 foreach ( $it as $path ) {
@@ -295,6 +328,460 @@ wp_eval() {
     return $rc
 }
 
+# --- WP Freighter tenants -----------------------------------------------------
+# WP Freighter runs many sites out of one WordPress install. A tenant is chosen
+# by STACKED_SITE_ID under WP-CLI: its tables are stacked_<id>_*, and its files
+# are content/<id>/ (dedicated mode), just content/<id>/uploads (hybrid, where
+# plugins and themes are shared), or nothing of its own (shared). Everything
+# else in the install belongs to every tenant at once, so a tenant backup or
+# restore touches only that tenant's tables and that one folder.
+
+php_facts_script() {
+cat << 'PHPFACTS'
+<?php
+// key=value facts about the site WP-CLI booted. Under STACKED_SITE_ID they
+// describe that WP Freighter tenant: its prefix, its folders, its URLs.
+global $wpdb;
+$root    = defined( 'TABLE_PREFIX' ) ? TABLE_PREFIX : $wpdb->prefix;
+$uploads = wp_upload_dir( null, false );
+$clean   = function ( $value ) { return str_replace( array( "\t", "\r", "\n" ), ' ', (string) $value ); };
+$facts   = array(
+    'prefix'      => $wpdb->prefix,
+    'root_prefix' => $root,
+    'abspath'     => untrailingslashit( ABSPATH ),
+    'content_dir' => untrailingslashit( WP_CONTENT_DIR ),
+    'content_url' => untrailingslashit( WP_CONTENT_URL ),
+    'uploads_dir' => untrailingslashit( $uploads['basedir'] ),
+    'uploads_url' => untrailingslashit( $uploads['baseurl'] ),
+    // The stored value. Freighter defines WP_HOME for tenants without a
+    // domain, so get_option( 'home' ) would answer with the main site's.
+    'raw_home'    => $wpdb->get_var( "SELECT option_value FROM {$wpdb->options} WHERE option_name = 'home'" ),
+    'tables'      => count( $wpdb->get_col( $wpdb->prepare( 'SHOW TABLES LIKE %s', $wpdb->esc_like( $wpdb->prefix ) . '%' ) ) ),
+    'freighter'   => file_exists( ABSPATH . 'wp-content/freighter.php' ) ? 'y' : 'n',
+);
+foreach ( $facts as $key => $value ) {
+    echo $key . '=' . $clean( $value ) . "\n";
+}
+// The tenant registry lives in the main site's options, whichever site booted.
+$wpdb->suppress_errors( true );
+$sites = maybe_unserialize( $wpdb->get_var( "SELECT option_value FROM {$root}options WHERE option_name = 'stacked_sites'" ) );
+if ( is_array( $sites ) ) {
+    foreach ( $sites as $site ) {
+        echo 'tenant=' . (int) $site['stacked_site_id'] . "\t" . $clean( isset( $site['domain'] ) ? $site['domain'] : '' ) . "\t" . $clean( isset( $site['name'] ) ? $site['name'] : '' ) . "\n";
+    }
+}
+PHPFACTS
+}
+
+php_drop_leftovers_script() {
+cat << 'PHPDROP'
+<?php
+// $args: 0=file listing the tables the import created, 1=the prefix this must
+// be running under. Drops this site's other tables, so the tenant ends up
+// with exactly what was pushed. Nothing outside the prefix is considered.
+global $wpdb;
+if ( $wpdb->prefix !== $args[1] ) {
+    WP_CLI::error( "Expected prefix {$args[1]}, WordPress booted with {$wpdb->prefix}." );
+}
+$keep = array_filter( array_map( 'trim', file( $args[0] ) ) );
+$own  = $wpdb->get_col( $wpdb->prepare( 'SHOW TABLES LIKE %s', $wpdb->esc_like( $wpdb->prefix ) . '%' ) );
+foreach ( array_diff( $own, $keep ) as $table ) {
+    $wpdb->query( "DROP TABLE IF EXISTS `$table`" );
+    WP_CLI::log( "Dropped $table, which the pushed site does not have." );
+}
+PHPDROP
+}
+
+php_prefix_keys_script() {
+cat << 'PHPKEYS'
+<?php
+// The tables were renamed from prefix $args[0] to this site's. WordPress also
+// keys the roles option and per-user meta by prefix, so rename those too.
+global $wpdb;
+$from = $args[0];
+$to   = $wpdb->prefix;
+if ( $from === $to ) { return; }
+$wpdb->query( $wpdb->prepare( "UPDATE {$wpdb->options} SET option_name = %s WHERE option_name = %s", $to . 'user_roles', $from . 'user_roles' ) );
+$wpdb->query( $wpdb->prepare( "UPDATE {$wpdb->usermeta} SET meta_key = CONCAT( %s, SUBSTRING( meta_key, %d ) ) WHERE meta_key LIKE %s", $to, strlen( $from ) + 1, $wpdb->esc_like( $from ) . '%' ) );
+WP_CLI::log( "Renamed {$from}user_roles and {$from}* user meta to $to." );
+PHPKEYS
+}
+
+php_dump_check_script() {
+cat << 'PHPCHECK'
+<?php
+// $args: 0=dump, 1=the tenant's prefix, 2=file to list the tables the dump
+// creates, 3=file to write the first problem to, 4="tenant <id>".
+// Reads the dump statement by statement, with strings, comments and MySQL's
+// executable /*! */ comments taken into account, and accepts only what a
+// table dump is made of: session SET, LOCK/UNLOCK, and DROP/CREATE/ALTER/
+// INSERT/REPLACE/TRUNCATE/RENAME/DELETE/UPDATE on tables under the prefix.
+// Triggers, views, routines, events, users, global settings, another
+// database, or a mysql client command could all reach past the tenant.
+$file   = $args[0];
+$prefix = $args[1];
+$label  = $args[4];
+$fh     = fopen( $file, 'rb' );
+if ( ! $fh ) { WP_CLI::error( "Cannot read $file" ); }
+
+$problem = null;
+$created = array();
+$foreign = array();
+
+$check = function ( $sql, $seen = array() ) use ( $prefix, $label, &$created, &$foreign, &$problem ) {
+    preg_match_all( '/`(?:[^`]|``)*`|\'\'|@@?[A-Za-z0-9_.$]+|[A-Za-z0-9_$]+|\S/', $sql, $m );
+    $t = $m[0];
+    if ( ! $t ) { return; }
+    $kw = function ( $i, $words ) use ( &$t ) {
+        return isset( $t[ $i ] ) && '`' !== $t[ $i ][0] && in_array( strtoupper( $t[ $i ] ), (array) $words, true );
+    };
+    $name = function ( &$i ) use ( &$t, &$problem ) {
+        if ( ! isset( $t[ $i ] ) ) { return null; }
+        $tok = $t[ $i ];
+        if ( '`' === $tok[0] ) {
+            $n = str_replace( '``', '`', substr( $tok, 1, -1 ) );
+        } elseif ( preg_match( '/^[A-Za-z0-9_$]+$/', $tok ) ) {
+            $n = $tok;
+        } else {
+            return null;
+        }
+        $i++;
+        if ( isset( $t[ $i ] ) && '.' === $t[ $i ] ) {
+            $problem = "The dump names a table in another database ($n." . ( isset( $t[ $i + 1 ] ) ? $t[ $i + 1 ] : '' ) . ').';
+            return null;
+        }
+        return $n;
+    };
+    $own = function ( $n ) use ( $prefix, &$foreign ) {
+        if ( null !== $n && 0 !== strpos( $n, $prefix ) ) { $foreign[ $n ] = true; }
+        return null !== $n;
+    };
+    $refuse = function () use ( &$t, &$problem, $label ) {
+        $text = '';
+        foreach ( $t as $tok ) {
+            $glue  = '' === $text || in_array( $tok, array( ',', ')', '.', '@', '/' ), true ) || in_array( substr( $text, -1 ), array( '(', '.', '@', '/' ), true );
+            $text .= $glue ? $tok : ' ' . $tok;
+            if ( strlen( $text ) > 70 ) { $text = substr( $text, 0, 70 ) . '…'; break; }
+        }
+        $problem = "The dump holds a statement that can reach past $label's tables, which a tenant restore refuses: $text.";
+    };
+    $i     = 1;
+    $first = strtoupper( $t[0] );
+    // A dump writes rows as values. A SELECT (or MySQL 8's TABLE) inside any
+    // other statement reads them from somewhere, possibly another tenant's
+    // tables, and SELECT … INTO keeps what it read for a later statement.
+    if ( ( isset( $seen['SELECT'] ) && 'SELECT' !== $first )
+        || ( isset( $seen['TABLE'] ) && in_array( $first, array( 'INSERT', 'REPLACE', 'UPDATE', 'DELETE', 'SET' ), true ) )
+        || ( isset( $seen['INTO'] ) && 'SELECT' === $first ) ) {
+        return $refuse();
+    }
+    switch ( $first ) {
+        case 'SET':
+            foreach ( $t as $tok ) {
+                $u = strtoupper( $tok );
+                if ( in_array( $u, array( 'GLOBAL', 'PERSIST', 'PERSIST_ONLY', 'PASSWORD', 'ROLE', 'STATEMENT' ), true )
+                    || 0 === strpos( $u, '@@GLOBAL.' ) || 0 === strpos( $u, '@@PERSIST' ) ) {
+                    return $refuse();
+                }
+            }
+            return;
+        case 'UNLOCK': case 'START': case 'BEGIN': case 'COMMIT': case 'ROLLBACK':
+            return;
+        case 'SELECT':
+            foreach ( $t as $tok ) {
+                if ( in_array( strtoupper( $tok ), array( 'OUTFILE', 'DUMPFILE' ), true ) ) { return $refuse(); }
+            }
+            return;
+        case 'USE':
+            $problem = 'The dump switches or creates databases.';
+            return;
+        case 'LOCK':
+            if ( ! $kw( $i++, array( 'TABLE', 'TABLES' ) ) ) { return $refuse(); }
+            do {
+                if ( ! $own( $name( $i ) ) ) { return $problem ? null : $refuse(); }
+                while ( isset( $t[ $i ] ) && ',' !== $t[ $i ] ) { $i++; }
+            } while ( isset( $t[ $i ] ) && ',' === $t[ $i++ ] );
+            return;
+        case 'DROP':
+            if ( $kw( $i, 'TEMPORARY' ) ) { $i++; }
+            if ( $kw( $i, array( 'DATABASE', 'SCHEMA' ) ) ) { $problem = 'The dump switches or creates databases.'; return; }
+            if ( ! $kw( $i++, array( 'TABLE', 'TABLES' ) ) ) { return $refuse(); }
+            if ( $kw( $i, 'IF' ) && $kw( $i + 1, 'EXISTS' ) ) { $i += 2; }
+            do {
+                if ( ! $own( $name( $i ) ) ) { return $problem ? null : $refuse(); }
+            } while ( isset( $t[ $i ] ) && ',' === $t[ $i++ ] );
+            return;
+        case 'CREATE':
+            if ( $kw( $i, 'OR' ) && $kw( $i + 1, 'REPLACE' ) ) { $i += 2; }
+            if ( $kw( $i, 'TEMPORARY' ) ) { $i++; }
+            if ( $kw( $i, array( 'DATABASE', 'SCHEMA' ) ) ) { $problem = 'The dump switches or creates databases.'; return; }
+            if ( ! $kw( $i++, 'TABLE' ) ) { return $refuse(); }
+            if ( $kw( $i, 'IF' ) && $kw( $i + 1, 'NOT' ) && $kw( $i + 2, 'EXISTS' ) ) { $i += 3; }
+            $n = $name( $i );
+            if ( ! $own( $n ) ) { return $problem ? null : $refuse(); }
+            $created[ $n ] = true;
+            break;
+        case 'ALTER':
+            while ( $kw( $i, array( 'ONLINE', 'IGNORE' ) ) ) { $i++; }
+            if ( $kw( $i, array( 'DATABASE', 'SCHEMA' ) ) ) { $problem = 'The dump switches or creates databases.'; return; }
+            if ( ! $kw( $i++, 'TABLE' ) ) { return $refuse(); }
+            if ( ! $own( $name( $i ) ) ) { return $problem ? null : $refuse(); }
+            break;
+        case 'INSERT': case 'REPLACE':
+            while ( $kw( $i, array( 'LOW_PRIORITY', 'DELAYED', 'HIGH_PRIORITY', 'IGNORE' ) ) ) { $i++; }
+            if ( $kw( $i, 'INTO' ) ) { $i++; }
+            if ( ! $own( $name( $i ) ) ) { return $problem ? null : $refuse(); }
+            return;
+        case 'TRUNCATE':
+            if ( $kw( $i, 'TABLE' ) ) { $i++; }
+            if ( ! $own( $name( $i ) ) || isset( $t[ $i ] ) ) { return $problem ? null : $refuse(); }
+            return;
+        case 'RENAME':
+            if ( ! $kw( $i++, array( 'TABLE', 'TABLES' ) ) ) { return $refuse(); }
+            do {
+                if ( ! $own( $name( $i ) ) || ! $kw( $i++, 'TO' ) || ! $own( $name( $i ) ) ) { return $problem ? null : $refuse(); }
+            } while ( isset( $t[ $i ] ) && ',' === $t[ $i++ ] );
+            return;
+        case 'DELETE':
+            while ( $kw( $i, array( 'LOW_PRIORITY', 'QUICK', 'IGNORE' ) ) ) { $i++; }
+            if ( ! $kw( $i++, 'FROM' ) || ! $own( $name( $i ) ) ) { return $problem ? null : $refuse(); }
+            if ( isset( $t[ $i ] ) && ! $kw( $i, array( 'WHERE', 'ORDER', 'LIMIT', 'RETURNING' ) ) ) { return $refuse(); }
+            return;
+        case 'UPDATE':
+            while ( $kw( $i, array( 'LOW_PRIORITY', 'IGNORE' ) ) ) { $i++; }
+            if ( ! $own( $name( $i ) ) || ! $kw( $i, 'SET' ) ) { return $problem ? null : $refuse(); }
+            return;
+        default:
+            return $refuse();
+    }
+    // CREATE TABLE and ALTER TABLE: the other tables they name.
+    for ( $n = count( $t ); $i < $n; $i++ ) {
+        if ( $kw( $i, 'WITH' ) && $kw( $i + 1, 'TABLE' ) ) {
+            $i++;
+        } elseif ( $kw( $i, 'RENAME' ) && ! $kw( $i + 1, array( 'COLUMN', 'INDEX', 'KEY', 'CONSTRAINT' ) ) ) {
+            if ( $kw( $i + 1, array( 'TO', 'AS' ) ) ) { $i++; }
+        } elseif ( ! $kw( $i, array( 'REFERENCES', 'LIKE' ) ) ) {
+            continue;
+        }
+        $j = $i + 1;
+        if ( ! $own( $name( $j ) ) && $problem ) { return; }
+    }
+};
+
+$head    = '';     // the statement so far: code only, strings as ''
+$cap     = 65536;  // a CREATE TABLE fits; an INSERT's rows don't matter
+$state   = 'code'; // code | sq | dq | bt | comment
+$exec    = 0;      // executable comments open (/*! … */): their text is code
+$esc     = false;  // the last character in a string was a backslash
+$line_no = 0;
+$seen    = array(); // SELECT, TABLE, INTO in the statement's code, past the cap too
+$add     = function ( $s ) use ( &$head, $cap ) {
+    if ( strlen( $head ) < $cap ) { $head .= $s; }
+};
+while ( null === $problem && false !== ( $line = fgets( $fh ) ) ) {
+    $line_no++;
+    // MariaDB's dump tools put this first. It is a client command, but the
+    // one that turns the client's other commands off.
+    if ( 1 === $line_no && '/*M!999999\- enable the sandbox mode */' === rtrim( $line ) ) { continue; }
+    $len = strlen( $line );
+    $i   = 0;
+    while ( $i < $len && null === $problem ) {
+        if ( 'sq' === $state || 'dq' === $state ) {
+            if ( $esc ) { $esc = false; $i++; continue; }
+            $q  = 'sq' === $state ? "'" : '"';
+            $i += strcspn( $line, $q . '\\', $i );
+            if ( $i >= $len ) { break; }
+            if ( '\\' === $line[ $i ] ) { $esc = true; $i++; continue; }
+            if ( $i + 1 < $len && $q === $line[ $i + 1 ] ) { $i += 2; continue; }
+            $state = 'code';
+            $add( "''" );
+            $i++;
+        } elseif ( 'bt' === $state ) {
+            $n = strcspn( $line, '`', $i );
+            $add( substr( $line, $i, $n ) );
+            $i += $n;
+            if ( $i >= $len ) { break; }
+            if ( $i + 1 < $len && '`' === $line[ $i + 1 ] ) { $add( '``' ); $i += 2; continue; }
+            $add( '`' );
+            $state = 'code';
+            $i++;
+        } elseif ( 'comment' === $state ) {
+            $p = strpos( $line, '*/', $i );
+            if ( false === $p ) { break; }
+            $state = 'code';
+            $add( ' ' );
+            $i = $p + 2;
+        } else {
+            $n     = strcspn( $line, "'\"`;/-#*\\", $i );
+            $chunk = substr( $line, $i, $n );
+            $add( $chunk );
+            if ( preg_match_all( '/(?<![A-Za-z0-9_$])(SELECT|TABLE|INTO)(?![A-Za-z0-9_$])/i', $chunk, $w ) ) {
+                foreach ( $w[1] as $word ) { $seen[ strtoupper( $word ) ] = true; }
+            }
+            $i += $n;
+            if ( $i >= $len ) { break; }
+            $c    = $line[ $i ];
+            $next = $i + 1 < $len ? $line[ $i + 1 ] : '';
+            if ( "'" === $c ) {
+                $state = 'sq';
+                $i++;
+            } elseif ( '"' === $c ) {
+                $state = 'dq';
+                $i++;
+            } elseif ( '`' === $c ) {
+                $state = 'bt';
+                $add( '`' );
+                $i++;
+            } elseif ( ';' === $c ) {
+                $check( $head, $seen );
+                $head = '';
+                $seen = array();
+                $i++;
+            } elseif ( '\\' === $c ) {
+                $problem = "The dump holds a mysql client command (\\$next on line $line_no), which a tenant restore refuses.";
+            } elseif ( '#' === $c || ( '-' === $c && '-' === $next && ( $i + 2 >= $len || ctype_space( $line[ $i + 2 ] ) ) ) ) {
+                $add( ' ' );
+                break;
+            } elseif ( '/' === $c && '*' === $next ) {
+                if ( preg_match( '/\G\/\*M?!\d*/', $line, $m, 0, $i ) ) {
+                    $exec++;
+                    $i += strlen( $m[0] );
+                } else {
+                    $state = 'comment';
+                    $i += 2;
+                }
+                $add( ' ' );
+            } elseif ( '*' === $c && '/' === $next && $exec > 0 ) {
+                $exec--;
+                $add( ' ' );
+                $i += 2;
+            } else {
+                $add( $c );
+                $i++;
+            }
+        }
+    }
+}
+fclose( $fh );
+if ( null === $problem && '' !== trim( $head ) ) { $check( $head, $seen ); }
+if ( null === $problem && $foreign ) {
+    $problem = "The dump touches tables outside $label: " . implode( ' ', array_slice( array_keys( $foreign ), 0, 5 ) ) . '.';
+}
+if ( null !== $problem ) {
+    file_put_contents( $args[3], $problem );
+    return;
+}
+file_put_contents( $args[2], implode( "\n", array_keys( $created ) ) . "\n" );
+PHPCHECK
+}
+
+# Does the install at $1 run WP Freighter? Read from the files, not through
+# PHP, so the answer holds when WordPress fails to boot: push uses it to
+# refuse a whole-install restore that would take every tenant with it.
+is_freighter_host() {
+    local cfg="$1/wp-config.php"
+    [ -f "$cfg" ] || cfg="$(dirname "$1")/wp-config.php"
+    [ -f "$1/wp-content/freighter.php" ] || grep -q 'freighter\.php' "$cfg" 2>/dev/null
+}
+
+# Boot the site at $1 once (as the tenant, when --tenant exported
+# STACKED_SITE_ID) and keep its facts in FACTS.
+FACTS=""
+load_facts() {
+    local site_dir="$1" tmp_php rc=0
+    tmp_php=$(mktemp "${TMPDIR:-/tmp}/cove-php-XXXXXX.php") || die "mktemp failed"
+    php_facts_script > "$tmp_php"
+    FACTS=$($WP eval-file "$tmp_php" --path="$site_dir" --skip-plugins --skip-themes 2>/dev/null) || rc=$?
+    rm -f "$tmp_php"
+    return $rc
+}
+fact() { printf '%s\n' "$FACTS" | sed -n "s/^$1=//p" | head -1; }
+
+# Confirm STACKED_SITE_ID really switched WordPress to tenant $TENANT, and work
+# out which folder belongs to it alone (TENANT_FILES = content | uploads |
+# none, TENANT_DIR = that folder). Sets TENANT_ERROR and returns 1 when it is
+# not safe to treat the install as that tenant.
+TENANT_FILES=""
+TENANT_DIR=""
+TENANT_ERROR=""
+tenant_check() {
+    local prefix root abspath content uploads
+    prefix=$(fact prefix); root=$(fact root_prefix); abspath=$(fact abspath)
+    content=$(fact content_dir); uploads=$(fact uploads_dir)
+    if [ "$prefix" != "stacked_${TENANT}_" ]; then
+        TENANT_ERROR="STACKED_SITE_ID=$TENANT did not switch WordPress to tenant $TENANT's tables (it booted with prefix '${prefix:-unknown}'). Is this a WP Freighter host?"
+        return 1
+    fi
+    if [ "$prefix" = "$root" ]; then
+        TENANT_ERROR="Tenant $TENANT's prefix ($prefix) is the main site's own."
+        return 1
+    fi
+    if [ "$(fact tables)" = "0" ]; then
+        TENANT_ERROR="Tenant $TENANT has no tables. Create it on the host first (wp freighter add)."
+        return 1
+    fi
+    if [ "$content" != "$abspath/wp-content" ]; then
+        TENANT_FILES=content; TENANT_DIR="$content"
+    elif [ "${uploads#"$abspath/wp-content/"}" = "$uploads" ]; then
+        TENANT_FILES=uploads; TENANT_DIR="$uploads"
+    else
+        TENANT_FILES=none; TENANT_DIR=""
+    fi
+    if [ -n "$TENANT_DIR" ]; then
+        case "$TENANT_DIR" in
+            "$abspath"/?*) ;;
+            *) TENANT_ERROR="Tenant $TENANT's folder $TENANT_DIR is outside the install."; return 1 ;;
+        esac
+        case "$TENANT_DIR" in
+            "$abspath/wp-content"|"$abspath/wp-content/"*|"$abspath/content"|"$abspath/wp-admin"|"$abspath/wp-includes")
+                TENANT_ERROR="Tenant $TENANT's folder $TENANT_DIR is shared with the rest of the install."
+                return 1 ;;
+        esac
+    fi
+}
+
+# Copy dump $1 to $4 with every table renamed from prefix $2 to $3. Only the
+# name right after a statement keyword changes, never row data.
+rename_dump_prefix() {
+    local in="$1" from="$2" to="$3" out="$4"
+    sed -E \
+        -e "s/^(DROP TABLE IF EXISTS|DROP TABLE|CREATE TABLE IF NOT EXISTS|CREATE TABLE|INSERT IGNORE INTO|INSERT INTO|REPLACE INTO|LOCK TABLES|ALTER TABLE|TRUNCATE TABLE|TRUNCATE) \`${from}/\1 \`${to}/" \
+        -e "s/^(\/\*![0-9]+ ALTER TABLE) \`${from}/\1 \`${to}/" \
+        -e "s/^([[:space:]]+CONSTRAINT .* REFERENCES) \`${from}/\1 \`${to}/" \
+        "$in" > "$out"
+}
+
+# One search-replace over this site's own tables only. --all-tables would
+# reach every tenant in a shared database.
+sr_own_tables() {
+    $WP search-replace "$2" "$3" --all-tables-with-prefix --skip-columns=guid \
+        --path="$1" --skip-plugins --skip-themes --quiet >&2 \
+        || log "  (URL rewrite reported errors)"
+}
+
+# An archive made from a tenant carries .cove-source, which says where its
+# files were served from (/content/<id>/ in dedicated mode, /content/<id>/
+# uploads/ in hybrid). Point those links at wp-content under the restored
+# site's stored home ($3), before the address itself changes over.
+# Scheme-less, so http, https and protocol-relative links all follow.
+# $1 = site dir, $2 = unpacked tree, $4 = table scope for search-replace.
+rewrite_source_urls() {
+    local site_dir="$1" src="$2" url_from="$3" scope="$4" key there want
+    [ -f "$src/.cove-source" ] && [ -n "$url_from" ] || return 0
+    for key in uploads_url content_url; do
+        there=$(sed -n "s/^$key=//p" "$src/.cove-source" | head -1)
+        there="${there#*:}"
+        want="${url_from#*:}/wp-content"
+        [ "$key" = uploads_url ] && want="$want/uploads"
+        if [ -n "$there" ] && [ "$there" != "$want" ]; then
+            log "Rewriting $there/ -> $want/"
+            $WP search-replace "$there/" "$want/" "$scope" --skip-columns=guid \
+                --path="$site_dir" --skip-plugins --skip-themes --quiet >&2 \
+                || log "  (URL rewrite reported errors)"
+        fi
+    done
+}
+
 # --- subcommands --------------------------------------------------------------
 cmd_probe() {
     local site_dir="$1"
@@ -315,6 +802,53 @@ cmd_probe() {
     echo "php=$(have php && echo y || echo n)"
     if [ -n "$site_dir" ] && [ -d "$site_dir" ]; then
         echo "home=$($WP option get home --path="$site_dir" --skip-plugins --skip-themes 2>/dev/null)"
+        echo "freighter_host=$(is_freighter_host "$site_dir" && echo y || echo n)"
+        # Prefix, folders, URLs and WP Freighter's tenant list (tenant=<id>
+        # TAB <domain> TAB <name>), so pull and push can offer the tenants.
+        if load_facts "$site_dir"; then
+            printf '%s\n' "$FACTS"
+            if [ -n "$TENANT" ]; then
+                if tenant_check; then
+                    echo "tenant_files=$TENANT_FILES"
+                    echo "tenant_dir=$TENANT_DIR"
+                else
+                    echo "tenant_error=$TENANT_ERROR"
+                fi
+            fi
+        elif [ -n "$TENANT" ]; then
+            echo "tenant_error=WordPress did not boot as tenant $TENANT. Does it exist on this host?"
+        fi
+    fi
+}
+
+# Lay tenant $TENANT out as a standalone site in $2: symlinks to WordPress
+# core in the install at $1, and a wp-content made of the tenant's own content
+# folder plus its uploads when those live elsewhere (hybrid mode).
+stage_tenant() {
+    local site_dir="$1" out="$2" entry name
+    local abspath content uploads
+    abspath=$(fact abspath); content=$(fact content_dir); uploads=$(fact uploads_dir)
+    mkdir -p "$out/wp-content" || return 1
+    # Core only, by name: the host's root can hold files of its own, and a
+    # wp-config.php (or any copy of one) carries the host's credentials.
+    for name in wp-admin wp-includes index.php license.txt readme.html xmlrpc.php \
+        wp-activate.php wp-blog-header.php wp-comments-post.php wp-config-sample.php \
+        wp-cron.php wp-links-opml.php wp-load.php wp-login.php wp-mail.php \
+        wp-settings.php wp-signup.php wp-trackback.php; do
+        if [ -e "$site_dir/$name" ]; then ln -s "$site_dir/$name" "$out/$name" || return 1; fi
+    done
+    [ -e "$out/wp-settings.php" ] || return 1
+    if [ -d "$content" ]; then
+        while IFS= read -r entry; do
+            name=$(basename "$entry")
+            # The host's bootstrap, when the tenant shares the main wp-content.
+            if [ "$name" = freighter.php ] && [ "$content" = "$abspath/wp-content" ]; then continue; fi
+            if [ "$name" = uploads ] && [ "$uploads" != "$content/uploads" ]; then continue; fi
+            ln -s "$entry" "$out/wp-content/$name" || return 1
+        done < <(find "$content" -mindepth 1 -maxdepth 1)
+    fi
+    if [ "$uploads" != "$content/uploads" ] && [ -d "$uploads" ]; then
+        ln -s "$uploads" "$out/wp-content/uploads" || return 1
     fi
 }
 
@@ -344,21 +878,73 @@ cmd_backup() {
     case "$ARCHIVER" in tar) ext="tar.gz" ;; *) ext="zip" ;; esac
     archive="$parent/${stamp}_${rand}.${ext}"
 
-    # The dump lands inside the site dir so it travels in the archive, exactly
-    # where restore expects to find it.
+    # A tenant is archived from a staging folder beside the install, never in
+    # the web root: symlinks to core and to the tenant's own files, laid out
+    # like a standalone site so the archive restores like any other. The
+    # host's wp-config.php, the other tenants and the main site stay out.
+    local stage="" tree="$site_dir"
+    if [ -n "$TENANT" ]; then
+        load_facts "$site_dir" || die "WordPress did not boot as tenant $TENANT. Does it exist on this host?"
+        tenant_check || die "$TENANT_ERROR"
+        stage=$(mktemp -d "$parent/.cove-tenant-XXXXXX") || die "mktemp failed"
+        tree="$stage/$base"
+    fi
+
+    # The dump lands inside the tree so it travels in the archive, exactly
+    # where restore expects to find it. For a whole site that is the web root,
+    # for as long as the archive takes to build — on a live host when `cove
+    # pull` runs this. So: a name nobody can guess (it used to be a fixed
+    # db_export.sql), readable by this user only, and removed however this exits.
     log "Exporting database..."
-    local dump="$site_dir/db_export.sql"
+    local dump_rand
+    dump_rand=$( (head -c 8 /dev/urandom | od -An -tx1 | tr -d ' \n') 2>/dev/null )
+    [ -n "$dump_rand" ] || dump_rand="$$$(date +%s)"
+    local dump="$tree/db_export-$dump_rand.sql"
+    local cleanup="rm -f '$dump'"
+    # rm -rf on the staging folder removes its symlinks, never what they point at.
+    [ -n "$stage" ] && cleanup="$cleanup; rm -rf '$stage'"
+    # shellcheck disable=SC2064
+    trap "$cleanup" EXIT
+    # PIPE too: run over `ssh … bash -s` there is no terminal, so a dropped
+    # connection or a Ctrl-C at the other end arrives as SIGPIPE on the next
+    # write to the closed stderr, not as HUP.
+    # shellcheck disable=SC2064
+    trap "$cleanup; exit 1" HUP INT TERM PIPE
+
+    if [ -n "$stage" ]; then
+        stage_tenant "$site_dir" "$tree" || die "Could not stage tenant $TENANT's files."
+        # Read by restore: the prefix the tables carry and where the tenant's
+        # files were served from, so its URLs can move to wp-content.
+        {
+            echo "tenant=$TENANT"
+            echo "table_prefix=$(fact prefix)"
+            echo "content_url=$(fact content_url)"
+            echo "uploads_url=$(fact uploads_url)"
+        } > "$tree/.cove-source"
+        log "Tenant $TENANT: tables $(fact prefix)*, files from ${TENANT_DIR:-the shared wp-content}."
+    fi
+
+    # A tenant, or a push to one, takes only the tables under its own prefix:
+    # the database is shared with every other site on the host.
+    local tables=""
+    if [ -n "$TENANT" ] || $ONLY_PREFIX; then
+        tables=$($WP db tables --all-tables-with-prefix --format=csv --path="$site_dir" --skip-plugins --skip-themes 2>/dev/null)
+        [ -n "$tables" ] || die "No tables found under this site's prefix."
+    fi
     if [ "$DB_DUMP" = native ]; then
-        $WP db export "$dump" --path="$site_dir" --add-drop-table \
-            --default-character-set=utf8mb4 --skip-plugins --skip-themes >&2 \
+        ( umask 077; $WP db export "$dump" --path="$site_dir" --add-drop-table \
+            --default-character-set=utf8mb4 ${tables:+"--tables=$tables"} --skip-plugins --skip-themes >&2 ) \
             || die "Database export failed."
     else
         log "  (no mysqldump — exporting through WordPress)"
-        wp_eval "$site_dir" php_dump_script "$dump" || die "Database export failed."
+        ( umask 077; wp_eval "$site_dir" php_dump_script "$dump" ${tables:+prefix} ) || die "Database export failed."
     fi
 
     log "Creating archive (${ARCHIVER})..."
-    ( cd "$parent" || exit 1
+    # Owner-only, like the dump inside it: for a WordPress in a subfolder,
+    # $parent is itself the web root. Archivers follow the staging folder's
+    # symlinks: zip does by default, tar with -h, PHP with create-follow.
+    ( umask 077; cd "$(dirname "$tree")" || exit 1
       case "$ARCHIVER" in
         zip)
             local -a zargs=(-rq "$archive" "$base")
@@ -366,25 +952,266 @@ cmd_backup() {
             zip "${zargs[@]}" ;;
         tar)
             local -a targs=()
+            [ -n "$stage" ] && targs+=(-h)
             for a in ${excludes[@]+"${excludes[@]}"}; do targs+=(--exclude="$base/$a"); done
             tar -czf "$archive" ${targs[@]+"${targs[@]}"} "$base" ;;
         php|phar)
-            local -a pargs=(create "$archive" "$site_dir")
+            local mode=create
+            [ -n "$stage" ] && mode=create-follow
+            local -a pargs=("$mode" "$archive" "$tree")
             for a in ${excludes[@]+"${excludes[@]}"}; do pargs+=("$a"); done
             wp_eval "$site_dir" php_archive_script "${pargs[@]}" ;;
-      esac ) || { rm -f "$dump"; die "Archive creation failed."; }
+      esac ) || die "Archive creation failed."
 
     rm -f "$dump"
     [ -f "$archive" ] || die "Archive was not created."
     echo "$archive"
 }
 
+# Import dump $2 into the site at $1, with the mysql client or through $wpdb.
+# WP-CLI's import carries on past a statement that fails and still reports
+# success, so IMPORT_ERRORS counts the statements the database refused.
+IMPORT_ERRORS=0
+db_load() {
+    local err rc=0
+    err=$(mktemp "${TMPDIR:-/tmp}/cove-import-XXXXXX") || return 1
+    if [ "$DB_LOAD" = native ]; then
+        $WP db import "$2" --path="$1" --skip-plugins --skip-themes >&2 2>"$err" || rc=$?
+    else
+        wp_eval "$1" php_load_script "$2" 2>"$err" || rc=$?
+    fi
+    cat "$err" >&2
+    IMPORT_ERRORS=$(grep -cE '^(ERROR [0-9]|WordPress database error)' "$err")
+    rm -f "$err"
+    return $rc
+}
+
+# MariaDB's dump tools (11.x, and 10.x point releases since mid-2024) start
+# every dump with /*M!999999\- enable the sandbox mode */, which MySQL's
+# client and older MariaDB clients refuse ("Unknown command '\-'"), so a site
+# dumped by Cove's MariaDB failed to import on a MySQL host. Asks the client
+# WP-CLI imports with whether it takes the line; when it doesn't, writes a
+# copy without it to $3. Prints the dump to import. $1 = site dir.
+dump_for_this_client() {
+    local site_dir="$1" sql="$2" out="$3"
+    if [ "$DB_LOAD" != native ] || ! head -c 200 "$sql" | head -1 | grep -q 'enable the sandbox mode'; then
+        echo "$sql"; return 0
+    fi
+    if printf '%s\n' '/*M!999999\- enable the sandbox mode */' 'SELECT 1;' \
+        | $WP db query --path="$site_dir" --skip-plugins --skip-themes >/dev/null 2>&1; then
+        echo "$sql"; return 0
+    fi
+    log "  (this database client doesn't take MariaDB's sandbox line; importing without it)"
+    ( umask 077; tail -n +2 "$sql" > "$out" ) || return 1
+    echo "$out"
+}
+
+# What a tenant restore needs to undo itself once it has changed anything:
+# the tenant's folder and where its previous files wait, whether the folder
+# is new, and a dump of its previous tables with their names.
+UNDO_SITE="" UNDO_DIR="" UNDO_OLD="" UNDO_CREATED=false UNDO_SQL="" UNDO_TABLES=""
+
+# Put tenant $TENANT back the way restore_tenant found it, then stop with $1.
+tenant_undo() {
+    local why="$1" ok=true sql keep
+    trap '' HUP INT TERM PIPE
+    log "$why Putting tenant $TENANT back as it was..."
+    if [ -n "$UNDO_OLD" ] && [ -e "$UNDO_OLD" ]; then
+        if [ -e "$UNDO_DIR" ]; then
+            mv "$UNDO_DIR" "$UNDO_OLD.failed" && rm -rf "$UNDO_OLD.failed"
+        fi
+        mv "$UNDO_OLD" "$UNDO_DIR" || { ok=false; log "  Could not put its files back. The previous ones are in $UNDO_OLD."; }
+    elif $UNDO_CREATED && [ -n "$UNDO_DIR" ]; then
+        rm -rf "$UNDO_DIR"
+    fi
+    if [ -n "$UNDO_SQL" ]; then
+        if sql=$(dump_for_this_client "$UNDO_SITE" "$UNDO_SQL" "$UNDO_SQL.client") \
+            && db_load "$UNDO_SITE" "$sql" && [ "$IMPORT_ERRORS" = 0 ] \
+            && wp_eval "$UNDO_SITE" php_drop_leftovers_script "$UNDO_TABLES" "stacked_${TENANT}_"; then
+            :
+        else
+            ok=false
+            keep="$HOME/cove-tenant-$TENANT-before-$(date +%Y%m%d-%H%M%S).sql"
+            ( umask 077; cp "$UNDO_SQL" "$keep" ) && log "  Could not put its tables back. They are saved in $keep."
+        fi
+    fi
+    $ok && die "$why Tenant $TENANT is back as it was."
+    die "$why Tenant $TENANT could not be put back completely (see above)."
+}
+
+# Restore the unpacked site in $2 (dump $3) into tenant $TENANT of the install
+# at $1: the tenant's tables, and the one folder that is its own. Core, the
+# main site and the other tenants are shared and stay as they are. Everything
+# that can refuse does so before anything is changed. $4 = scratch folder,
+# $5 = --url-to, then the --keep paths.
+restore_tenant() {
+    local site_dir="$1" src="$2" sql="$3" held="$4" url_to="$5"; shift 5
+    local dest_prefix content_url uploads_url
+    dest_prefix=$(fact prefix)
+    # Where the tenant serves its files from, read before the import replaces
+    # the options some of these are built from.
+    content_url=$(fact content_url)
+    uploads_url=$(fact uploads_url)
+
+    # The dump: tables renamed to the tenant's prefix, and refused outright if
+    # it would touch anything outside it. The database is every tenant's.
+    local src_prefix
+    src_prefix=$(sed -n 's/^table_prefix=//p' "$src/.cove-source" 2>/dev/null | head -1)
+    [ -n "$src_prefix" ] || src_prefix=$(read_table_prefix "$src/wp-config.php")
+    [ -n "$src_prefix" ] || src_prefix=$(infer_table_prefix_from_dump "$sql")
+    case "$src_prefix" in
+        ""|*[!A-Za-z0-9_]*) die "Could not tell which table prefix the archive's site uses. Nothing was changed." ;;
+    esac
+    if [ "$src_prefix" != "$dest_prefix" ]; then
+        log "Renaming tables from ${src_prefix}* to ${dest_prefix}*..."
+        rename_dump_prefix "$sql" "$src_prefix" "$dest_prefix" "$held/tenant.sql" \
+            || die "Could not rewrite the dump's table names. Nothing was changed."
+        sql="$held/tenant.sql"
+    fi
+    log "Checking the dump..."
+    wp_eval "$site_dir" php_dump_check_script "$sql" "$dest_prefix" "$held/tables.txt" "$held/dump-problem.txt" "tenant $TENANT" \
+        || die "Could not check the dump. Nothing was changed."
+    [ -s "$held/dump-problem.txt" ] && die "$(cat "$held/dump-problem.txt") Nothing was changed."
+    grep -qx "${dest_prefix}options" "$held/tables.txt" \
+        || die "The dump has no ${dest_prefix}options table once renamed. Nothing was changed."
+    sql=$(dump_for_this_client "$site_dir" "$sql" "$held/client.sql") \
+        || die "Could not prepare the dump for this host's database client. Nothing was changed."
+
+    # The tenant's tables as they are, dumped the way a backup dumps them, so
+    # a failed import can be undone.
+    log "Saving tenant $TENANT's current tables, in case the import fails..."
+    local before_tables
+    before_tables=$($WP db tables --all-tables-with-prefix --format=csv --path="$site_dir" --skip-plugins --skip-themes 2>/dev/null)
+    [ -n "$before_tables" ] || die "Could not list tenant $TENANT's tables. Nothing was changed."
+    printf '%s\n' "$before_tables" | tr ',' '\n' > "$held/before-tables.txt"
+    if [ "$DB_DUMP" = native ]; then
+        ( umask 077; $WP db export "$held/before.sql" --path="$site_dir" --add-drop-table \
+            --default-character-set=utf8mb4 --tables="$before_tables" --skip-plugins --skip-themes >&2 )
+    else
+        ( umask 077; wp_eval "$site_dir" php_dump_script "$held/before.sql" prefix )
+    fi || die "Could not save tenant $TENANT's current tables. Nothing was changed."
+    UNDO_SITE="$site_dir"
+    UNDO_TABLES="$held/before-tables.txt"
+
+    # Files: the tenant's own folder is built beside the live one and swapped
+    # in, so the site serves its old files right up until the swap.
+    local from=""
+    case "$TENANT_FILES" in
+        content) from="$src/wp-content" ;;
+        uploads)
+            from="$src/wp-content/uploads"
+            log "Plugins and themes are shared by every tenant on this host (hybrid files mode), so only uploads are replaced." ;;
+        none)
+            log "Plugins, themes and uploads are shared by every tenant on this host (shared files mode), so only the database is replaced." ;;
+    esac
+    if [ -n "$from" ]; then
+        [ -d "$from" ] || die "The archive has no ${from#"$src"/} folder. Nothing was changed."
+        local target="$TENANT_DIR" parent incoming old rel k inner
+        parent=$(dirname "$target")
+        incoming="$parent/.$(basename "$target").cove-incoming-$$"
+        old="$parent/.$(basename "$target").cove-old-$$"
+        log "Replacing ${target}..."
+        mkdir -p "$parent" && mkdir "$incoming" || die "Could not create $incoming."
+        cp -R "$from"/. "$incoming"/ || { rm -rf "$incoming"; die "Copying files failed. Nothing was changed."; }
+        # --keep paths are site-relative (wp-content/…). The tenant's own copy
+        # of each survives, as in a whole-site restore.
+        rel="${from#"$src"/}"
+        for k in "$@"; do
+            case "$k" in "$rel"/*) ;; *) continue ;; esac
+            inner="${k#"$rel"/}"
+            if [ -e "$target/$inner" ]; then
+                rm -rf "$incoming/$inner"
+                mkdir -p "$incoming/$(dirname "$inner")"
+                cp -Rp "$target/$inner" "$incoming/$inner"
+            fi
+        done
+        # From here on a failure, or the connection dropping, puts the
+        # tenant's previous files (kept aside until the end) back in place.
+        UNDO_DIR="$target"
+        trap 'tenant_undo "The restore was interrupted."' HUP INT TERM PIPE
+        if [ -e "$target" ]; then
+            mv "$target" "$old" || { rm -rf "$incoming"; die "Could not move $target aside. Nothing was changed."; }
+            UNDO_OLD="$old"
+        else
+            UNDO_CREATED=true
+        fi
+        if ! mv "$incoming" "$target"; then
+            rm -rf "$incoming"
+            tenant_undo "Could not move the new files into $target."
+        fi
+    fi
+    # (Again for the files modes that leave the folder alone.)
+    trap 'tenant_undo "The restore was interrupted."' HUP INT TERM PIPE
+
+    # Database: import, then drop the tenant's tables the archive doesn't
+    # have. Never `wp db reset` here: that empties the whole shared database.
+    log "Importing database..."
+    [ "$DB_LOAD" = native ] || log "  (no mysql client — importing through WordPress)"
+    UNDO_SQL="$held/before.sql"
+    db_load "$site_dir" "$sql" || tenant_undo "Database import failed."
+    [ "$IMPORT_ERRORS" = 0 ] || tenant_undo "The database refused $IMPORT_ERRORS statement(s) from the dump (above)."
+    wp_eval "$site_dir" php_drop_leftovers_script "$held/tables.txt" "$dest_prefix" \
+        || tenant_undo "Could not remove the tenant's old tables."
+    if [ "$src_prefix" != "$dest_prefix" ]; then
+        wp_eval "$site_dir" php_prefix_keys_script "$src_prefix" \
+            || tenant_undo "Could not rename the prefix-keyed role option and user meta."
+    fi
+    load_facts "$site_dir" || tenant_undo "WordPress did not boot as tenant $TENANT after the import."
+
+    # The tenant is in: nothing below fails the restore, so the way back goes.
+    trap - HUP INT TERM PIPE
+    [ -n "$UNDO_OLD" ] && rm -rf "$UNDO_OLD"
+    UNDO_OLD="" UNDO_SQL="" UNDO_CREATED=false
+
+    # URLs, in this tenant's tables only: wp-content links move to the
+    # tenant's own folder first, then the address changes over. Scheme-less,
+    # so http, https and protocol-relative links all follow.
+    if [ -n "$url_to" ]; then
+        local url_from from_content
+        url_from=$(fact raw_home)
+        if [ -n "$url_from" ]; then
+            rewrite_source_urls "$site_dir" "$src" "$url_from" --all-tables-with-prefix
+            from_content="${url_from#*:}/wp-content"
+            case "$TENANT_FILES" in
+                content)
+                    if [ "$from_content" != "${content_url#*:}" ]; then
+                        log "Rewriting $from_content/ -> ${content_url#*:}/"
+                        sr_own_tables "$site_dir" "$from_content/" "${content_url#*:}/"
+                    fi ;;
+                uploads)
+                    if [ "$from_content/uploads" != "${uploads_url#*:}" ]; then
+                        log "Rewriting $from_content/uploads/ -> ${uploads_url#*:}/"
+                        sr_own_tables "$site_dir" "$from_content/uploads/" "${uploads_url#*:}/"
+                    fi ;;
+            esac
+            if [ "$url_from" != "$url_to" ]; then
+                log "Rewriting URLs: $url_from -> $url_to"
+                sr_own_tables "$site_dir" "$url_from" "$url_to"
+            fi
+            $WP option update home "$url_to" --path="$site_dir" --skip-plugins --skip-themes >&2 2>/dev/null
+            $WP option update siteurl "$url_to" --path="$site_dir" --skip-plugins --skip-themes >&2 2>/dev/null
+        fi
+    fi
+
+    $WP cache flush --path="$site_dir" --skip-plugins --skip-themes >&2 2>/dev/null
+    log "Restore complete (tenant $TENANT)."
+}
+
 cmd_restore() {
     local site_dir="$1" archive="$2"; shift 2
     local url_to=""
+    local -a keeps=()
     local a
     for a in "$@"; do
-        case "$a" in --url-to=*) url_to="${a#--url-to=}" ;; esac
+        case "$a" in
+            --url-to=*) url_to="${a#--url-to=}" ;;
+            --keep=*)
+                a="${a#--keep=}"
+                case "/$a/" in
+                    *"/../"*|//*) die "--keep takes a path inside the site: $a" ;;
+                esac
+                keeps+=("$a") ;;
+        esac
     done
 
     [ -d "$site_dir" ] || die "Site directory not found: $site_dir"
@@ -411,11 +1238,28 @@ cmd_restore() {
     if [ ! -f "$site_dir/wp-config.php" ] && [ ! -f "$site_dir/wp-load.php" ] && [ ! -d "$site_dir/wp-includes" ]; then
         die "Refusing to restore over $site_dir: it does not look like a WordPress install."
     fi
+    # Push asks for this: replacing a WP Freighter install replaces every
+    # tenant on it. Checked from the files, so a host whose tenant list could
+    # not be read is still refused. (Pull does not ask: a whole host pulled
+    # into Cove is restored over Cove's own copy of it.)
+    if [ -z "$TENANT" ] && $REFUSE_FREIGHTER && is_freighter_host "$site_dir"; then
+        die "Refusing to restore over $site_dir: it runs WP Freighter, and the whole install holds every tenant's files and tables. Restore one tenant with --tenant=<id>. Nothing was changed."
+    fi
+    # A tenant is checked before anything is unpacked.
+    if [ -n "$TENANT" ]; then
+        load_facts "$site_dir" || die "WordPress did not boot as tenant $TENANT. Does it exist on this host?"
+        tenant_check || die "$TENANT_ERROR"
+    fi
 
-    local work
+    local work held
     work=$(mktemp -d "${TMPDIR:-/tmp}/cove-restore-XXXXXX") || die "mktemp failed"
+    # What the destination keeps (its wp-config.php, --keep paths) waits in a
+    # folder of its own: when the archive has no WordPress markers the whole
+    # of $work is copied into the site, and anything parked there would land
+    # in the web root — wp-config.php.keep included, served as plain text.
+    held=$(mktemp -d "${TMPDIR:-/tmp}/cove-keep-XXXXXX") || { rm -rf "$work"; die "mktemp failed"; }
     # shellcheck disable=SC2064
-    trap "rm -rf '$work'" EXIT
+    trap "rm -rf '$work' '$held'" EXIT
 
     log "Extracting archive (${EXTRACTOR})..."
     case "$EXTRACTOR" in
@@ -424,56 +1268,132 @@ cmd_restore() {
         php|phar) wp_eval "$site_dir" php_archive_script extract "$archive" "$work" ;;
     esac || die "Extraction failed."
 
-    # Archives carry a single top-level directory (the site folder). Descend
-    # into it when present so both shapes restore identically.
-    local src="$work"
-    local entries
-    entries=$(find "$work" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')
-    if [ "$entries" = "1" ]; then
-        local only
-        only=$(find "$work" -mindepth 1 -maxdepth 1)
-        [ -d "$only" ] && src="$only"
+    # The WordPress tree may sit at the archive root, one folder down (a
+    # site folder), or deeper (a Cove export's public/, Local's app/public/,
+    # a host backup's files/ or public_html/). Take the shallowest folder
+    # that holds wp-settings.php, else wp-config.php, else the old rule.
+    local src=""
+    local marker
+    for marker in wp-settings.php wp-config.php; do
+        src=$(find "$work" -maxdepth 5 -name "$marker" -not -path '*/wp-content/*' 2>/dev/null | awk '{ print length($0) "\t" $0 }' | sort -n | head -1 | cut -f2-)
+        [ -n "$src" ] && { src=$(dirname "$src"); break; }
+    done
+    if [ -z "$src" ]; then
+        src="$work"
+        local entries
+        entries=$(find "$work" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')
+        if [ "$entries" = "1" ]; then
+            local only
+            only=$(find "$work" -mindepth 1 -maxdepth 1)
+            [ -d "$only" ] && src="$only"
+        fi
     fi
 
+    # The dump can be anywhere too (db.sql beside public/, app/sql/local.sql,
+    # database/backup.sql). Prefer one outside wp-content — backup plugins
+    # leave old dumps in uploads — and the largest of those; .sql.gz is fine.
     local sql
-    sql=$(find "$src" -maxdepth 1 -name '*.sql' | head -1)
+    sql=$(find "$work" -maxdepth 6 -type f \( -name '*.sql' -o -name '*.sql.gz' \) -not -path '*/wp-content/*' -not -path '*/wp-includes/*' -not -path '*/wp-admin/*' 2>/dev/null | while IFS= read -r f; do printf '%s\t%s\n' "$(wc -c < "$f" | tr -d ' ')" "$f"; done | sort -rn | head -1 | cut -f2-)
+    [ -n "$sql" ] || sql=$(find "$work" -maxdepth 8 -type f \( -name '*.sql' -o -name '*.sql.gz' \) 2>/dev/null | while IFS= read -r f; do printf '%s\t%s\n' "$(wc -c < "$f" | tr -d ' ')" "$f"; done | sort -rn | head -1 | cut -f2-)
     [ -n "$sql" ] || die "No .sql file found in the archive."
+    case "$sql" in
+        *.gz)
+            log "Unpacking $(basename "$sql")..."
+            gunzip -c "$sql" > "$held/import.sql" || die "Could not unpack the SQL dump."
+            sql="$held/import.sql"
+            ;;
+    esac
+    if [ -f "$src/wp-config.php" ] && grep -Eq "define\(\s*['\"]MULTISITE['\"]\s*,\s*true" "$src/wp-config.php"; then
+        die "The archive is a multisite network, which import does not support yet."
+    fi
+    if [ -n "$TENANT" ]; then
+        restore_tenant "$site_dir" "$src" "$sql" "$held" "$url_to" ${keeps[@]+"${keeps[@]}"}
+        return
+    fi
 
     # Preserve the destination's own wp-config.php: its credentials are the
     # ones that work here. Shipping the source's would point the restored site
     # at a database that does not exist on this machine.
     local keep_config=""
     if [ -f "$site_dir/wp-config.php" ]; then
-        keep_config="$work/wp-config.php.keep"
+        keep_config="$held/wp-config.php.keep"
         cp "$site_dir/wp-config.php" "$keep_config"
     fi
 
+    # --keep paths (files or folders): the destination's own copy survives
+    # the swap, the same way wp-config.php does. `cove push` keeps the
+    # remote's mu-plugin of the same name as Cove's local-only helper, which
+    # never leaves the machine, and the host's own mu-plugins (Kinsta's).
+    local k
+    for k in ${keeps[@]+"${keeps[@]}"}; do
+        if [ -e "$site_dir/$k" ]; then
+            mkdir -p "$held/keep/$(dirname "$k")"
+            cp -Rp "$site_dir/$k" "$held/keep/$k"
+        fi
+    done
+
     log "Replacing files..."
     # Clear the destination except wp-config.php, then move the new tree in.
+    # Dumps at the top of the tree (the db_export-*.sql that backup packs
+    # there) are imported from where they sit, never copied into the web
+    # root, where a failed step below would have left them downloadable.
     find "$site_dir" -mindepth 1 -maxdepth 1 ! -name 'wp-config.php' -exec rm -rf {} + 2>/dev/null
     ( cd "$src" && find . -mindepth 1 -maxdepth 1 ! -name 'wp-config.php' \
+        ! -name '*.sql' ! -name '*.sql.gz' ! -name '.cove-source' \
         -exec cp -R {} "$site_dir/" \; ) || die "Copying files failed."
+    for k in ${keeps[@]+"${keeps[@]}"}; do
+        if [ -e "$held/keep/$k" ]; then
+            rm -rf "${site_dir:?}/$k"
+            mkdir -p "$site_dir/$(dirname "$k")"
+            cp -Rp "$held/keep/$k" "$site_dir/$k"
+        fi
+    done
     if [ -n "$keep_config" ]; then
         cp "$keep_config" "$site_dir/wp-config.php"
+
+        # Keeping the config also keeps its $table_prefix — almost always `wp_`
+        # from `cove add` — while the dump carries the source's tables under
+        # whatever prefix the source used. Left alone, WordPress looks for
+        # wp_options in a database full of xyz_options, and the URL rewrite
+        # below silently no-ops too, since it can't read `home` either (#7).
+        # The source's own config travelled in the archive even though it is
+        # never copied into place, so sync the prefix from it — or, failing
+        # that, from the dump's table names. A tenant's archive carries no
+        # config (the host's is the host's); its .cove-source says instead.
+        local src_prefix dest_prefix
+        src_prefix=$(sed -n 's/^table_prefix=//p' "$src/.cove-source" 2>/dev/null | head -1)
+        [ -n "$src_prefix" ] || src_prefix=$(read_table_prefix "$src/wp-config.php")
+        [ -n "$src_prefix" ] || src_prefix=$(infer_table_prefix_from_dump "$sql")
+        dest_prefix=$(read_table_prefix "$site_dir/wp-config.php")
+        if [ -n "$src_prefix" ] && [ "$src_prefix" != "$dest_prefix" ]; then
+            log "Setting \$table_prefix to '$src_prefix' to match the imported tables (was '${dest_prefix:-unset}')..."
+            $WP config set table_prefix "$src_prefix" --type=variable --path="$site_dir" \
+                --skip-plugins --skip-themes >&2 \
+                || die "Could not update \$table_prefix in wp-config.php."
+        fi
     fi
     rm -f "$site_dir"/*.sql
 
     log "Importing database..."
     if [ "$DB_LOAD" = native ]; then
+        sql=$(dump_for_this_client "$site_dir" "$sql" "$held/client.sql") \
+            || die "Could not prepare the dump for this host's database client."
         $WP db reset --yes --path="$site_dir" --skip-plugins --skip-themes >&2 \
             || die "Database reset failed."
-        $WP db import "$sql" --path="$site_dir" --skip-plugins --skip-themes >&2 \
-            || die "Database import failed."
     else
         log "  (no mysql client — importing through WordPress)"
         # The dump's DROP TABLE statements make a separate reset unnecessary,
         # which matters here because `wp db reset` also needs the native client.
-        wp_eval "$site_dir" php_load_script "$sql" || die "Database import failed."
     fi
+    db_load "$site_dir" "$sql" || die "Database import failed."
+    # Not fatal: a dump from a MySQL server with GTIDs sets @@GLOBAL.GTID_PURGED,
+    # which MariaDB refuses while everything else imports fine.
+    [ "$IMPORT_ERRORS" = 0 ] || log "⚠️  The database refused $IMPORT_ERRORS statement(s) from the dump (above). Check that the site's tables all arrived."
 
     if [ -n "$url_to" ]; then
         local url_from
         url_from=$($WP option get home --path="$site_dir" --skip-plugins --skip-themes 2>/dev/null)
+        rewrite_source_urls "$site_dir" "$src" "$url_from" --all-tables
         if [ -n "$url_from" ] && [ "$url_from" != "$url_to" ]; then
             log "Rewriting URLs: $url_from -> $url_to"
             $WP search-replace "$url_from" "$url_to" --all-tables --skip-columns=guid \
@@ -498,15 +1418,24 @@ for a in "$@"; do
     case "$a" in
         --quiet)    QUIET=true ;;
         --wp-cli=*) WP_CLI_PHAR="${a#--wp-cli=}" ;;
+        --tenant=*) TENANT="${a#--tenant=}" ;;
+        --only-prefix) ONLY_PREFIX=true ;;
+        --refuse-freighter) REFUSE_FREIGHTER=true ;;
         *)          ARGS+=("$a") ;;
     esac
 done
 set -- ${ARGS+"${ARGS[@]}"}
+# WP Freighter's bootstrap reads the tenant from the environment under WP-CLI,
+# so every wp call below runs as that tenant.
+if [ -n "$TENANT" ]; then
+    case "$TENANT" in *[!0-9]*) die "--tenant takes a WP Freighter tenant id (a number): $TENANT" ;; esac
+    export STACKED_SITE_ID="$TENANT"
+fi
 
 case "$SUB" in
     probe)   cmd_probe   "${1:-}" ;;
     backup)  [ $# -ge 1 ] || die "usage: backup <site_dir> [--exclude=GLOB]..."; cmd_backup  "$@" ;;
-    restore) [ $# -ge 2 ] || die "usage: restore <site_dir> <archive> [--url-to=URL]"; cmd_restore "$@" ;;
+    restore) [ $# -ge 2 ] || die "usage: restore <site_dir> <archive> [--url-to=URL] [--keep=PATH]..."; cmd_restore "$@" ;;
     *)       die "unknown subcommand: ${SUB:-<none>}" ;;
 esac
 COVE_TRANSFER_HELPER
@@ -546,7 +1475,7 @@ transfer_wp_cli_phar() {
     local phar="$cache_dir/wp-cli.phar"
     mkdir -p "$cache_dir"
     if [ ! -s "$phar" ]; then
-        curl -sL "$COVE_WP_CLI_PHAR_URL" -o "$phar" || return 1
+        curl -fsSL "$COVE_WP_CLI_PHAR_URL" -o "$phar" || { rm -f "$phar"; return 1; }
         [ -s "$phar" ] || { rm -f "$phar"; return 1; }
     fi
     echo "$phar"
@@ -575,23 +1504,71 @@ transfer_ensure_remote_wp_cli() {
     echo "--wp-cli=$remote_phar"
 }
 
-# `cove transfer probe [site]` — surface the capability ladder for debugging a
+# --- WP Freighter tenants (Cove side) -------------------------------------------
+
+# Tenant rows from a probe: "<id> TAB <domain> TAB <name>", one per line.
+transfer_probe_tenants() {
+    printf '%s\n' "$1" | sed -n 's/^tenant=//p'
+}
+
+# The id of the tenant --tenant names: an id, a domain (a URL works too) or a
+# tenant's name, matched against probe rows. Empty when nothing matches, and
+# one id per line when a domain or name is shared, so callers can refuse to
+# guess: a push to the wrong tenant replaces it.
+transfer_match_tenant() {
+    printf '%s\n' "$1" | awk -F'\t' -v w="$2" '
+        BEGIN { w = tolower(w); sub(/^[a-z]+:\/\//, "", w); sub(/\/.*$/, "", w); sub(/^www\./, "", w) }
+        { d = tolower($2); sub(/^www\./, "", d) }
+        $1 == w { id = $1 }
+        (d != "" && d == w) || ($3 != "" && tolower($3) == w) { m[++n] = $1 }
+        END { if (id != "") print id; else for (i = 1; i <= n; i++) print m[i] }'
+}
+
+# "15 (cove.run), 16 (beckon.run), …" for error messages.
+transfer_list_tenants() {
+    printf '%s\n' "$1" | awk -F'\t' 'NF { printf "%s%s (%s)", sep, $1, ($2 != "" ? $2 : $3); sep = ", " }'
+}
+
+# Pick a tenant with gum. $2 labels an extra first choice for the main site;
+# leave it empty to offer tenants only. Echoes an id, "main", or nothing.
+transfer_choose_tenant() {
+    local rows="$1" main_label="$2" choice id domain name
+    local -a options=()
+    [ -n "$main_label" ] && options+=("$main_label")
+    while IFS=$'\t' read -r id domain name; do
+        [ -n "$id" ] && options+=("Tenant $id · ${domain:-${name:-no domain}}")
+    done <<< "$rows"
+    choice=$(gum choose --header "This is a WP Freighter host. Which site?" "${options[@]}") || return 0
+    case "$choice" in
+        "Tenant "*) choice="${choice#Tenant }"; echo "${choice%% *}" ;;
+        "") ;;
+        *) echo main ;;
+    esac
+}
+
+# `cove transfer probe [site] [--tenant=<id>]` — surface the capability ladder
+# (and the site's prefix, folders and WP Freighter tenants) for debugging a
 # host that pull/push struggles with.
 cove_transfer() {
     local sub="${1:-}"; shift 2>/dev/null || true
     case "$sub" in
         probe)
-            local target="${1:-}"
+            local target="" a
+            local -a extra=()
+            for a in "$@"; do
+                case "$a" in
+                    --tenant=*) extra+=("$a") ;;
+                    *) target="$a" ;;
+                esac
+            done
             if [ -n "$target" ] && [[ "$target" != /* ]]; then
                 target="$SITES_DIR/${target%.localhost}.localhost/public"
             fi
             echo "🔎 Transfer capabilities (local)"
-            transfer_local probe "$target"
+            transfer_local probe "$target" ${extra[@]+"${extra[@]}"}
             ;;
         *)
-            echo "Usage: cove transfer probe [site]"
-            echo ""
-            echo "Reports which tools the backup/restore engine will use here."
+            cove_unknown_subcommand transfer "$sub" "probe"
             ;;
     esac
 }

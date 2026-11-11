@@ -1,0 +1,70 @@
+# `cove redis`: the Redis that Laravel sites keep their cache, sessions or
+# queue in. With no arguments, how it is; install sets it up (an app set up
+# with cove add --from that uses it does that too); start and stop; cli
+# opens redis-cli.
+cove_redis() {
+    # One Cove found running is started and stopped by whatever runs it.
+    case "${1:-}" in
+        start|stop)
+            if [ "$OS" = "macos" ] && cove_redis_configured && [ -z "$(config_get REDIS_FORMULA)" ]; then
+                echo "Cove uses the Redis it found running on 127.0.0.1:$(cove_redis_port); $1 it where it came from." >&2
+                exit 1
+            fi ;;
+    esac
+    case "${1:-}" in
+        ""|status)
+            if ! cove_redis_configured; then
+                echo "Redis isn't set up for Cove yet."
+                echo "It is when an app that uses it is set up (cove add myapp --from=…), or now with: cove redis install"
+                return 0
+            fi
+            local state="❌ Stopped" info="" cli
+            cli=$(command -v redis-cli || command -v valkey-cli)
+            if cove_redis_ready; then
+                state="✅ Running"
+                [ -n "$cli" ] && info=$("$cli" -h 127.0.0.1 -p "$(cove_redis_port)" info server 2>/dev/null | tr -d '\r' | sed -nE 's/^(redis|valkey)_version:(.*)$/\1 \2/p' | head -n 1)
+            fi
+            echo "  Redis:        $state${info:+ ($info)}"
+            echo "  Address:      127.0.0.1:$(cove_redis_port), no password (loopback only)"
+            if cove_redis_ready && [ -n "$cli" ]; then
+                local keys
+                keys=$("$cli" -h 127.0.0.1 -p "$(cove_redis_port)" info keyspace 2>/dev/null | grep '^db' | tr -d '\r')
+                if [ -n "$keys" ]; then echo "  Keys:         $keys"; fi
+            fi
+            ;;
+        install) ensure_redis ;;
+        start)
+            cove_redis_start
+            cove_redis_wait_ready "" 20 && echo "✅ Redis is running." || { echo "❌ Redis did not start." >&2; exit 1; }
+            ;;
+        stop)
+            cove_redis_configured || { echo "Redis isn't set up for Cove yet." >&2; exit 1; }
+            cove_redis_stop
+            echo "✅ Redis stopped. Laravel sites that keep their cache, sessions or queue in it fail until: cove redis start"
+            ;;
+        cli)
+            shift
+            # Setup and start messages on stderr, apart from redis-cli's output.
+            ensure_redis >&2 || exit 1
+            local cli
+            cli=$(command -v redis-cli || command -v valkey-cli) || { echo "❌ redis-cli isn't installed." >&2; exit 1; }
+            exec "$cli" -h 127.0.0.1 -p "$(cove_redis_port)" "$@"
+            ;;
+        -h|--help|help)
+            echo "Usage: cove redis [status|install|start|stop|cli [command…]]"
+            echo ""
+            echo "The Redis server Laravel sites use for their cache, sessions and queues. Cove"
+            echo "sets it up the first time a site needs it (Homebrew's redis on macOS, the"
+            echo "distro's redis or valkey on Linux), or uses one already running on 127.0.0.1:6379."
+            echo "Each site's keys carry its own prefix (cove:<site>:): a rename moves them and a"
+            echo "delete removes them."
+            echo ""
+            echo "  status       Whether it runs, its version and its keys (the default)."
+            echo "  install      Sets it up now."
+            echo "  start, stop  Starts or stops it. Redis is optional, so cove enable and cove"
+            echo "               disable leave it alone."
+            echo "  cli [args]   redis-cli on Cove's Redis."
+            ;;
+        *) echo "Usage: cove redis [status|install|start|stop|cli [command…]]" >&2; exit 1 ;;
+    esac
+}

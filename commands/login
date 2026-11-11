@@ -1,11 +1,182 @@
+# A site restored or copied in by hand keeps the address it had where it
+# came from: its home and siteurl options still name the live domain (or
+# Local's localhost:10003). WordPress builds the login link from them, so the
+# link opened that address, and so did every redirect after signing in.
+# Rewrite them to this site's own address, as `cove import` and `cove pull`
+# do, after saving the database to the site's private/ folder. Only a plain
+# single site: a multisite network keeps its domains in tables of its own, a
+# Minn Engine site has no WordPress to run search-replace, and WP_HOME or
+# WP_SITEURL win over the database anyway; those get a warning instead, as
+# does a copy of another Cove site still sharing that site's database. An
+# address the site answers on here (a mapping, its twin) is left alone.
+# Messages go to stderr with --plain, where stdout is the link.
+login_localize_urls() {
+    local site_name="$1" site_dir="$2" wp_cmd="$3" plain="$4"
+    local public_dir="$site_dir/public"
+    local fd=1 tmp_php facts tag multisite defined db_name home_url siteurl_url
+    local key url origin host m entry twin_domain twin_folder twin_as_site
+    local other_cfg backup local_url from to found v n path
+    local -a wpa=(--skip-plugins --skip-themes) foreign=() keys=() longer=()
+    [ "$plain" = true ] && fd=2
+    site_is_minn "$public_dir" && return 0
+    local_url=$(url_for "$site_name.localhost")
+    tmp_php=$(mktemp "${TMPDIR:-/tmp}/cove-login-XXXXXX") || return 0
+    # What WordPress itself sees, so a WP_HOME set in an included file or a
+    # MULTISITE spelled TRUE counts as much as one in wp-config.php.
+    login_facts_php > "$tmp_php"
+    facts=$( (cd "$public_dir" && $wp_cmd eval-file "$tmp_php" "${wpa[@]}" 2>/dev/null) | grep "^COVE"$'\t' | tail -n 1)
+    if [ -z "$facts" ]; then rm -f "$tmp_php"; return 0; fi
+    IFS=$'\t' read -r tag multisite defined db_name home_url siteurl_url <<< "$facts"
+    for key in home siteurl; do
+        url="$home_url"; [ "$key" = siteurl ] && url="$siteurl_url"
+        origin=$(printf '%s' "$url" | sed -nE 's~^([A-Za-z]+://[^/?#]+).*~\1~p')
+        host=$(printf '%s' "$origin" | sed -E 's~^[A-Za-z]+://~~; s~:[0-9]+$~~' | tr '[:upper:]' '[:lower:]')
+        [ -n "$host" ] || continue
+        [ "$host" = "$site_name.localhost" ] && continue
+        if [ -f "$site_dir/mappings" ]; then
+            grep -Fixq "$host" "$site_dir/mappings" && continue
+            while IFS= read -r m || [ -n "$m" ]; do
+                case "$m" in \*.*) [[ "$host" == *".${m#\*.}" ]] && continue 2 ;; esac
+            done < "$site_dir/mappings"
+        fi
+        if entry=$(site_twin "$site_dir"); then
+            IFS=$'\t' read -r twin_domain twin_folder twin_as_site <<< "$entry"
+            [ "$host" = "$twin_domain" ] || [ "$host" = "$twin_as_site" ] && continue
+        fi
+        keys+=("$key")
+        [[ " ${foreign[*]} " == *" $origin "* ]] || foreign+=("$origin")
+    done
+    if [ ${#foreign[@]} -eq 0 ]; then rm -f "$tmp_php"; return 0; fi
+
+    if [ "$multisite" = 1 ] || [ "$defined" = 1 ]; then
+        echo "⚠️  $site_name's URLs name ${foreign[*]}, so signing in can land on that address. Its configuration sets them (multisite, WP_HOME or WP_SITEURL), so Cove left them alone." >&"$fd"
+        rm -f "$tmp_php"; return 0
+    fi
+    # A folder copied from another Cove site still uses that site's database:
+    # rewriting it would move the original to this address.
+    for origin in "${foreign[@]}"; do
+        host=$(printf '%s' "${origin#*://}" | sed -E 's~:[0-9]+$~~' | tr '[:upper:]' '[:lower:]')
+        other_cfg="$SITES_DIR/$host/public/wp-config.php"
+        case "$host" in *.localhost) ;; *) continue ;; esac
+        [ -f "$other_cfg" ] || continue
+        if grep -Fq "'$db_name'" "$other_cfg" || grep -Fq "\"$db_name\"" "$other_cfg"; then
+            echo "⚠️  $site_name's stored URLs name $origin, and it shares that site's database ($db_name), so Cove left them alone: a rewrite would break ${host%.localhost}. 'cove clone ${host%.localhost} <name>' makes a copy with a database of its own." >&"$fd"
+            rm -f "$tmp_php"; return 0
+        fi
+    done
+
+    backup="$site_dir/private/database-before-url-rewrite-$(date +%Y%m%d-%H%M%S).sql"
+    mkdir -p "$site_dir/private"
+    echo "🔧 $site_name's stored URLs still name ${foreign[*]}, so the login link would open that address, not this site. Rewriting them to $local_url..." >&"$fd"
+    if ! (umask 077; cd "$public_dir" && $wp_cmd db export "$backup" "${wpa[@]}" >/dev/null 2>&1); then
+        rm -f "$backup" "$tmp_php"
+        echo "⚠️  Couldn't save the database first, so the URLs were left alone." >&"$fd"
+        return 0
+    fi
+    to="//${local_url#*://}"
+    for origin in "${foreign[@]}"; do
+        from="//${origin#*://}"
+        # A plain search for //example.com also matches //example.com.au.
+        # Park every longer host that starts with it, replace, put them back.
+        login_longer_hosts_php > "$tmp_php"
+        found=$( (cd "$public_dir" && $wp_cmd eval-file "$tmp_php" "$from" "${wpa[@]}" 2>/dev/null) | grep '^//')
+        longer=()
+        while IFS= read -r v; do [ -n "$v" ] && longer+=("$v"); done <<< "$found"
+        n=0
+        for v in ${longer[@]+"${longer[@]}"}; do
+            n=$((n + 1))
+            login_search_replace "$public_dir" "$wp_cmd" "$v" "//cove-keep-$n.invalid"
+        done
+        login_search_replace "$public_dir" "$wp_cmd" "$from" "$to"
+        n=0
+        for v in ${longer[@]+"${longer[@]}"}; do
+            n=$((n + 1))
+            login_search_replace "$public_dir" "$wp_cmd" "//cove-keep-$n.invalid" "$v"
+        done
+    done
+    rm -f "$tmp_php"
+    # Set outright too (search-replace keeps an http:// scheme, and Cove
+    # serves https), but only the ones that named another address.
+    for key in "${keys[@]}"; do
+        url=$( (cd "$public_dir" && $wp_cmd option get "$key" "${wpa[@]}" 2>/dev/null) )
+        path=$(printf '%s' "$url" | sed -nE 's~^[A-Za-z]+://[^/?#]+(/[^?#]*)?.*$~\1~p')
+        (cd "$public_dir" && $wp_cmd option update "$key" "$local_url${path%/}" "${wpa[@]}" >/dev/null 2>&1)
+    done
+    (cd "$public_dir" && $wp_cmd cache flush "${wpa[@]}" >/dev/null 2>&1)
+    echo "   Done. The database from before is in $site_name.localhost/private/$(basename "$backup")." >&"$fd"
+}
+
+login_search_replace() {
+    (cd "$1" && $2 search-replace "$3" "$4" --all-tables-with-prefix --skip-columns=guid --skip-plugins --skip-themes --quiet >/dev/null 2>&1)
+}
+
+login_facts_php() {
+cat << 'PHPFACTS'
+<?php
+echo "COVE\t", is_multisite() ? 1 : 0, "\t", ( defined( 'WP_HOME' ) || defined( 'WP_SITEURL' ) ) ? 1 : 0, "\t", DB_NAME, "\t", get_option( 'home' ), "\t", get_option( 'siteurl' ), "\n";
+PHPFACTS
+}
+
+# $args[0] = "//host". Every longer host in the site's tables that starts with
+# it (//example.com.au and //example.community for //example.com), longest
+# first, so a search-replace of the shorter one can leave them as they are.
+login_longer_hosts_php() {
+cat << 'PHPHOSTS'
+<?php
+global $wpdb;
+$needle = $args[0];
+$like   = '%' . $wpdb->esc_like( $needle ) . '%';
+$re     = '~' . preg_quote( $needle, '~' ) . '(?:[A-Za-z0-9-]|\.[A-Za-z0-9])[A-Za-z0-9.-]*~';
+$found  = array();
+foreach ( $wpdb->get_col( $wpdb->prepare( 'SHOW TABLES LIKE %s', $wpdb->esc_like( $wpdb->prefix ) . '%' ) ) as $table ) {
+    $table = str_replace( '`', '``', $table );
+    foreach ( (array) $wpdb->get_results( "SHOW COLUMNS FROM `$table`" ) as $col ) {
+        if ( 'guid' === $col->Field || ! preg_match( '/char|text|blob|json/i', $col->Type ) ) { continue; }
+        $field = str_replace( '`', '``', $col->Field );
+        foreach ( (array) $wpdb->get_col( $wpdb->prepare( "SELECT `$field` FROM `$table` WHERE `$field` LIKE %s", $like ) ) as $value ) {
+            if ( preg_match_all( $re, (string) $value, $m ) ) {
+                foreach ( $m[0] as $host ) {
+                    $host = rtrim( $host, '.-' );
+                    if ( $host !== $needle ) { $found[ $host ] = true; }
+                }
+            }
+        }
+    }
+}
+$hosts = array_keys( $found );
+usort( $hosts, function ( $a, $b ) { return strlen( $b ) - strlen( $a ); } );
+foreach ( $hosts as $host ) { echo $host, "\n"; }
+PHPHOSTS
+}
+
 cove_login() {
-    local site_name="$1"
-    local user_identifier="$2" # Optional second argument for the user
+    local site_name=""
+    local user_identifier="" # Optional: the user to log in as
+    local subsite_url=""     # Optional: a subsite of a multisite network
+    local plain=false        # --plain: print only the URL, for scripts and agents
+    local to=""              # --to: a Laravel site's page to land on
+    local arg
+    for arg in "$@"; do
+        case "$arg" in
+            --url=*) subsite_url="${arg#*=}" ;;
+            --to=*) to="${arg#*=}" ;;
+            --user=*) user_identifier="${arg#*=}" ;;
+            --plain|--url-only) plain=true ;;
+            -*)
+                gum style --foreground red "❌ Error: Unknown option '$arg'."
+                echo "Usage: cove login <site> [<user>] [--url=<subsite-url>] [--to=<path>] [--plain]"
+                exit 1
+                ;;
+            *)
+                if [ -z "$site_name" ]; then site_name="$arg"; elif [ -z "$user_identifier" ]; then user_identifier="$arg"; fi
+                ;;
+        esac
+    done
 
     # 1. Validate that a site name was provided.
     if [ -z "$site_name" ]; then
         gum style --foreground red "❌ Error: A site name is required."
-        echo "Usage: cove login <site> [<user>]"
+        echo "Usage: cove login <site> [<user>] [--url=<subsite-url>] [--to=<path>] [--plain]"
         exit 1
     fi
 
@@ -27,55 +198,139 @@ cove_login() {
 
     # 2. Check if the site exists and is a WordPress installation.
     if [ ! -d "$site_dir" ] || [ ! -f "$public_dir/wp-config.php" ]; then
-        gum style --foreground red "❌ Error: WordPress site '$site_name.localhost' not found."
-        exit 1
+        if site_is_laravel "$site_dir"; then
+            cove_login_laravel "$site_name" "$user_identifier" "$to" "$plain"
+            return
+        fi
+        site_not_found "$site_name" "WordPress and Laravel"
     fi
+
+    # --url picks a subsite of a multisite network: wp-cli then runs in that
+    # site's context, so the minted link lands on ITS wp-login.php and its
+    # admin list is consulted. The URL must be one the network actually
+    # serves, so a typo cannot quietly mint a link for the main site.
+    local url_flag=()
+    local label="$site_name.localhost"
+    if [ -n "$subsite_url" ]; then
+        local wanted="${subsite_url%/}/"
+        local known
+        known=$( (cd "$public_dir" && $wp_cmd site list --field=url --skip-plugins --skip-themes 2>/dev/null) )
+        if [ -z "$known" ]; then
+            gum style --foreground red "❌ Error: '$site_name.localhost' is not a multisite network, so --url does not apply."
+            exit 1
+        fi
+        if ! printf '%s\n' "$known" | grep -Fxq "$wanted"; then
+            gum style --foreground red "❌ Error: '$subsite_url' is not a site on the '$site_name.localhost' network." "Run 'cove network $site_name' to list its sites."
+            exit 1
+        fi
+        url_flag=(--url="$wanted")
+        label="$wanted"
+    fi
+
+    [ -z "$subsite_url" ] && login_localize_urls "$site_name" "$site_dir" "$wp_cmd" "$plain"
 
     local admin_to_login
     if [ -n "$user_identifier" ]; then
-        echo "🔎 Verifying user '$user_identifier' for '$site_name.localhost'..."
+        [ "$plain" = true ] || echo "🔎 Verifying user '$user_identifier' for '$label'..."
         local user_roles
-        user_roles=$( (cd "$public_dir" && $wp_cmd user get "$user_identifier" --field=roles --format=json --skip-plugins --skip-themes 2>/dev/null) )
+        user_roles=$( (cd "$public_dir" && $wp_cmd user get "$user_identifier" --field=roles --format=json "${url_flag[@]}" --skip-plugins --skip-themes 2>/dev/null) )
 
         if [ -z "$user_roles" ]; then
             gum style --foreground red "❌ Error: User '$user_identifier' not found on this site."
             exit 1
         fi
 
-        if ! echo "$user_roles" | grep -q "administrator"; then
-            gum style --foreground red "❌ Error: User '$user_identifier' is not an administrator."
-            exit 1
+        # A named user may hold any role: logging in as an editor or a
+        # subscriber is how a role's view of the site gets tested. Say so
+        # when it is not an administrator (a super admin may hold no role
+        # on a subsite at all).
+        if ! echo "$user_roles" | grep -q "administrator" && ! (cd "$public_dir" && $wp_cmd super-admin list --skip-plugins --skip-themes 2>/dev/null | grep -Fxq "$user_identifier"); then
+            echo "⚠️  '$user_identifier' is not an administrator (roles: $(echo "$user_roles" | tr -d '[]"' ))."
         fi
         
         admin_to_login="$user_identifier"
-        echo "✅ User '$admin_to_login' verified."
+        [ "$plain" = true ] || echo "✅ User '$admin_to_login' verified."
     else
-        echo "🔎 Finding an administrator for '$site_name.localhost'..."
-        admin_to_login=$( (cd "$public_dir" && $wp_cmd user list --role=administrator --field=user_login --format=csv --skip-plugins --skip-themes | head -n 1) )
+        [ "$plain" = true ] || echo "🔎 Finding an administrator for '$label'..."
+        admin_to_login=$( (cd "$public_dir" && $wp_cmd user list --role=administrator --field=user_login --format=csv "${url_flag[@]}" --skip-plugins --skip-themes | head -n 1) )
+        # A subsite with no administrator of its own still has the network's
+        # super admins.
+        if [ -z "$admin_to_login" ] && [ -n "$subsite_url" ]; then
+            admin_to_login=$( (cd "$public_dir" && $wp_cmd super-admin list --skip-plugins --skip-themes 2>/dev/null | head -n 1) )
+        fi
 
         if [ -z "$admin_to_login" ]; then
             gum style --foreground red "❌ Error: Could not find any administrator users for this site."
             exit 1
         fi
-        echo "✅ Found admin: '$admin_to_login'."
+        [ "$plain" = true ] || echo "✅ Found admin: '$admin_to_login'."
     fi
 
     # 3. Refresh the MU-plugin before generating the URL. Always overwrite
     # the file so sites created with older Cove versions pick up changes to
     # the plugin (token format, query-arg name, etc.) without needing a
     # re-add. The file is small and idempotent to regenerate.
-    inject_mu_plugin "$public_dir"
+    if [ "$plain" = true ]; then inject_mu_plugin "$public_dir" >/dev/null 2>&1; else inject_mu_plugin "$public_dir"; fi
 
     # 4. Generate the login URL.
-    echo "   Generating login link..."
+    [ "$plain" = true ] || echo "   Generating login link..."
     local login_url
-    login_url=$( (cd "$public_dir" && $wp_cmd user login "$admin_to_login" --skip-plugins --skip-themes) )
+    login_url=$( (cd "$public_dir" && $wp_cmd user login "$admin_to_login" "${url_flag[@]}" --skip-plugins --skip-themes) )
 
     # 5. Display the final URL or an error message.
-    if [ -n "$login_url" ]; then
+    if [ -n "$login_url" ] && [ "$plain" = true ]; then
+        echo "$login_url"
+    elif [ -n "$login_url" ]; then
         gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "🔗 One-Time Login URL for '$admin_to_login'" "$login_url"
     else
         gum style --foreground red "❌ Error: Failed to generate the login link after all checks."
         exit 1
     fi
+}
+# A one-time sign-in link for a Laravel site. The token waits five minutes
+# in ~/Cove/cache/laravel-login (this user's only); the prepend Cove runs
+# before every request (create_whoops_bootstrap) takes it on a request from
+# this machine, boots the app and signs the user in through the app's own
+# auth guard: the user named (an id or an email), or the first one. Then it
+# goes on to --to, the app's dashboard route, or the home page.
+cove_login_laravel() {
+    local site_name="$1" who="$2" to="$3" plain="$4" dir="$COVE_DIR/cache/laravel-login" token url
+    if [ -n "$who" ] && ! [[ "$who" =~ ^[A-Za-z0-9._@+-]{1,120}$ ]]; then
+        gum style --foreground red "❌ Error: '$who' is not a user id or email." >&2
+        exit 1
+    fi
+    if [ -n "$to" ] && { ! [[ "$to" =~ ^/[A-Za-z0-9._~/?=\&%:+,@!-]*$ ]] || [[ "$to" == //* ]]; }; then
+        gum style --foreground red "❌ Error: --to is a path on the site, such as /admin." >&2
+        exit 1
+    fi
+    # Said here, not on the page the link opens: an app with no users yet,
+    # without the one named, or not migrated. Anything else (a guard that
+    # isn't Eloquent's) is left to the sign-in route.
+    local check
+    check=$(COVE_LU_WHO="$who" laravel_users_run "$site_name" check)
+    case "$check" in
+        *'"total":0,'*)
+            gum style --foreground red "❌ Error: $site_name has no users yet. Add one: cove laravel $site_name user add you@example.com" >&2
+            exit 1 ;;
+        *'"found":false'*)
+            gum style --foreground red "❌ Error: No user '$who' in $site_name. List them: cove laravel $site_name users" >&2
+            exit 1 ;;
+        *'"code":"no_table"'*)
+            gum style --foreground red "❌ Error: $site_name has no users table yet: run its migrations (cove artisan $site_name migrate)." >&2
+            exit 1 ;;
+    esac
+    mkdir -p "$dir" && chmod 700 "$dir" || exit 1
+    find "$dir" -type f -mmin +10 -delete 2>/dev/null
+    token=$(openssl rand -hex 16 2>/dev/null)
+    [[ "$token" =~ ^[0-9a-f]{32}$ ]] || token=$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')
+    # Every value was checked above: none holds a quote or a backslash.
+    ( umask 077; printf '{"site":"%s","user":"%s","to":"%s","expires":%s}\n' "$site_name" "$who" "$to" "$(( $(date +%s) + 300 ))" > "$dir/$token" ) || exit 1
+    url="$(url_for "$site_name.localhost")/__cove/login/$token"
+    if [ "$plain" = true ]; then
+        echo "$url"
+        return
+    fi
+    local as="$who"
+    [ -n "$as" ] || as="the app's first user"
+    gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "🔑 One-time login for $site_name.localhost" "$url" "Signs in as $as; works once, within five minutes, from this machine."
 }

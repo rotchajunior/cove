@@ -1,12 +1,27 @@
 cove_list() {
-    local show_totals=false
-    if [[ "$1" == "--totals" ]]; then
-        show_totals=true
+    local show_totals=false format="table"
+    local arg
+    for arg in "$@"; do
+        case "$arg" in
+            --totals) show_totals=true ;;
+            --format=*) format="${arg#*=}" ;;
+            --json) format="json" ;;
+            *)
+                gum style --foreground red "❌ Error: Unknown option '$arg'." "Usage: cove list [--totals] [--format=json]" >&2
+                exit 1 ;;
+        esac
+    done
+    if [ "$format" != table ] && [ "$format" != json ]; then
+        gum style --foreground red "❌ Error: Unknown format '$format'." "Use --format=json, or leave it out for the table." >&2
+        exit 1
     fi
+    # Colour only for a terminal, and never with NO_COLOR set (no-color.org).
+    local color=0
+    [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && color=1
 
     # PHP script to find, sort, and format the site list with box-drawing characters
     local php_output
-    php_output=$(SITES_DIR="$SITES_DIR" SHOW_TOTALS="$show_totals" HTTPS_PORT_SUFFIX="$(https_port_suffix)" WPVER_CACHE="$COVE_WPVER_CACHE" frankenphp php-cli -r '
+    php_output=$(SITES_DIR="$SITES_DIR" LIST_COLOR="$color" SHOW_TOTALS="$show_totals" LIST_FORMAT="$format" HTTPS_PORT_SUFFIX="$(https_port_suffix)" WPVER_CACHE="$COVE_WPVER_CACHE" frankenphp php-cli -r '
         function getDirectorySize(string $path): int {
             if (!is_dir($path)) return 0;
             $total_size = 0;
@@ -68,27 +83,49 @@ cove_list() {
 
         $sites = [];
         $items = scandir($sites_dir);
+        // `cove demo`: only the sites named in ~/Cove/demo.
+        $demo = @file(getenv("HOME") . "/Cove/demo", FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
 
         foreach ($items as $item) {
             if ($item === "." || $item === "..") continue;
+            if ($demo && !in_array(str_replace(".localhost", "", $item), array_map("trim", $demo), true)) continue;
             $site_path = $sites_dir . "/" . $item;
             if (is_dir($site_path)) {
                 $public_path = $site_path . "/public";
-                $size = $show_totals && is_dir($public_path) ? formatSize(getDirectorySize($public_path)) : null;
+                // A Laravel site is its whole folder (the project), not just public/.
+                $is_laravel = is_file($site_path . "/artisan") && is_file($site_path . "/bootstrap/app.php") && is_file($public_path . "/index.php");
+                $laravel_head = $is_laravel ? @file_get_contents($site_path . "/vendor/laravel/framework/src/Illuminate/Foundation/Application.php", false, null, 0, 16384) : false;
+                $measured = $is_laravel ? $site_path : $public_path;
+                $size = $show_totals && is_dir($measured) ? formatSize(getDirectorySize($measured)) : null;
                 $version = wpVersion($public_path);
                 $status = $version !== null ? ($status_map[$version] ?? null) : null;
+                // The rule Minn Engine uses itself: its install record, or the engine
+                // at the webroot with no WordPress loader beside it.
+                $is_minn = is_file($public_path . "/.minn-install.php") || (is_file($public_path . "/minn/bootstrap.php") && !is_file($public_path . "/wp-load.php"));
+                $minn_head = $is_minn ? @file_get_contents($public_path . "/minn/bootstrap.php", false, null, 0, 8192) : false;
+                if ($is_minn) $status = null; // none of that WordPress release runs on Minn
                 $sites[] = [
                     "name" => str_replace(".localhost", "", $item),
                     "domain" => "https://" . $item . $port_suffix,
-                    "type" => file_exists($site_path . "/public/wp-config.php") ? "WordPress" : "Plain",
+                    "type" => file_exists($site_path . "/multisite") ? "Multisite" : ($is_minn ? "Minn" : ($is_laravel ? "Laravel" : (file_exists($site_path . "/public/wp-config.php") ? "WordPress" : "Plain"))),
+                    "laravel_version" => ($laravel_head !== false && preg_match("/const VERSION = \x27([^\x27]+)\x27/", $laravel_head, $lm)) ? $lm[1] : null,
+                    "minn_version" => ($minn_head !== false && preg_match("/MINN_ENGINE_VERSION\x27, \x27([^\x27]+)\x27/", $minn_head, $mm)) ? $mm[1] : null,
                     "size" => $size,
+                    "size_bytes" => $show_totals && is_dir($measured) ? getDirectorySize($measured) : null,
+                    "wp_version" => $version,
+                    "wp_status" => $status,
+                    "path" => $site_path,
+                    "multisite" => file_exists($site_path . "/multisite") ? trim((string) @file_get_contents($site_path . "/multisite")) : null,
                     // "!" marks a release wp.org considers insecure. Local sites
                     // are not exposed, so this is a nudge rather than an alarm.
                     // ASCII only: str_pad counts bytes, so a multibyte dash here
                     // would under-pad the column and skew the box border.
                     "wp" => $version === null ? "-" : $version . ($status === "insecure" ? " !" : ""),
                     // Per-site PHP pin (`cove php`); "-" = Cove default PHP.
-                    "php" => is_file($site_path . "/php_version") ? trim((string) @file_get_contents($site_path . "/php_version")) : "-",
+                    // The PHP the site runs on: a `cove php` pin, else the Cove default
+                    // (this script runs under it, so PHP_VERSION is that).
+                    "php" => is_file($site_path . "/php_version") ? trim((string) @file_get_contents($site_path . "/php_version")) . " pin" : preg_replace("/^(\\d+\\.\\d+).*$/", "$1", PHP_VERSION),
+                    "php_pinned" => is_file($site_path . "/php_version"),
                 ];
             }
         }
@@ -98,6 +135,11 @@ cove_list() {
         }
 
         // Sort the array: first by type, then by name
+        if (getenv("LIST_FORMAT") === "json") {
+            usort($sites, fn($a, $b) => strcmp($a["name"], $b["name"]));
+            echo json_encode(array_map(fn($s) => ["name" => $s["name"], "domain" => $s["domain"], "type" => $s["type"], "multisite" => $s["multisite"], "wp_version" => $s["wp_version"], "minn_version" => $s["minn_version"], "laravel_version" => $s["laravel_version"], "wp_status" => $s["wp_status"], "php" => preg_replace("/ pin$/", "", $s["php"]), "php_pinned" => $s["php_pinned"], "path" => $s["path"], "size_bytes" => $s["size_bytes"]], $sites), JSON_UNESCAPED_SLASHES) . "\n";
+            exit;
+        }
         array_multisort(
             array_column($sites, "type"), SORT_ASC,
             array_column($sites, "name"), SORT_ASC,
@@ -117,18 +159,25 @@ cove_list() {
         $type_width = 9 + $gap; // "WordPress" + gap
 
         // Sized from the content: versions run from "6.4" to "7.0-RC4 !".
+        // The Version column: what the site runs, WordPress or Laravel or Minn.
+        foreach ($sites as &$site) {
+            if ($site["type"] === "Laravel") $site["wp"] = $site["laravel_version"] ?? "-";
+            elseif ($site["type"] === "Minn") $site["wp"] = $site["minn_version"] ?? "-";
+        }
+        unset($site);
         $wp_width = max(array_map(fn($s) => strlen($s["wp"]), $sites));
-        $wp_width = max($wp_width, 2) + $gap;
+        $wp_width = max($wp_width, 7) + $gap;
 
         $php_width = max(array_map(fn($s) => strlen($s["php"]), $sites));
         $php_width = max($php_width, 3) + $gap;
 
         $size_width = $show_totals ? 11 : 0;
 
-        // ANSI colors
-        $pink = "\033[38;5;212m";
-        $dim = "\033[2m";
-        $reset = "\033[0m";
+        // ANSI colors, for a terminal only
+        $color = getenv("LIST_COLOR") === "1";
+        $pink = $color ? "\033[38;5;212m" : "";
+        $dim = $color ? "\033[2m" : "";
+        $reset = $color ? "\033[0m" : "";
 
         // Box drawing characters
         $tl = "╭"; $tr = "╮"; $bl = "╰"; $br = "╯";
@@ -146,7 +195,7 @@ cove_list() {
         $bot_line = $pink . $bl . str_repeat($h, $inner_width) . $br . $reset;
 
         // Header row (white text)
-        $header = $pink . $v . $reset . " " . str_pad("Name", $name_width - 1) . str_pad("Domain", $domain_width) . str_pad("Type", $type_width) . str_pad("WP", $wp_width) . str_pad("PHP", $php_width);
+        $header = $pink . $v . $reset . " " . str_pad("Name", $name_width - 1) . str_pad("Domain", $domain_width) . str_pad("Type", $type_width) . str_pad("Version", $wp_width) . str_pad("PHP", $php_width);
         if ($show_totals) {
             $header .= str_pad("Size", $size_width);
         }
@@ -173,6 +222,11 @@ cove_list() {
         echo $bot_line . "\n";
     ')
 
+    if [ "$format" == "json" ]; then
+        # Scripts and agents: the JSON array and nothing else.
+        echo "${php_output:-[]}"
+        return
+    fi
     if [ -z "$php_output" ]; then
         gum style --padding "1 2" "No sites found. Add one with 'cove add <name>'."
     else

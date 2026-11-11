@@ -1,0 +1,337 @@
+# Site previews: a headless capture of a site's front page by whichever
+# Chromium-family browser is installed (Chrome, Chromium, Brave, Edge, Arc,
+# Vivaldi). Cove ships no renderer of its own; when none is found the
+# dashboard says so instead of showing a preview.
+
+SCREENSHOTS_DIR="${SCREENSHOTS_DIR:-$COVE_DIR/cache/screenshots}"
+# Where capture profiles live. macOS sets TMPDIR with a trailing slash;
+# one form for both mktemp and find, so a path names the same processes.
+SHOT_TMP="${TMPDIR:-/tmp}"; SHOT_TMP="${SHOT_TMP%/}"
+
+find_headless_browser() {
+    local c
+    if [ "$(uname -s)" == "Darwin" ]; then
+        for c in \
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
+            "$HOME/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
+            "/Applications/Chromium.app/Contents/MacOS/Chromium" \
+            "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser" \
+            "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge" \
+            "/Applications/Arc.app/Contents/MacOS/Arc" \
+            "/Applications/Vivaldi.app/Contents/MacOS/Vivaldi" \
+            "/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary"; do
+            [ -x "$c" ] && { echo "$c"; return 0; }
+        done
+    fi
+    for c in google-chrome google-chrome-stable chromium chromium-browser brave-browser microsoft-edge microsoft-edge-stable vivaldi; do
+        command -v "$c" >/dev/null 2>&1 && { command -v "$c"; return 0; }
+    done
+    # Flatpak and snap Chromium on Linux desktops.
+    if command -v flatpak >/dev/null 2>&1 && flatpak info org.chromium.Chromium >/dev/null 2>&1; then
+        echo "flatpak run org.chromium.Chromium"; return 0
+    fi
+    return 1
+}
+
+# True when nobody has touched the keyboard or mouse for a while — the
+# sweep from the watchdog only runs then. Unknown platforms count as idle.
+cove_user_is_idle() {
+    local secs
+    if [ "$(uname -s)" == "Darwin" ]; then
+        secs=$(ioreg -c IOHIDSystem 2>/dev/null | awk '/HIDIdleTime/ {print int($NF/1000000000); exit}')
+        [ -n "$secs" ] && [ "$secs" -ge 90 ] && return 0
+        [ -n "$secs" ] && return 1
+        return 0
+    fi
+    if command -v xprintidle >/dev/null 2>&1; then
+        secs=$(( $(xprintidle 2>/dev/null || echo 0) / 1000 ))
+        [ "$secs" -ge 90 ] && return 0 || return 1
+    fi
+    return 0
+}
+
+# Stop one capture's browser. Every Chrome helper carries the profile path
+# in its arguments, so the path names the whole tree: TERM it, give it a
+# moment, then KILL whatever ignored that. Never an unbounded `wait` — a
+# headless Chrome that ignores SIGTERM once held a process for an hour.
+cove_screenshot_stop() {
+    local profile="$1"
+    [ -n "$profile" ] || return 0
+    pkill -TERM -f -- "$profile" 2>/dev/null
+    local i=0
+    while [ $i -lt 30 ] && pgrep -f -- "$profile" >/dev/null 2>&1; do sleep 0.1; i=$((i + 1)); done
+    if pgrep -f -- "$profile" >/dev/null 2>&1; then
+        pkill -KILL -f -- "$profile" 2>/dev/null
+        sleep 0.2
+    fi
+}
+
+# Strays from earlier runs: capture browsers whose profile is older than
+# three minutes (no capture takes that long), their profile directories,
+# and any capture lock file that outlived its capture.
+cove_screenshot_reap() {
+    local d
+    # Only folders this user made, named exactly the way mktemp names them.
+    # On Linux $SHOT_TMP is the shared /tmp, and each name here becomes a
+    # pkill -f pattern: another account's 'cove-shot-profile.x|.' would
+    # otherwise have matched, and killed, every process this user runs.
+    while IFS= read -r d; do
+        [ -n "$d" ] || continue
+        [[ "$(basename "$d")" =~ ^cove-shot-profile\.[A-Za-z0-9]+$ ]] || continue
+        cove_screenshot_stop "$d"
+        rm -rf "$d"
+    done < <(find "$SHOT_TMP" -maxdepth 1 -type d -user "$(id -u)" -name 'cove-shot-profile.*' -mmin +3 2>/dev/null)
+    [ -d "$SCREENSHOTS_DIR" ] && find "$SCREENSHOTS_DIR" -maxdepth 1 -name '*.png.tmp.png' -mmin +2 -delete 2>/dev/null
+    # Previews of sites that no longer exist.
+    local sp sn
+    for sp in "$SCREENSHOTS_DIR"/*.png; do
+        [ -f "$sp" ] || continue
+        case "$sp" in *.tmp.png) continue ;; esac
+        sn=$(basename "$sp" .png)
+        [ -d "$SITES_DIR/$sn.localhost" ] || rm -f "$sp"
+    done
+    for sp in "$SCREENSHOTS_DIR"/.*.failed; do
+        [ -f "$sp" ] || continue
+        sn=$(basename "$sp" .failed); sn="${sn#.}"
+        [ -d "$SITES_DIR/$sn.localhost" ] || rm -f "$sp"
+    done
+    # Gallery thumbnails (made by the dashboard) whose preview is gone, and
+    # half-written ones.
+    if [ -d "$SCREENSHOTS_DIR/thumbs" ]; then
+        find "$SCREENSHOTS_DIR/thumbs" -maxdepth 2 -name '*.webp.tmp.*' -mmin +2 -delete 2>/dev/null
+        for sp in "$SCREENSHOTS_DIR"/thumbs/*.webp "$SCREENSHOTS_DIR"/thumbs/mini/*.webp; do
+            [ -f "$sp" ] || continue
+            sn=$(basename "$sp" .webp)
+            [ -f "$SCREENSHOTS_DIR/$sn.png" ] || rm -f "$sp"
+        done
+    fi
+    return 0
+}
+
+# Refresh previews that are missing, older than the site's public/ tree,
+# or older than a day — up to --max of them, one after another, at low
+# priority, under a lock so two sweeps never overlap. A site whose capture
+# fails (front page down or 5xx) is stamped `.<site>.failed` and skipped for
+# a day: the sweep walks sites in name order, so without the stamp one
+# broken site is picked again every tick, its front page (and its wp-cron)
+# is hit every five minutes, and no site after it is ever refreshed.
+cove_screenshot_sweep() {
+    local max="$1" idle_only="$2"
+    if [ "$idle_only" -eq 1 ] && ! cove_user_is_idle; then return 0; fi
+    mkdir -p "$SCREENSHOTS_DIR"
+    local lock="$SCREENSHOTS_DIR/.sweep.lock"
+    if [ -f "$lock" ]; then
+        local lpid; lpid=$(cat "$lock" 2>/dev/null)
+        if [ -n "$lpid" ] && kill -0 "$lpid" 2>/dev/null; then return 0; fi
+    fi
+    echo $$ > "$lock"
+    trap 'rm -f "$lock"' EXIT
+    cove_screenshot_reap
+    local done=0 site_path name png now site_m
+    now=$(date +%s)
+    for site_path in "$SITES_DIR"/*/; do
+        [ "$done" -ge "$max" ] && break
+        site_path="${site_path%/}"
+        [ -d "$site_path/public" ] || continue
+        name=$(basename "$site_path"); name="${name%.localhost}"
+        png="$SCREENSHOTS_DIR/$name.png"
+        site_m=$(stat -f%m "$site_path/public" 2>/dev/null || stat -c%Y "$site_path/public" 2>/dev/null || echo 0)
+        if [ -f "$png" ]; then
+            local png_m; png_m=$(stat -f%m "$png" 2>/dev/null || stat -c%Y "$png" 2>/dev/null || echo 0)
+            [ "$png_m" -ge "$site_m" ] && [ $((now - png_m)) -lt 86400 ] && continue
+        fi
+        local failed="$SCREENSHOTS_DIR/.$name.failed"
+        if [ -f "$failed" ]; then
+            local fail_m; fail_m=$(stat -f%m "$failed" 2>/dev/null || stat -c%Y "$failed" 2>/dev/null || echo 0)
+            [ "$fail_m" -ge "$site_m" ] && [ $((now - fail_m)) -lt 86400 ] && continue
+        fi
+        if [ "$idle_only" -eq 1 ] && ! cove_user_is_idle; then break; fi
+        if nice -n 15 "$0" screenshot "$name" --quiet >/dev/null 2>&1; then
+            rm -f "$failed"
+        else
+            touch "$failed"
+        fi
+        done=$((done + 1))
+    done
+}
+
+cove_screenshot() {
+    local site_name="" out="" path="" width=1280 height=800 quiet=0 sweep=0 max=3 idle_only=0 check=0
+    local arg
+    for arg in "$@"; do
+        case "$arg" in
+            --out=*)    out="${arg#*=}" ;;
+            --path=*)   path="${arg#*=}" ;;
+            --width=*)  width="${arg#*=}" ;;
+            --height=*) height="${arg#*=}" ;;
+            --quiet)    quiet=1 ;;
+            --sweep)    sweep=1 ;;
+            --check)    check=1 ;;
+            --max=*)    max="${arg#*=}" ;;
+            --idle-only) idle_only=1 ;;
+            -h|--help)
+                echo "Usage: cove screenshot <site> [--out=<file.png>] [--path=/<page>]"
+                echo "                              [--width=1280] [--height=800]"
+                echo "       cove screenshot --check"
+                echo "       cove screenshot --sweep [--max=N] [--idle-only]"
+                echo ""
+                echo "Captures the site's front page with a headless Chromium-family browser"
+                echo "(Chrome, Chromium, Brave, Edge, Arc, Vivaldi). Without --out the image"
+                echo "goes to ~/Cove/cache/screenshots/<site>.png, where the dashboard shows it."
+                echo "--path captures another page of the site instead, and needs --out."
+                echo ""
+                echo "  --check       Print the browser that would be used; exit 2 when there is none."
+                echo "  --sweep [--max=N] [--idle-only]"
+                echo "        Refresh up to N stale previews (missing, older than the site, or older"
+                echo "        than a day) in the background; --idle-only waits for an idle desktop."
+                return
+                ;;
+            -*)
+                gum style --foreground red "❌ Error: Unknown option '$arg'."
+                exit 1
+                ;;
+            *) [ -z "$site_name" ] && site_name="$arg" ;;
+        esac
+    done
+    if [ "$check" -eq 1 ]; then
+        local found
+        if found=$(find_headless_browser); then echo "$found"; return 0; fi
+        echo "No Chromium-family browser found (Chrome, Chromium, Brave, Edge, Arc, Vivaldi)."
+        exit 2
+    fi
+    if [ "$sweep" -eq 1 ]; then
+        [[ "$max" =~ ^[0-9]+$ ]] || max=3
+        cove_screenshot_sweep "$max" "$idle_only"
+        return
+    fi
+    if [ -z "$site_name" ]; then
+        gum style --foreground red "❌ Error: A site name is required."
+        echo "Usage: cove screenshot <site> [--out=<file.png>] [--path=/<page>]"
+        exit 1
+    fi
+    if ! validate_site_name "$site_name"; then
+        gum style --foreground red "❌ Error: Invalid site name '$site_name'."
+        exit 1
+    fi
+    if [ ! -d "$SITES_DIR/$site_name.localhost/public" ]; then
+        site_not_found "$site_name"
+    fi
+    if ! [[ "$width" =~ ^[0-9]{3,4}$ ]] || ! [[ "$height" =~ ^[0-9]{3,4}$ ]]; then
+        gum style --foreground red "❌ Error: --width and --height take a number of pixels."
+        exit 1
+    fi
+    # Another page of the site. The preview the dashboard shows is always the
+    # front page, so this one goes to a file of the caller's choosing.
+    if [ -n "$path" ] && [ "$path" != "/" ]; then
+        local path_re='^/[A-Za-z0-9._~/?=&%:+,@!;#-]*$'
+        if [[ ! "$path" =~ $path_re ]]; then
+            gum style --foreground red "❌ Error: --path takes a path on the site, such as /shop/ or /?p=12."
+            exit 1
+        fi
+        if [ -z "$out" ]; then
+            gum style --foreground red "❌ Error: --path needs --out=<file.png>; the site's preview is always its front page."
+            exit 1
+        fi
+    else
+        path=""
+    fi
+
+    local browser
+    if ! browser=$(find_headless_browser); then
+        gum style --foreground red "❌ Error: No Chromium-family browser found (Chrome, Chromium, Brave, Edge, Arc, Vivaldi)." "Install one to capture previews."
+        exit 2
+    fi
+
+    [ -z "$out" ] && { mkdir -p "$SCREENSHOTS_DIR"; out="$SCREENSHOTS_DIR/$site_name.png"; }
+    cove_screenshot_reap
+    local url
+    url=$(url_for "$site_name.localhost")$path
+    local tmp_profile tmp_out
+    tmp_profile=$(mktemp -d "$SHOT_TMP/cove-shot-profile.XXXXXX")
+    tmp_out="$out.tmp.png"
+    # Another capture of this site is under way (the file is its lock).
+    if [ -f "$tmp_out" ]; then
+        local age; age=$(( $(date +%s) - $(stat -f%m "$tmp_out" 2>/dev/null || stat -c%Y "$tmp_out" 2>/dev/null || echo 0) ))
+        if [ "$age" -lt 60 ]; then [ "$quiet" -eq 1 ] && echo "$out"; return 0; fi
+        rm -f "$tmp_out"
+    fi
+    touch "$tmp_out"
+    # If this script is stopped part-way, the browser and the lock go with it.
+    trap 'cove_screenshot_stop "$tmp_profile"; rm -rf "$tmp_profile" "$tmp_out"' EXIT
+    # Warm the page first, and give up when the site does not answer: Chrome
+    # screenshots whatever is painted when its load budget runs out, and a
+    # page still waiting on the server paints nothing — a black preview. A
+    # site's first load after a restart (or a cold OPcache at night) can take
+    # half a minute; this request pays it so the capture itself is quick.
+    local http ctype
+    http=$(curl -sk -o /dev/null --max-time 60 -w '%{http_code}\n%{content_type}' "$url" 2>/dev/null)
+    ctype="${http#*$'\n'}"; http="${http%%$'\n'*}"
+    if [ -z "$http" ] || [ "$http" == "000" ] || [ "${http:0:1}" == "5" ]; then
+        rm -f "$tmp_out"
+        [ "$quiet" -eq 1 ] && exit 1
+        gum style --foreground red "❌ Error: $url did not answer (HTTP ${http:-none}); the preview was left as it was."
+        exit 1
+    fi
+    # A front page that is a PDF, an image, or JSON has nothing for the
+    # browser to paint; a blank preview left from before goes too.
+    case "$ctype" in
+        ""|text/html*|application/xhtml*) ;;
+        *)
+            rm -f "$tmp_out"
+            [ -f "$out" ] && [ "$(stat -f%z "$out" 2>/dev/null || stat -c%s "$out" 2>/dev/null || echo 0)" -lt 8192 ] && rm -f "$out"
+            [ "$quiet" -eq 1 ] && exit 1
+            gum style --foreground yellow "ℹ️  $url serves ${ctype%%;*}, not a page — nothing to preview."
+            exit 1
+            ;;
+    esac
+    [ "$quiet" -eq 1 ] || echo "📷 Capturing $url with $(basename "${browser%% *}")…"
+    # A throwaway profile: headless refuses to start on a profile the user's
+    # open browser holds, and nothing from the user's session should leak
+    # into the capture. Chrome's new headless mode writes the file and then,
+    # on some builds, never exits — so the capture is watched for and the
+    # browser stopped once the file is there (or after 30 s regardless).
+    local -a cmd
+    case "$browser" in
+        "flatpak run "*) read -r -a cmd <<< "$browser" ;;
+        *) cmd=("$browser") ;;
+    esac
+    "${cmd[@]}" \
+        --headless=new --disable-gpu --hide-scrollbars --no-first-run --no-default-browser-check \
+        --ignore-certificate-errors --disable-features=MacAppCodeSignClone,TranslateUI \
+        --user-data-dir="$tmp_profile" --window-size="${width},${height}" \
+        --timeout=45000 --screenshot="$tmp_out" "$url" >/dev/null 2>&1 &
+    local pid=$!
+    local waited=0
+    while [ $waited -lt 600 ]; do
+        [ -s "$tmp_out" ] && break
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.1
+        waited=$((waited + 1))
+    done
+    # Let the write finish, then stop the browser — the whole tree, KILL
+    # behind the TERM, and no open-ended wait.
+    [ -s "$tmp_out" ] && sleep 0.5
+    cove_screenshot_stop "$tmp_profile"
+    rm -rf "$tmp_profile"
+    trap - EXIT
+    if [ ! -s "$tmp_out" ]; then
+        rm -f "$tmp_out"
+        gum style --foreground red "❌ Error: The capture failed (is the site answering at $url?)."
+        exit 1
+    fi
+    # A solid-colour image (nothing painted) compresses to a few KB; a real
+    # page never does. Keep the previous preview rather than replace it with
+    # a black rectangle.
+    local bytes; bytes=$(stat -f%z "$tmp_out" 2>/dev/null || stat -c%s "$tmp_out" 2>/dev/null || echo 0)
+    if [ "$bytes" -lt 8192 ]; then
+        rm -f "$tmp_out"
+        # Do not keep an earlier blank either.
+        [ -f "$out" ] && [ "$(stat -f%z "$out" 2>/dev/null || stat -c%s "$out" 2>/dev/null || echo 0)" -lt 8192 ] && rm -f "$out"
+        [ "$quiet" -eq 1 ] && exit 1
+        gum style --foreground red "❌ Error: The page had not painted when the capture was taken; the preview was left as it was."
+        exit 1
+    fi
+    mv -f "$tmp_out" "$out"
+    [ "$quiet" -eq 1 ] && { echo "$out"; return; }
+    gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "✅ Saved $out"
+}

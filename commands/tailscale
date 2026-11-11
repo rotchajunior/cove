@@ -1,8 +1,19 @@
 # --- Tailscale Configuration ---
 TAILSCALE_CONFIG="$APP_DIR/tailscale"
+# Present only when the dashboard (9900) and Adminer (9902) should answer the
+# tailnet too; see regenerate_caddyfile.
+TAILSCALE_DASHBOARD_FLAG="$APP_DIR/tailscale-dashboard"
 
 cove_tailscale_enable() {
-    local hostname="$1"
+    local hostname="" with_dashboard=false
+    local arg
+    for arg in "$@"; do
+        case "$arg" in
+            --dashboard) with_dashboard=true ;;
+            -*) gum style --foreground red "❌ Error: Unknown option '$arg'."; exit 1 ;;
+            *) [ -z "$hostname" ] && hostname="$arg" ;;
+        esac
+    done
 
     # Try to auto-detect hostname if not provided
     if [ -z "$hostname" ]; then
@@ -15,6 +26,7 @@ cove_tailscale_enable() {
 
     # Interactive mode if still no hostname
     if [ -z "$hostname" ]; then
+        require_interactive "The Tailscale hostname (not auto-detected)" "it as an argument: cove tailscale enable <machine.tailnet.ts.net>"
         echo "📝 Enter your Tailscale machine hostname"
         echo "   (e.g., mycomputer.tail1234.ts.net)"
         hostname=$(gum input --width 0 --placeholder "your-machine.tailnet.ts.net")
@@ -37,12 +49,24 @@ cove_tailscale_enable() {
         exit 1
     fi
 
-    # Save the configuration
+    # Save the configuration. `enable` states the whole setup each time:
+    # without --dashboard, the dashboard and Adminer stay off the tailnet.
     mkdir -p "$APP_DIR"
     echo "$hostname" > "$TAILSCALE_CONFIG"
+    if $with_dashboard; then
+        : > "$TAILSCALE_DASHBOARD_FLAG"
+    else
+        rm -f "$TAILSCALE_DASHBOARD_FLAG"
+    fi
 
     echo "✅ Tailscale access enabled!"
     echo "   Hostname: $hostname"
+    if $with_dashboard; then
+        echo "   Dashboard and Adminer: on the tailnet too (ports 9900 and 9902)."
+        echo "   Anyone on your tailnet can use them to run commands on this machine."
+    else
+        echo "   Dashboard and Adminer: this machine only (add --dashboard to share them)."
+    fi
     echo ""
     echo "   Regenerating Caddyfile with port-based routing..."
     echo ""
@@ -55,6 +79,7 @@ cove_tailscale_enable() {
 cove_tailscale_disable() {
     if [ -f "$TAILSCALE_CONFIG" ]; then
         rm "$TAILSCALE_CONFIG"
+        rm -f "$TAILSCALE_DASHBOARD_FLAG"
         
         # Clean up port files
         if [ -d "$SITES_DIR" ]; then
@@ -102,9 +127,13 @@ cove_tailscale_status() {
         
         echo ""
         echo "   Global services:"
-        echo "   - https://${hostname}:9900  (Dashboard)"
         echo "   - https://${hostname}:9901  (Mailpit)"
-        echo "   - https://${hostname}:9902  (Adminer)"
+        if [ -f "$TAILSCALE_DASHBOARD_FLAG" ]; then
+            echo "   - https://${hostname}:9900  (Dashboard)"
+            echo "   - https://${hostname}:9902  (Adminer)"
+        else
+            echo "   Dashboard and Adminer are not shared (cove tailscale enable --dashboard)."
+        fi
     else
         gum style --foreground yellow "❌ Disabled"
         echo ""
@@ -127,26 +156,7 @@ cove_tailscale() {
             cove_tailscale_status
             ;;
         *)
-            echo "Usage: cove tailscale <subcommand>"
-            echo ""
-            echo "Expose all Cove sites to your Tailscale network via port-based routing."
-            echo "This allows devices on your Tailnet (like your iPhone) to access"
-            echo "your local development sites."
-            echo ""
-            echo "Your Tailscale hostname is automatically detected when you run 'enable'."
-            echo "Each site gets a unique port (starting at 9001), so you can access them at:"
-            echo "  https://<your-tailscale-hostname>:<port>"
-            echo ""
-            echo "Subcommands:"
-            echo "  enable     Enable Tailscale access (auto-detects hostname)"
-            echo "  disable    Disable Tailscale access"
-            echo "  status     Show current Tailscale configuration and URLs"
-            echo ""
-            echo "Examples:"
-            echo "  cove tailscale enable"
-            echo "  cove tailscale status"
-            echo "  cove tailscale disable"
-            exit 0
+            cove_unknown_subcommand tailscale "$action" "enable disable status"
             ;;
     esac
 }

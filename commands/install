@@ -107,7 +107,7 @@ install_dependency() {
                     fi
                 fi
                 echo "   - Downloading and extracting tarball..."
-                if curl -sL "$binary_url" | tar -xz -C "$temp_dir"; then
+                if curl -fsSL "$binary_url" | tar -xz -C "$temp_dir"; then
                     # Find the binary in extracted contents
                     local binary_file
                     binary_file=$(find "$temp_dir" -name "$cmd_name" -type f -executable 2>/dev/null | head -1)
@@ -123,9 +123,10 @@ install_dependency() {
                     fi
                 fi
             else
-                # Direct binary download
+                # Direct binary download. --fail, or an HTTP error page
+                # would be installed as the command.
                 echo "   - Downloading binary..."
-                if curl -sL "$binary_url" -o "$temp_dir/$cmd_name"; then
+                if curl -fsSL "$binary_url" -o "$temp_dir/$cmd_name"; then
                     chmod +x "$temp_dir/$cmd_name"
                     if $SUDO_CMD mv "$temp_dir/$cmd_name" "$BIN_DIR/$cmd_name"; then
                         installed_successfully=true
@@ -168,13 +169,13 @@ cove_install() {
                 auto_yes=true
                 shift
                 ;;
-            --http) explicit_http="$2"; shift 2 ;;
+            --http) [ $# -ge 2 ] || { echo "❌ Error: --http needs a value." >&2; exit 1; }; explicit_http="$2"; shift 2 ;;
             --http=*) explicit_http="${1#*=}"; shift ;;
-            --https) explicit_https="$2"; shift 2 ;;
+            --https) [ $# -ge 2 ] || { echo "❌ Error: --https needs a value." >&2; exit 1; }; explicit_https="$2"; shift 2 ;;
             --https=*) explicit_https="${1#*=}"; shift ;;
-            --db-root-user) db_root_user="$2"; shift 2 ;;
+            --db-root-user) [ $# -ge 2 ] || { echo "❌ Error: --db-root-user needs a value." >&2; exit 1; }; db_root_user="$2"; shift 2 ;;
             --db-root-user=*) db_root_user="${1#*=}"; shift ;;
-            --db-root-pass) db_root_pass="$2"; shift 2 ;;
+            --db-root-pass) [ $# -ge 2 ] || { echo "❌ Error: --db-root-pass needs a value." >&2; exit 1; }; db_root_pass="$2"; shift 2 ;;
             --db-root-pass=*) db_root_pass="${1#*=}"; shift ;;
             -h|--help)
                 display_command_help install
@@ -187,6 +188,9 @@ cove_install() {
                 ;;
         esac
     done
+
+    # A VPS is an easy place to put Cove by mistake: say so up front.
+    cove_warn_if_server
 
     # Explicit ports bypass both interactive port menus below entirely.
     if [ -n "$explicit_http" ] || [ -n "$explicit_https" ]; then
@@ -213,32 +217,37 @@ cove_install() {
     echo "🚀 Starting Cove installation..."
 
     # --- WSL/Systemd Check ---
+    # MariaDB and FrankenPHP run as systemd services on Linux, so without
+    # systemd the install fails at its first `systemctl`, after every
+    # package is in. Stop before installing anything instead. No
+    # /run/systemd/system is systemd's own test for "not booted with it":
+    # WSL without systemd turned on, or a container whose init isn't systemd.
     if [ "$OS" == "linux" ]; then
-        if [ "$IS_WSL" = true ]; then
-            echo "🐧 WSL environment detected."
-            # Check if systemd is running
-            if ! pidof systemd >/dev/null 2>&1; then
-                echo ""
-                echo "⚠️  WARNING: systemd is not running in WSL."
-                echo "   Cove requires systemd for service management."
-                echo ""
-                echo "   To enable systemd in WSL2, add to /etc/wsl.conf:"
-                echo "   [boot]"
-                echo "   systemd=true"
-                echo ""
-                echo "   Then restart WSL with: wsl --shutdown"
-                echo ""
-                if $auto_yes; then
-                    echo "   (--yes set — continuing anyway.)"
-                else
-                    read -p "Do you want to continue anyway? (y/N) " -n 1 -r
-                    echo
-                    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-                        echo "🚫 Installation cancelled."
-                        exit 0
-                    fi
-                fi
+        [ "$IS_WSL" = true ] && echo "🐧 WSL environment detected."
+        if [ ! -d /run/systemd/system ]; then
+            local lines=("❌ Cove needs systemd, and this system isn't running it.")
+            if [ "$IS_WSL" = true ]; then
+                lines+=(
+                    "To turn it on in WSL, add these lines to /etc/wsl.conf:"
+                    "    [boot]"
+                    "    systemd=true"
+                    "Then run 'wsl --shutdown' in PowerShell, open this distro again,"
+                    "and run 'cove install' again."
+                )
+            else
+                lines+=(
+                    "Cove runs MariaDB and FrankenPHP as systemd services. In a container,"
+                    "start it with systemd as its init, or install Cove in a VM instead."
+                )
             fi
+            echo ""
+            # gum isn't installed yet on a first run.
+            if command -v gum >/dev/null 2>&1; then
+                gum style --border normal --border-foreground red --padding "0 1" "${lines[@]}" >&2
+            else
+                printf '%s\n' "${lines[@]}" >&2
+            fi
+            exit 1
         fi
     fi
 
@@ -300,6 +309,11 @@ cove_install() {
                 ;;
             "Pick different"*)
                 prompt_custom_ports 8090 8453
+                ;;
+            *)
+                # Esc or Ctrl-C leaves gum choose with no answer.
+                echo "🚫 Installation cancelled."
+                exit 1
                 ;;
         esac
         port_choice_made=true
@@ -364,7 +378,7 @@ cove_install() {
                 gum style --foreground yellow \
                     "⚠️  Services may fail to bind on ${HTTP_PORT}/${HTTPS_PORT}."
                 ;;
-            "Cancel installation")
+            "Cancel installation"|*)
                 echo "🚫 Installation cancelled."
                 exit 1
                 ;;
@@ -390,39 +404,52 @@ cove_install() {
     # only fires when it's actually meaningful.
     if [ -d "$ADMINER_DIR" ]; then
         if ! $auto_yes && ! gum confirm "⚠️ Cove already appears to be installed at ~/Cove. Proceeding may overwrite some configurations. Continue?"; then
+            # Non-zero, so the installer that ran us doesn't report success.
             echo "🚫 Installation cancelled."
-            exit 0
+            exit 1
         fi
     fi
     
-    # FrankenPHP uses its own universal installer.
-    # The upstream installer tries to write to /usr/local/bin and silently
-    # falls back to CWD when that fails — which happens on a fresh Apple
-    # Silicon Mac (Homebrew lives at /opt/homebrew/bin). To handle both,
-    # we run the installer from a tempdir and, if the binary ends up there
-    # instead of on PATH, move it into $BIN_DIR ourselves.
+    # FrankenPHP. On Linux, its upstream installer, which sets up the apt/dnf
+    # repository and falls back to a static binary saved in the working
+    # directory. On macOS, the release binary straight from GitHub (as
+    # cove_upgrade does): the upstream installer has no Intel Mac build in
+    # its list and exits there, though releases publish frankenphp-mac-x86_64,
+    # and it saves the download without --fail. Either way the binary may
+    # land in a tempdir rather than on PATH, so we move it into $BIN_DIR.
     if ! command -v frankenphp &> /dev/null; then
         gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "Installing Dependency: frankenphp"
-        echo "   - Using the official FrankenPHP installer..."
         local fp_tmpdir
         fp_tmpdir=$(mktemp -d)
-        if (cd "$fp_tmpdir" && curl -sL https://frankenphp.dev/install.sh | $SUDO_CMD bash); then
-            hash -r
-            if ! command -v frankenphp &> /dev/null && [ -x "$fp_tmpdir/frankenphp" ]; then
-                $SUDO_CMD mv "$fp_tmpdir/frankenphp" "$BIN_DIR/frankenphp"
-                $SUDO_CMD chmod +x "$BIN_DIR/frankenphp"
-                hash -r
-            fi
-            rm -rf "$fp_tmpdir"
-            if command -v frankenphp &> /dev/null; then
-                echo "✅ FrankenPHP installed successfully."
-            else
-                gum style --foreground red "❌ FrankenPHP installer ran but the binary is not on PATH."
+        if [ "$OS" = "macos" ]; then
+            local fp_asset="frankenphp-mac-arm64"
+            [ "$(uname -m)" = "x86_64" ] && fp_asset="frankenphp-mac-x86_64"
+            echo "   - Downloading ${fp_asset} from FrankenPHP's latest release..."
+            if ! curl -L --fail --progress-bar "https://github.com/php/frankenphp/releases/latest/download/${fp_asset}" -o "$fp_tmpdir/frankenphp"; then
+                rm -rf "$fp_tmpdir"
+                gum style --foreground red "❌ Failed to download FrankenPHP (${fp_asset})."
                 exit 1
             fi
+            chmod 755 "$fp_tmpdir/frankenphp"
         else
-            rm -rf "$fp_tmpdir"
-            gum style --foreground red "❌ The FrankenPHP download script failed."
+            echo "   - Using the official FrankenPHP installer..."
+            if ! run_installer_script https://frankenphp.dev/install.sh "$fp_tmpdir"; then
+                rm -rf "$fp_tmpdir"
+                gum style --foreground red "❌ The FrankenPHP download script failed."
+                exit 1
+            fi
+        fi
+        hash -r
+        if ! command -v frankenphp &> /dev/null && [ -x "$fp_tmpdir/frankenphp" ]; then
+            $SUDO_CMD mv "$fp_tmpdir/frankenphp" "$BIN_DIR/frankenphp"
+            $SUDO_CMD chmod +x "$BIN_DIR/frankenphp"
+            hash -r
+        fi
+        rm -rf "$fp_tmpdir"
+        if command -v frankenphp &> /dev/null; then
+            echo "✅ FrankenPHP installed successfully."
+        else
+            gum style --foreground red "❌ FrankenPHP was downloaded but isn't on PATH (expected it in $BIN_DIR)."
             exit 1
         fi
     else
@@ -432,23 +459,17 @@ cove_install() {
     # On Linux with apt/dnf, FrankenPHP needs additional PHP extensions installed
     # The DEB/RPM packages don't include all extensions by default
     if [ "$OS" = "linux" ]; then
-        echo "📦 Installing FrankenPHP PHP extensions for WordPress..."
-        if [ "$PKG_MANAGER" = "apt" ]; then
-            # Install required PHP extensions for WordPress via apt
-            $SUDO_CMD apt install -y php-zts-mysqli php-zts-curl php-zts-gd php-zts-xml php-zts-mbstring php-zts-zip php-zts-intl php-zts-bcmath 2>/dev/null || true
-            echo "✅ FrankenPHP PHP extensions installed."
-        elif [ "$PKG_MANAGER" = "dnf" ]; then
-            # Install required PHP extensions for WordPress via dnf
-            $SUDO_CMD dnf install -y php-zts-mysqli php-zts-curl php-zts-gd php-zts-xml php-zts-mbstring php-zts-zip php-zts-intl php-zts-bcmath 2>/dev/null || true
+        echo "📦 Installing FrankenPHP PHP extensions for WordPress and Laravel..."
+        # Names any package it couldn't install, and fails then.
+        if linux_install_php_extensions; then
             echo "✅ FrankenPHP PHP extensions installed."
         fi
-        
+
         # Verify mysqli is available
         if ! frankenphp php-cli -r "echo implode(',', get_loaded_extensions());" 2>/dev/null | grep -qi mysqli; then
-            gum style --foreground yellow "⚠️ Warning: mysqli extension not found in FrankenPHP."
-            gum style --foreground yellow "   WordPress may not work correctly."
-            gum style --foreground yellow "   Try: sudo apt install php-zts-mysqli (for apt)"
-            gum style --foreground yellow "   Or:  sudo dnf install php-zts-mysqli (for dnf)"
+            gum style --foreground yellow "⚠️ Warning: mysqli extension not found in FrankenPHP." \
+                "   WordPress may not work correctly." \
+                "   Try: sudo $PKG_MANAGER install php-zts-mysqli"
         fi
 
         # Let FrankenPHP bind ports 80/443 as the user. Without this cap,
@@ -488,6 +509,10 @@ cove_install() {
         fi
     fi
 
+    # Pin portable collation defaults before the first start (see
+    # write_mariadb_config in main for the MariaDB 11.5+ uca1400 trap).
+    write_mariadb_config || true
+
     # No standalone PHP install — wp-cli is invoked through `frankenphp php-cli`
     # (see get_wp_cmd in main), so FrankenPHP's bundled PHP is the single PHP
     # runtime for both web and CLI. On Linux the php-zts-* extensions installed
@@ -503,7 +528,7 @@ cove_install() {
     elif ! command -v mailpit &> /dev/null; then
         gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "Installing Dependency: mailpit"
         echo "   - Using the official Mailpit installer..."
-        if curl -sL https://raw.githubusercontent.com/axllent/mailpit/develop/install.sh | $SUDO_CMD bash; then
+        if run_installer_script https://raw.githubusercontent.com/axllent/mailpit/develop/install.sh; then
             echo "✅ Mailpit installed successfully."
         else
             gum style --foreground red "❌ The Mailpit download script failed."
@@ -520,6 +545,10 @@ cove_install() {
     # --- Directory and Service Setup (Copied from original file) ---
     echo "📁 Creating Cove directory structure..."
     mkdir -p "$SITES_DIR" "$LOGS_DIR" "$GUI_DIR" "$ADMINER_DIR" "$CUSTOM_CADDY_DIR"
+    # ~/Cove holds every site's wp-config.php (with the database password
+    # that opens them all), backups, caught mail, and logs. Only this user's
+    # processes (FrankenPHP, php-fpm, Mailpit, the menu bar app) need it.
+    chmod 700 "$COVE_DIR" 2>/dev/null
 
     # Write the PHP ini that wp-cli (via `frankenphp php-cli`) will load.
     # See the comment on $PHPRC export in main for the rationale.
@@ -549,8 +578,18 @@ error_reporting = 6143
 ${mysql_socket:+mysqli.default_socket = $mysql_socket}
 ${mysql_socket:+pdo_mysql.default_socket = $mysql_socket}
 INI
+    # wp_mail() from the CLI goes to Mailpit too (see ensure_cli_sendmail_path).
+    ensure_cli_sendmail_path
+    # WP-CLI under FrankenPHP 1.13.0's php-cli (see ensure_cli_argv_fix).
+    ensure_cli_argv_fix
     echo "🗃️ Downloading Adminer 6.0.0..."
-    curl -sL "https://github.com/vrana/adminer/releases/download/v6.0.0/adminer-6.0.0.php" -o "$ADMINER_DIR/adminer-core.php"
+    # Saved beside it and moved into place, so a failed download (--fail
+    # keeps an HTTP error page out) never replaces a working copy.
+    if ! { curl -fsSL "https://github.com/vrana/adminer/releases/download/v6.0.0/adminer-6.0.0.php" -o "$ADMINER_DIR/adminer-core.php.new" \
+        && mv -f "$ADMINER_DIR/adminer-core.php.new" "$ADMINER_DIR/adminer-core.php"; }; then
+        rm -f "$ADMINER_DIR/adminer-core.php.new"
+        gum style --foreground yellow "⚠️ Couldn't download Adminer: the database manager won't open until 'cove install' runs again."
+    fi
     # Entry point + theme assets. Keep in sync with cove_upgrade so upgraders
     # pick up index.php/head() and CSS/JS changes without a full reinstall.
     deploy_adminer_theme
@@ -637,7 +676,7 @@ INI
                 root_pass=$(gum input --password --placeholder "Password for '$root_user'")
             fi
 
-            if echo "$sql_command" | mysql -u "$root_user" -p"$root_pass"; then
+            if echo "$sql_command" | MYSQL_PWD="$root_pass" mysql -u "$root_user"; then
                 echo "   - ✅ Manual database user creation successful."
                 user_created_successfully=true
             fi
@@ -666,7 +705,8 @@ INI
     # and the root cert to exist (Caddy generated it during the initial
     # cove_enable above). Idempotent — users can re-run via `cove trust`.
     echo ""
-    cove_trust
+    local ssl_trusted=false
+    cove_trust && ssl_trusted=true
 
     # If the user changed HTTPS ports during install AND there are pre-existing
     # WordPress sites in $SITES_DIR, migrate their stored URLs to the new port.
@@ -677,50 +717,61 @@ INI
             echo "🔄 Updating WordPress site URLs to new HTTPS port..."
             update_wp_site_urls_for_port_change "$original_https" "$HTTPS_PORT"
         fi
+        # Laravel sites have no wp-config.php, so they're looked for on their
+        # own: an APP_URL left on the old port sends every redirect and asset
+        # URL to a port nothing listens on. It names only the sites it changes.
+        update_laravel_site_urls_for_port_change
     fi
 
-    # Show post-install guidance
-    echo ""
+    # Show post-install guidance: the ports when they aren't the defaults,
+    # and the certificate workarounds only when cove_trust above didn't
+    # succeed. After a successful trust, browsers show no warning to explain.
     if [ "$HTTPS_PORT" != "443" ]; then
+        echo ""
         gum style --border normal --margin "1" --padding "1 2" --border-foreground "yellow" \
             "📋 First-Time Setup Notes" \
             "Cove is running on custom ports: HTTP ${HTTP_PORT} / HTTPS ${HTTPS_PORT}" \
             "Access the dashboard at: $(url_for cove.localhost)"
-    else
+    elif ! $ssl_trusted; then
+        echo ""
         gum style --border normal --margin "1" --padding "1 2" --border-foreground "yellow" \
             "📋 First-Time Setup Notes"
     fi
-    echo ""
-    echo "  Your browser will show a certificate warning when accessing Cove sites."
-    echo "  This is normal for local development with self-signed certificates."
-    echo ""
-    echo "  Options to resolve:"
-    echo "    1. Click 'Advanced' and 'Proceed' to accept the certificate"
-    echo "    2. Or trust Caddy's root CA certificate system-wide (recommended)"
-    echo ""
-    if [ "$OS" == "macos" ]; then
-        echo "  On macOS, Caddy typically auto-trusts its CA. If not, the CA cert is at:"
-        echo "    ~/Library/Application Support/Caddy/pki/authorities/local/root.crt"
-    else
-        echo "  On Linux, the CA certificate is located at:"
-        echo "    ~/.local/share/caddy/pki/authorities/local/root.crt"
+    if ! $ssl_trusted; then
         echo ""
-        if [ "$PKG_MANAGER" = "apt" ]; then
-            echo "  To trust it system-wide (Ubuntu/Debian):"
-            echo "    sudo cp ~/.local/share/caddy/pki/authorities/local/root.crt /usr/local/share/ca-certificates/caddy.crt"
-            echo "    sudo update-ca-certificates"
-        elif [ "$PKG_MANAGER" = "pacman" ]; then
-            echo "  To trust it system-wide (Arch/Manjaro):"
-            echo "    sudo trust anchor --store ~/.local/share/caddy/pki/authorities/local/root.crt"
-        elif [ "$PKG_MANAGER" = "dnf" ]; then
-            echo "  To trust it system-wide (Fedora/RHEL):"
-            echo "    sudo cp ~/.local/share/caddy/pki/authorities/local/root.crt /etc/pki/ca-trust/source/anchors/caddy.crt"
-            echo "    sudo update-ca-trust"
+        echo "  Your browser will show a certificate warning when accessing Cove sites,"
+        echo "  because Cove's local root certificate isn't trusted yet."
+        echo ""
+        echo "  Options to resolve:"
+        echo "    1. Click 'Advanced' and 'Proceed' to accept the certificate"
+        echo "    2. Or trust Caddy's root CA certificate system-wide (recommended):"
+        echo "       run 'cove trust' once Cove is running, or follow the steps below"
+        echo ""
+        if [ "$OS" == "macos" ]; then
+            echo "  On macOS, the CA cert is at:"
+            echo "    ~/Library/Application Support/Caddy/pki/authorities/local/root.crt"
+            echo "  Open it in Keychain Access and set it to Always Trust."
+        else
+            echo "  On Linux, the CA certificate is located at:"
+            echo "    ~/.local/share/caddy/pki/authorities/local/root.crt"
+            echo ""
+            if [ "$PKG_MANAGER" = "dnf" ]; then
+                echo "  To trust it system-wide (Fedora/RHEL):"
+                echo "    sudo cp ~/.local/share/caddy/pki/authorities/local/root.crt /etc/pki/ca-trust/source/anchors/caddy.crt"
+                echo "    sudo update-ca-trust"
+            elif [ "$PKG_MANAGER" = "pacman" ]; then
+                echo "  To trust it system-wide (Arch/Manjaro):"
+                echo "    sudo trust anchor --store ~/.local/share/caddy/pki/authorities/local/root.crt"
+            else
+                echo "  To trust it system-wide (Ubuntu/Debian):"
+                echo "    sudo cp ~/.local/share/caddy/pki/authorities/local/root.crt /usr/local/share/ca-certificates/caddy.crt"
+                echo "    sudo update-ca-certificates"
+            fi
+            echo ""
+            echo "  For browser-only trust, import the certificate in your browser settings."
         fi
-        echo ""
-        echo "  For browser-only trust, import the certificate in your browser settings."
     fi
-    
+
     if [ "$IS_WSL" = true ]; then
         echo ""
         gum style --foreground yellow "  WSL: Run 'cove wsl-hosts' for Windows hosts file setup instructions."

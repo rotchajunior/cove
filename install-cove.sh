@@ -16,6 +16,9 @@ SUDO_CMD="sudo"
 IS_WSL=false
 DEV_MODE=false
 MAIN_MODE=false
+# The PATH of the terminal that ran us, before any Homebrew shellenv below:
+# whether that terminal can run cove once we're done.
+ORIGINAL_PATH="$PATH"
 
 # --- Parse Arguments ---
 for arg in "$@"; do
@@ -123,6 +126,32 @@ setup_environment() {
     echo_error "This script currently only supports MacOS and Linux."
 }
 
+# Puts Homebrew on PATH for new terminals, as Homebrew's own "Next steps"
+# say to: its installer only prints them, and the shellenv eval'd here lasts
+# for this run alone, so the next terminal couldn't find brew or cove.
+persist_brew_shellenv() {
+    local line="eval \"\$($INSTALL_DIR/brew shellenv)\""
+    local profile=""
+    case "${SHELL:-}" in
+        */zsh*) profile="${ZDOTDIR:-$HOME}/.zprofile" ;;
+        */bash*) profile="$HOME/.bash_profile" ;;
+    esac
+    if [ -z "$profile" ]; then
+        echo_info "Add this line to your shell's startup file so new terminals find Homebrew and cove:"
+        echo "    $line"
+        return 0
+    fi
+    if grep -qsF "$INSTALL_DIR/brew shellenv" "$profile"; then
+        return 0
+    fi
+    if { echo; echo "$line"; } 2>/dev/null >> "$profile"; then
+        echo_info "Added Homebrew to your PATH for new terminals, in $profile."
+    else
+        echo "${YELLOW}${BOLD}WARNING:${NC} Couldn't write to $profile. Add this line to it so new terminals find Homebrew and cove:"
+        echo "    $line"
+    fi
+}
+
 # --- Pre-flight Checks & Dependency Management ---
 pre_flight_checks() {
     echo_info "Running pre-flight checks..."
@@ -134,7 +163,13 @@ pre_flight_checks() {
 
     # 2. Check for the detected package manager
     if ! command -v $PKG_MANAGER &> /dev/null; then
-        if [ "$OS" == "macos" ]; then
+        if [ "$OS" == "macos" ] && [ -x "$INSTALL_DIR/brew" ]; then
+            # Installed, but this shell was never set up for it (Homebrew's
+            # "Next steps" skipped): use it rather than install it again.
+            echo_info "Found Homebrew in $INSTALL_DIR, though it isn't on your PATH."
+            eval "$("$INSTALL_DIR/brew" shellenv)"
+            persist_brew_shellenv
+        elif [ "$OS" == "macos" ]; then
             # For MacOS, offer to install Homebrew
             echo "${YELLOW}${BOLD}CONFIRM:${NC} Homebrew is not installed, but it's required by Cove on MacOS."
             # Read the confirmation from the terminal, not this script's stdin —
@@ -151,11 +186,21 @@ pre_flight_checks() {
             echo # Move to a new line
             if [[ $REPLY =~ ^[Yy]$ ]]; then
                 echo_info "Installing Homebrew. This may take a few minutes..."
-                if ! /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"; then
+                # Saved whole first: under `bash -c "$(curl …)"` a failed
+                # download runs an empty script, which "succeeds". Its stdin
+                # is the terminal (a reply above means we have one): Homebrew's
+                # installer turns non-interactive when stdin isn't a TTY, as
+                # under `curl | bash`, and then can't ask for the sudo password
+                # it needs on macOS.
+                local brew_installer="$TMP_WORK/homebrew-install.sh"
+                if ! curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh -o "$brew_installer"; then
+                    echo_error "Couldn't download Homebrew's installer. Please check your connection."
+                fi
+                if ! /bin/bash "$brew_installer" < /dev/tty || [ ! -x "$INSTALL_DIR/brew" ]; then
                     echo_error "Homebrew installation failed. Please install it manually and run this script again."
                 fi
-                echo_info "Temporarily configuring shell environment for Homebrew..."
-                eval "$($INSTALL_DIR/brew shellenv)"
+                eval "$("$INSTALL_DIR/brew" shellenv)"
+                persist_brew_shellenv
                 echo_success "Homebrew installed successfully."
             else
                 echo_error "Homebrew installation declined. Cannot proceed."
@@ -187,7 +232,56 @@ pre_flight_checks() {
     fi
 }
 
+# Builds cove.sh from the main branch's source into $1. cove.sh itself is
+# only committed in release commits, so the copy on main is the last
+# release's: build it the way a release is, with main's compile.sh.
+build_cove_from_main() {
+    local out="$1" src="$TMP_WORK/src" tool
+    for tool in tar gzip; do
+        if ! command -v "$tool" &> /dev/null; then
+            # Minimal RHEL-family images ship without tar.
+            if [ "$OS" = "linux" ]; then
+                echo_info "Installing $tool (needed to unpack the source)..."
+                if [ "$PKG_MANAGER" = "pacman" ]; then
+                    $SUDO_CMD pacman -S --needed --noconfirm "$tool" > /dev/null 2>&1 || true
+                else
+                    $SUDO_CMD $PKG_MANAGER install -y "$tool" > /dev/null 2>&1 || true
+                fi
+            fi
+            command -v "$tool" &> /dev/null || echo_error "--main needs $tool to unpack the source. Please install it and run this script again."
+        fi
+    done
+
+    if ! curl -L --fail --progress-bar "$MAIN_TARBALL_URL" -o "$TMP_WORK/main.tar.gz"; then
+        echo_error "Failed to download from '$MAIN_TARBALL_URL'. Please check your connection."
+    fi
+    mkdir -p "$src"
+    if ! tar -xzf "$TMP_WORK/main.tar.gz" -C "$src" --strip-components=1; then
+        echo_error "Couldn't unpack the main branch's source."
+    fi
+    # The tarball carries the last release's cove.sh: remove it, so a build
+    # that fails can't leave it behind to be installed in its place.
+    rm -f "$src/cove.sh"
+    if ! (cd "$src" && bash ./compile.sh > /dev/null) || [ ! -s "$src/cove.sh" ]; then
+        echo_error "Couldn't build cove.sh from the main branch's source."
+    fi
+    mv "$src/cove.sh" "$out"
+}
+
+# Says to open a new terminal when the one that ran us can't find cove: its
+# PATH didn't hold $INSTALL_DIR (a Homebrew this script just set up).
+say_if_new_terminal_needed() {
+    case ":$ORIGINAL_PATH:" in
+        *":$INSTALL_DIR:"*) ;;
+        *) echo_info "Open a new terminal to use cove: this one's PATH doesn't include $INSTALL_DIR yet." ;;
+    esac
+}
+
 # --- Main Installation Logic ---
+
+# Scratch space for downloads, removed however this script exits.
+TMP_WORK=$(mktemp -d "${TMPDIR:-/tmp}/cove-install.XXXXXX")
+trap 'rm -rf "$TMP_WORK"' EXIT
 
 # 1. Setup environment variables
 setup_environment
@@ -197,11 +291,8 @@ pre_flight_checks
 
 # 3. Define installation paths
 EXECUTABLE_NAME="cove"
-if [ "$MAIN_MODE" = true ]; then
-    DOWNLOAD_URL="https://raw.githubusercontent.com/anchorhost/cove/main/cove.sh"
-else
-    DOWNLOAD_URL="https://github.com/anchorhost/cove/releases/latest/download/cove.sh"
-fi
+DOWNLOAD_URL="https://github.com/anchorhost/cove/releases/latest/download/cove.sh"
+MAIN_TARBALL_URL="https://codeload.github.com/anchorhost/cove/tar.gz/refs/heads/main"
 DESTINATION_PATH="$INSTALL_DIR/$EXECUTABLE_NAME"
 
 # Get the directory where this script is located (for --dev mode)
@@ -234,16 +325,19 @@ if [ "$DEV_MODE" = true ]; then
     fi
     echo_success "Local cove.sh installed to $DESTINATION_PATH"
 else
+    # Download (or build) to temp first, then move with sudo if needed. In
+    # our own mktemp dir, not a fixed /tmp name another account could
+    # create first.
+    TEMP_DOWNLOAD="$TMP_WORK/cove.sh"
     if [ "$MAIN_MODE" = true ]; then
-        echo_info "🧪 MAIN MODE: Downloading cove.sh from the main branch (unreleased)..."
+        echo_info "🧪 MAIN MODE: Building cove.sh from the main branch's source (unreleased)..."
+        build_cove_from_main "$TEMP_DOWNLOAD"
+        echo_success "Built cove.sh from the main branch."
     else
         echo_info "Downloading the latest version of Cove..."
-    fi
-
-    # Download to temp first, then move with sudo if needed
-    TEMP_DOWNLOAD="/tmp/cove.sh.download"
-    if ! curl -L --fail --progress-bar "$DOWNLOAD_URL" -o "$TEMP_DOWNLOAD"; then
-        echo_error "Failed to download from '$DOWNLOAD_URL'. Please check your connection."
+        if ! curl -L --fail --progress-bar "$DOWNLOAD_URL" -o "$TEMP_DOWNLOAD"; then
+            echo_error "Failed to download from '$DOWNLOAD_URL'. Please check your connection."
+        fi
     fi
 
     # Move to final destination (may require sudo on Linux)
@@ -269,21 +363,36 @@ fi
 echo_info "Handing off to Cove to complete the installation..."
 echo "--------------------------------------------------"
 
-# 'set -e' is active, so a non-zero exit from `cove install` will abort the
-# script before we reach the success messages below. This is important when
-# the user cancels from Cove's interactive prompts — we must not claim success
-# after the user has explicitly cancelled.
+# A non-zero exit from `cove install` (a failed step, or a prompt the user
+# declined) must stop us before the success message below: we must not
+# claim success after the user has explicitly cancelled.
 #
 # Redirect stdin from /dev/tty so interactive prompts (gum confirm/choose,
 # read) work when this installer is run via `curl | bash`, which would
 # otherwise hand the child a closed stdin and silently fail every prompt.
+COVE_INSTALL_RC=0
 if (exec < /dev/tty) 2>/dev/null; then
-    "$DESTINATION_PATH" install < /dev/tty
+    "$DESTINATION_PATH" install < /dev/tty || COVE_INSTALL_RC=$?
 else
-    "$DESTINATION_PATH" install
+    "$DESTINATION_PATH" install || COVE_INSTALL_RC=$?
+fi
+if [ "$COVE_INSTALL_RC" -ne 0 ]; then
+    echo "--------------------------------------------------"
+    echo "${RED}${BOLD}ERROR:${NC} Cove's setup didn't finish. Run 'cove install' to try again." >&2
+    say_if_new_terminal_needed
+    exit "$COVE_INSTALL_RC"
+fi
+
+# cove install may have moved Cove off 80/443 (a port in use): its URLs
+# carry the HTTPS port then, as `cove url` prints them.
+HTTPS_SUFFIX=""
+SAVED_HTTPS_PORT=$(grep '^HTTPS_PORT=' "$HOME/Cove/config" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d "'\"")
+if [ -n "$SAVED_HTTPS_PORT" ] && [ "$SAVED_HTTPS_PORT" != "443" ]; then
+    HTTPS_SUFFIX=":$SAVED_HTTPS_PORT"
 fi
 
 echo "--------------------------------------------------"
 echo_success "Cove has been installed successfully!"
-echo_info "You can now use the 'cove' command from anywhere in your terminal."
-echo_info "You may need to restart your terminal for all changes to take effect."
+say_if_new_terminal_needed
+echo_info "Next, create your first site: cove add myblog"
+echo_info "It's served at https://myblog.localhost${HTTPS_SUFFIX}, and the dashboard is at https://cove.localhost${HTTPS_SUFFIX}."

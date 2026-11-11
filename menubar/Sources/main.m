@@ -84,6 +84,13 @@ static const NSInteger kServiceRowStartIndex = 2;
 - (void)applicationDidFinishLaunching:(NSNotification *)notification {
     [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
     self.statusItem = [[NSStatusBar systemStatusBar] statusItemWithLength:NSVariableStatusItemLength];
+    // NSStatusItem persists its visible flag in this app's defaults domain
+    // (run.cove.menubar). A stale 0 there — e.g. left behind by the original
+    // standalone build — would make every launch silently invisible, and
+    // `cove menubar enable` replaces the bundle without touching preferences.
+    // The item is never removal-allowed, so a hidden state can only be stale;
+    // force it visible.
+    self.statusItem.visible = YES;
     [self loadStatusImages];
 
     // Seed the core trio before the first poll so the very first render
@@ -212,7 +219,8 @@ static const NSInteger kServiceRowStartIndex = 2;
 // Post a notification for a service that died out from under a running stack.
 // Suppressed when: states aren't established yet, the user just acted through
 // the menu (start/stop churn), or EVERYTHING went down at once — that shape is
-// almost always a deliberate `cove disable` from a terminal, not a crash.
+// almost always a deliberate `cove disable` from a terminal, not a crash
+// (everything here being Cove's own services, without PostgreSQL and Redis).
 // A stop must also survive TWO consecutive polls before it notifies: a service
 // mid-restart (terminal-run `cove enable`, the multi-minute service churn of
 // `cove upgrade`) is back up by the next poll and never alarms.
@@ -230,9 +238,12 @@ static const NSInteger kServiceRowStartIndex = 2;
         return;
     }
 
+    // Only Cove's own services count here. PostgreSQL and Redis aren't
+    // stopped by `cove disable`, so one still up doesn't make a disable look
+    // like everything else crashing at once.
     BOOL anyStillRunning = NO;
-    for (NSNumber *running in newStates.allValues) {
-        if (running.boolValue) {
+    for (NSString *key in newStates) {
+        if (![self isOptionalServiceKey:key] && newStates[key].boolValue) {
             anyStillRunning = YES;
             break;
         }
@@ -312,6 +323,8 @@ static const NSInteger kServiceRowStartIndex = 2;
     if ([key isEqualToString:@"caddy"])   { return @"Caddy"; }
     if ([key isEqualToString:@"mariadb"]) { return @"MariaDB"; }
     if ([key isEqualToString:@"mailpit"]) { return @"Mailpit"; }
+    if ([key isEqualToString:@"postgres"]) { return @"PostgreSQL"; }
+    if ([key isEqualToString:@"redis"])   { return @"Redis"; }
     if ([key hasPrefix:@"php-fpm-"]) {
         return [NSString stringWithFormat:@"PHP-FPM %@",
                 [key substringFromIndex:[@"php-fpm-" length]]];
@@ -323,10 +336,17 @@ static const NSInteger kServiceRowStartIndex = 2;
     return self.serviceStates[key].boolValue;
 }
 
+// PostgreSQL and Redis are there for the Laravel sites that asked for them,
+// run by Homebrew (or found running), not by cove enable/disable: shown, but
+// not counted towards whether Cove itself is running.
+- (BOOL)isOptionalServiceKey:(NSString *)key {
+    return [key isEqualToString:@"postgres"] || [key isEqualToString:@"redis"];
+}
+
 - (NSInteger)runningServiceCount {
     NSInteger count = 0;
-    for (NSNumber *running in self.serviceStates.allValues) {
-        if (running.boolValue) {
+    for (NSString *key in self.serviceStates) {
+        if (![self isOptionalServiceKey:key] && self.serviceStates[key].boolValue) {
             count++;
         }
     }
@@ -338,7 +358,7 @@ static const NSInteger kServiceRowStartIndex = 2;
         return NO;
     }
     for (NSString *key in self.serviceKeys) {
-        if (!self.serviceStates[key].boolValue) {
+        if (![self isOptionalServiceKey:key] && !self.serviceStates[key].boolValue) {
             return NO;
         }
     }
@@ -547,7 +567,7 @@ static const NSInteger kServiceRowStartIndex = 2;
 
     [self.menu addItem:[NSMenuItem separatorItem]];
 
-    self.dashboardItem = [self linkItemWithTitle:@"Open Cove Dashboard"
+    self.dashboardItem = [self linkItemWithTitle:@"Open Dashboard"
                                           action:@selector(openDashboard)];
     [self.menu addItem:self.dashboardItem];
     self.adminerItem = [self linkItemWithTitle:@"Open Adminer"
@@ -1077,7 +1097,7 @@ static const NSInteger kServiceRowStartIndex = 2;
                                              withExtension:@"svg"
                                               subdirectory:@"Assets"];
     NSImage *source = assetURL ? [[NSImage alloc] initWithContentsOfURL:assetURL] : nil;
-    if (!source) {
+    if (!source || ![self imageDrawsVisibly:source]) {
         return;
     }
 
@@ -1085,6 +1105,51 @@ static const NSInteger kServiceRowStartIndex = 2;
     self.runningImage = source;
     self.partialImage = [self imageByDesaturating:source brightness:0.02 contrast:1.05];
     self.stoppedImage = [self imageByDesaturating:source brightness:-0.12 contrast:1.20];
+}
+
+// CoreSVG can "succeed" on an SVG yet hand back a non-nil image with no
+// usable content (observed with viewBox-only SVGs on some macOS builds) —
+// which would put an invisible status item in the menu bar. Rasterize a
+// probe and require at least one visible pixel before trusting the icon.
+- (BOOL)imageDrawsVisibly:(NSImage *)image {
+    const NSInteger side = 18;
+    NSBitmapImageRep *rep = [[NSBitmapImageRep alloc]
+        initWithBitmapDataPlanes:NULL
+                      pixelsWide:side
+                      pixelsHigh:side
+                   bitsPerSample:8
+                 samplesPerPixel:4
+                        hasAlpha:YES
+                        isPlanar:NO
+                  colorSpaceName:NSCalibratedRGBColorSpace
+                     bytesPerRow:0
+                    bitsPerPixel:0];
+    if (!rep || !rep.bitmapData) {
+        return NO;
+    }
+    memset(rep.bitmapData, 0, (size_t)(rep.bytesPerRow * side));
+
+    NSGraphicsContext *context =
+        [NSGraphicsContext graphicsContextWithBitmapImageRep:rep];
+    if (!context) {
+        return NO;
+    }
+    [NSGraphicsContext saveGraphicsState];
+    [NSGraphicsContext setCurrentContext:context];
+    [image drawInRect:NSMakeRect(0, 0, side, side)
+             fromRect:NSZeroRect
+            operation:NSCompositingOperationSourceOver
+             fraction:1.0];
+    [NSGraphicsContext restoreGraphicsState];
+
+    const unsigned char *data = rep.bitmapData;
+    NSInteger byteCount = rep.bytesPerRow * side;
+    for (NSInteger i = 0; i < byteCount; i++) {
+        if (data[i] != 0) {
+            return YES;
+        }
+    }
+    return NO;
 }
 
 - (NSImage *)imageByDesaturating:(NSImage *)source
@@ -1247,7 +1312,13 @@ int main(int argc, const char *argv[]) {
 
     @autoreleasepool {
         NSApplication *application = [NSApplication sharedApplication];
-        AppDelegate *delegate = [[AppDelegate alloc] init];
+        // NSApplication does not retain its delegate, and ARC may release a
+        // local as soon as its last use passes — before the run loop delivers
+        // applicationDidFinishLaunching:. A static keeps the delegate alive
+        // for the life of the process; without it the app can launch as a
+        // healthy event loop that never creates its status item.
+        static AppDelegate *delegate;
+        delegate = [[AppDelegate alloc] init];
         application.delegate = delegate;
         [application run];
     }

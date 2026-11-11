@@ -1,0 +1,39 @@
+cove_wp() {
+    local site_name="$1"
+    if [ -z "$site_name" ] || [ "$site_name" == "--help" ] || [ "$site_name" == "-h" ]; then
+        echo "Usage: cove wp <site> <wp-cli arguments…>"
+        echo ""
+        echo "Runs WP-CLI inside a WordPress site from anywhere, on the PHP the site"
+        echo "runs on (its 'cove php' pin, if it has one). A --help after the site name"
+        echo "is WP-CLI's own."
+        echo ""
+        echo "Examples:"
+        echo "  cove wp mysite plugin list"
+        echo "  cove wp mysite option get siteurl"
+        echo "  cove wp mysite user create dev dev@mysite.localhost --role=editor"
+        echo "  cove wp mysite plugin list --help"
+        [ -z "$site_name" ] && exit 1
+        return
+    fi
+    shift
+
+    if ! validate_site_name "$site_name"; then
+        gum style --foreground red "❌ Error: Invalid site name '$site_name'."
+        exit 1
+    fi
+
+    local site_dir="$SITES_DIR/$site_name.localhost"
+    local public_dir="$site_dir/public"
+    if [ ! -d "$site_dir" ] || [ ! -f "$public_dir/wp-config.php" ]; then
+        if site_is_laravel "$site_dir"; then
+            gum style --foreground red "❌ Error: '$site_name.localhost' is a Laravel site." "Its command line is artisan: cove artisan $site_name <command>"
+            exit 1
+        fi
+        site_not_found "$site_name" "WordPress"
+    fi
+
+    local wp_cmd
+    wp_cmd=$(get_wp_cmd "$site_dir")
+    # $wp_cmd is intentionally unquoted: it can be "php-binary /path/wp-cli.phar".
+    cd "$public_dir" && exec $wp_cmd "$@"
+}
